@@ -3,13 +3,15 @@ use serde_json::{Value, json};
 use std::fs;
 use std::path::Path;
 
+use crate::git::config_dir;
+
 /// The SessionStart hook entry that subcontext injects.
 fn subcontext_hook_entry() -> Value {
     json!({
         "hooks": [
             {
                 "type": "command",
-                "command": "subcontext startup"
+                "command": "subcontext startup --claude-code"
             }
         ]
     })
@@ -50,8 +52,7 @@ pub fn merge_claude_settings(root: &Path) -> Result<()> {
         .as_array_mut()
         .context("SessionStart field is not an array")?;
 
-    // Check if our hook is already present
-    let hook_entry = subcontext_hook_entry();
+    // Check if our hook is already present (match both old and new command strings)
     let already_present = session_start_arr.iter().any(|entry| {
         entry
             .get("hooks")
@@ -60,13 +61,15 @@ pub fn merge_claude_settings(root: &Path) -> Result<()> {
                 hooks.iter().any(|h| {
                     h.get("command")
                         .and_then(|c| c.as_str())
-                        .is_some_and(|c| c == "subcontext startup")
+                        .is_some_and(|c| {
+                            c == "subcontext startup --claude-code" || c == "subcontext startup"
+                        })
                 })
             })
     });
 
     if !already_present {
-        session_start_arr.push(hook_entry);
+        session_start_arr.push(subcontext_hook_entry());
     }
 
     // Write back to .claude/settings.local.json
@@ -75,17 +78,15 @@ pub fn merge_claude_settings(root: &Path) -> Result<()> {
         .context("failed to write .claude/settings.local.json")?;
 
     // Copy to config mount
-    let config_settings_dir = root
-        .join(".subcontext")
-        .join(".mnt")
-        .join("config")
-        .join("agents")
-        .join("claude");
-    fs::create_dir_all(&config_settings_dir)?;
+    let cfg = config_dir(root);
+    if cfg.exists() {
+        let config_settings_dir = cfg.join("agents").join("claude");
+        fs::create_dir_all(&config_settings_dir)?;
 
-    let config_settings_path = config_settings_dir.join("settings.local.json");
-    fs::copy(&settings_path, &config_settings_path)
-        .context("failed to copy settings to config mount")?;
+        let config_settings_path = config_settings_dir.join("settings.local.json");
+        fs::copy(&settings_path, &config_settings_path)
+            .context("failed to copy settings to config mount")?;
+    }
 
     eprintln!("[subcontext] Configured Claude SessionStart hook.");
     Ok(())

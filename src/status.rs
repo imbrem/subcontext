@@ -4,7 +4,6 @@ use std::path::{Path, PathBuf};
 use crate::git;
 
 /// Find the nearest git root and the main repo root.
-/// If they differ, we're in a linked worktree.
 fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
     let mut current = start
         .canonicalize()
@@ -15,8 +14,8 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
             return Ok((current.clone(), current));
         }
         if dot_git.is_file() {
-            // .git file contains "gitdir: /path/to/.git/worktrees/<name>"
-            let contents = std::fs::read_to_string(&dot_git).context("failed to read .git file")?;
+            let contents =
+                std::fs::read_to_string(&dot_git).context("failed to read .git file")?;
             let gitdir = contents
                 .strip_prefix("gitdir: ")
                 .unwrap_or(&contents)
@@ -29,7 +28,6 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
             let main_git_dir = gitdir_path
                 .canonicalize()
                 .context("failed to resolve worktree gitdir")?;
-            // .git/worktrees/<name> → .git/worktrees → .git → repo root
             let main_root = main_git_dir
                 .parent()
                 .and_then(|p| p.parent())
@@ -61,15 +59,12 @@ pub fn status(cwd: &Path) -> Result<()> {
         Err(_) => println!("Branch:      (detached HEAD)"),
     }
 
-    let main_has_sc = main_root.join(".subcontext").is_dir();
+    let sc_dir = main_root.join(".git").join(".subcontext");
     if is_worktree {
-        let wt_has_sc = current_root.join(".subcontext").is_dir();
         println!(
             "Subcontext:  {}",
-            if main_has_sc {
+            if sc_dir.is_dir() {
                 "installed (in main repo)"
-            } else if wt_has_sc {
-                "installed (in this worktree)"
             } else {
                 "not installed"
             }
@@ -77,7 +72,7 @@ pub fn status(cwd: &Path) -> Result<()> {
     } else {
         println!(
             "Subcontext:  {}",
-            if main_has_sc {
+            if sc_dir.is_dir() {
                 "installed"
             } else {
                 "not installed"

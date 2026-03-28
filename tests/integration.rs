@@ -4,13 +4,9 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-use serde_json;
-
 static COUNTER: AtomicU32 = AtomicU32::new(0);
 
-/// Directory containing a copy of the `subcontext` binary, created once per
-/// process. This is the *only* custom entry on PATH during tests, simulating
-/// an environment where only `subcontext` (and system tools) are installed.
+/// Directory containing a copy of the `subcontext` binary.
 fn test_bin_dir() -> &'static PathBuf {
     use std::sync::OnceLock;
     static DIR: OnceLock<PathBuf> = OnceLock::new();
@@ -20,7 +16,6 @@ fn test_bin_dir() -> &'static PathBuf {
         fs::create_dir_all(&dir).unwrap();
         fs::copy(src, dir.join("subcontext")).unwrap();
 
-        // Ensure the copy is executable
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -33,8 +28,6 @@ fn test_bin_dir() -> &'static PathBuf {
     })
 }
 
-/// Build a PATH that is: <test_bin_dir>:<system PATH>.
-/// The hook's `exec subcontext` will resolve to our copied binary.
 fn test_path() -> OsString {
     let mut path = OsString::from(test_bin_dir());
     if let Ok(existing) = std::env::var("PATH") {
@@ -44,10 +37,10 @@ fn test_path() -> OsString {
     path
 }
 
-/// Create a temp dir with a fresh git repo, returning its path.
 fn make_test_repo() -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir = std::env::temp_dir().join(format!("subcontext-test-{}-{}", std::process::id(), id));
+    let dir =
+        std::env::temp_dir().join(format!("subcontext-test-{}-{}", std::process::id(), id));
     if dir.exists() {
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -110,44 +103,32 @@ fn install_creates_expected_structure() {
 
     subcontext_ok(&root, &["install"]);
 
-    // .subcontext/ exists and is a git repo
-    assert!(root.join(".subcontext/.git").is_dir());
+    // Bare repo exists
+    assert!(root.join(".git/.subcontext/repo/HEAD").exists());
 
     // Config worktree is mounted
-    assert!(root.join(".subcontext/.mnt/config").is_dir());
+    assert!(root.join(".git/.subcontext/config").is_dir());
+
+    // Work worktree is mounted
+    assert!(root.join(".git/.subcontext/work").is_dir());
 
     // Claude settings were written
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(settings.contains("subcontext startup"));
 
-    // Settings were copied to config mount
-    assert!(
-        root.join(".subcontext/.mnt/config/agents/claude/settings.local.json")
-            .exists()
-    );
+    // Hook dispatchers installed
+    let pc_hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
+    assert!(pc_hook.contains("subcontext _hook post-checkout"));
 
-    // Hook dispatcher was installed
-    let hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
-    assert!(hook.contains("subcontext _hook post-checkout"));
+    let pcm_hook = fs::read_to_string(root.join(".git/hooks/post-commit")).unwrap();
+    assert!(pcm_hook.contains("subcontext _hook post-commit"));
 
-    // Host exclude contains .subcontext/
-    let exclude = fs::read_to_string(root.join(".git/info/exclude")).unwrap();
-    assert!(exclude.contains(".subcontext/"));
-
-    // Context repo exclude contains .mnt/ and .tmp/
-    let ctx_exclude = fs::read_to_string(root.join(".subcontext/.git/info/exclude")).unwrap();
-    assert!(ctx_exclude.contains(".mnt/"));
-    assert!(ctx_exclude.contains(".tmp/"));
-
-    // Main worktree is on worktrees/main
-    let branch = git(
-        &root.join(".subcontext"),
-        &["symbolic-ref", "--short", "HEAD"],
-    );
-    assert_eq!(branch, "worktrees/main");
+    // Overlay branch exists
+    let branches = git_in_repo(&root, &["branch", "--list", "overlay/main"]);
+    assert!(branches.contains("overlay/main"));
 
     // Config branch exists
-    let branches = git(&root.join(".subcontext"), &["branch", "--list", "config"]);
+    let branches = git_in_repo(&root, &["branch", "--list", "config"]);
     assert!(branches.contains("config"));
 
     cleanup(&root);
@@ -158,7 +139,7 @@ fn install_reinstall_succeeds() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    // Re-running install should succeed (re-install hooks + settings)
+    // Re-running install should succeed
     let out = subcontext(&root, &["install"]);
     assert!(
         out.status.success(),
@@ -168,10 +149,6 @@ fn install_reinstall_succeeds() {
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(stderr.contains("re-installing"));
 
-    // Hook should still work
-    let hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
-    assert!(hook.contains("subcontext _hook post-checkout"));
-
     cleanup(&root);
 }
 
@@ -179,7 +156,6 @@ fn install_reinstall_succeeds() {
 fn install_preserves_existing_claude_settings() {
     let root = make_test_repo();
 
-    // Write pre-existing settings
     fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(
         root.join(".claude/settings.local.json"),
@@ -200,8 +176,8 @@ fn install_preserves_existing_claude_settings() {
 fn install_backs_up_existing_hooks() {
     let root = make_test_repo();
 
-    // Write a pre-existing executable hook
     let hook_path = root.join(".git/hooks/post-checkout");
+    fs::create_dir_all(root.join(".git/hooks")).unwrap();
     fs::write(&hook_path, "#!/bin/sh\necho old-hook\n").unwrap();
     #[cfg(unix)]
     {
@@ -213,7 +189,7 @@ fn install_backs_up_existing_hooks() {
 
     subcontext_ok(&root, &["install"]);
 
-    let backup = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
+    let backup = root.join(".git/.subcontext/config/hooks/old/post-checkout");
     assert!(backup.exists());
     let content = fs::read_to_string(backup).unwrap();
     assert!(content.contains("old-hook"));
@@ -221,35 +197,146 @@ fn install_backs_up_existing_hooks() {
     cleanup(&root);
 }
 
-// ─── Startup ────────────────────────────────────────────────────────
+// ─── Overlay add / save / switch ─────────────────────────────────────
 
 #[test]
-fn startup_silent_without_task() {
+fn add_and_save_overlay_file() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    let stdout = subcontext_ok(&root, &["startup"]);
-    assert!(stdout.is_empty());
+    // Create a file and add to overlay
+    fs::write(root.join("NOTES.md"), "private notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "add notes"]);
+
+    // File should exist in work/
+    assert!(root.join(".git/.subcontext/work/NOTES.md").exists());
+
+    // File should be excluded from git status
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("NOTES.md"),
+        "NOTES.md should be excluded from git status, got: {status}"
+    );
 
     cleanup(&root);
 }
 
 #[test]
-fn startup_prints_task_as_json() {
+fn overlay_files_switch_with_branches() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    fs::write(root.join(".subcontext/TASK.md"), "Fix the login bug\n").unwrap();
+    // Add a file on main
+    fs::write(root.join("NOTES.md"), "main notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "main notes"]);
 
-    let stdout = subcontext_ok(&root, &["startup"]);
-    let parsed: serde_json::Value =
-        serde_json::from_str(stdout.trim()).expect("stdout should be valid JSON");
-    assert_eq!(parsed["continue"], true);
+    // Switch to new branch — overlay forks from main
+    git(&root, &["checkout", "-b", "feature"]);
 
-    let ctx = parsed["additionalContext"].as_str().unwrap();
-    assert!(ctx.contains("Active worktree: main"));
-    assert!(ctx.contains("Current task:"));
-    assert!(ctx.contains("Fix the login bug"));
+    // NOTES.md should be inherited from main's overlay
+    let content = fs::read_to_string(root.join("NOTES.md")).unwrap();
+    assert_eq!(content, "main notes\n", "new branch should inherit parent overlay");
+
+    // Overwrite with different content on feature
+    fs::write(root.join("NOTES.md"), "feature notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "feature notes"]);
+
+    // Switch back to main
+    git(&root, &["checkout", "main"]);
+
+    // Should see main notes (not feature notes)
+    let content = fs::read_to_string(root.join("NOTES.md")).unwrap();
+    assert_eq!(content, "main notes\n");
+
+    cleanup(&root);
+}
+
+#[test]
+fn new_branch_from_empty_overlay_starts_empty() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Don't add any overlay files on main — switch to feature
+    git(&root, &["checkout", "-b", "feature"]);
+
+    // Overlay should still be empty
+    let files = fs::read_to_string(root.join(".git/.subcontext/work/.gitkeep")).ok();
+    assert!(files.is_none(), "new branch from empty overlay should be empty");
+
+    // No overlay files should be in root
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(status.is_empty(), "should have no untracked files, got: {status}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn overlay_wins_over_main_repo() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Create a file tracked by main repo
+    fs::write(root.join("shared.txt"), "main version\n").unwrap();
+    git(&root, &["add", "shared.txt"]);
+    git(&root, &["commit", "-m", "add shared"]);
+
+    // Override with overlay
+    fs::write(root.join("shared.txt"), "overlay version\n").unwrap();
+    subcontext_ok(&root, &["add", "shared.txt"]);
+    subcontext_ok(&root, &["save", "-m", "overlay shared"]);
+
+    // File should show overlay version
+    let content = fs::read_to_string(root.join("shared.txt")).unwrap();
+    assert_eq!(content, "overlay version\n");
+
+    // git status should NOT show shared.txt as modified (skip-worktree)
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("shared.txt"),
+        "shared.txt should be hidden from git status via skip-worktree, got: {status}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn remove_restores_main_repo_version() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Create a file tracked by main repo
+    fs::write(root.join("shared.txt"), "main version\n").unwrap();
+    git(&root, &["add", "shared.txt"]);
+    git(&root, &["commit", "-m", "add shared"]);
+
+    // Override with overlay
+    fs::write(root.join("shared.txt"), "overlay version\n").unwrap();
+    subcontext_ok(&root, &["add", "shared.txt"]);
+
+    // Remove from overlay
+    subcontext_ok(&root, &["remove", "shared.txt"]);
+
+    // Should restore main version
+    let content = fs::read_to_string(root.join("shared.txt")).unwrap();
+    assert_eq!(content, "main version\n");
+
+    cleanup(&root);
+}
+
+#[test]
+fn remove_deletes_overlay_only_file() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    fs::write(root.join("NOTES.md"), "notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+
+    subcontext_ok(&root, &["remove", "NOTES.md"]);
+
+    assert!(!root.join("NOTES.md").exists());
 
     cleanup(&root);
 }
@@ -257,41 +344,19 @@ fn startup_prints_task_as_json() {
 // ─── Post-checkout hook ─────────────────────────────────────────────
 
 #[test]
-fn hook_creates_new_worktree_branch_on_checkout() {
+fn hook_creates_new_overlay_branch_on_checkout() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    // Create and switch to a new branch — the real hook fires via PATH
     git(&root, &["checkout", "-b", "feature/widgets"]);
 
-    // Context repo should now be on worktrees/feature-widgets
-    let branch = git(
-        &root.join(".subcontext"),
-        &["symbolic-ref", "--short", "HEAD"],
-    );
-    assert_eq!(branch, "worktrees/feature-widgets");
+    // Overlay branch should exist
+    let branches = git_in_repo(&root, &["branch", "--list", "overlay/feature-widgets"]);
+    assert!(branches.contains("overlay/feature-widgets"));
 
-    cleanup(&root);
-}
-
-#[test]
-fn hook_switches_back_to_existing_worktree_branch() {
-    let root = make_test_repo();
-    subcontext_ok(&root, &["install"]);
-
-    // Write a task on main's context
-    fs::write(root.join(".subcontext/TASK.md"), "main task\n").unwrap();
-    git(&root.join(".subcontext"), &["add", "TASK.md"]);
-    git(&root.join(".subcontext"), &["commit", "-m", "add task"]);
-
-    // Switch to a new branch — hook fires automatically
-    git(&root, &["checkout", "-b", "other"]);
-    assert!(!root.join(".subcontext/TASK.md").exists());
-
-    // Switch back to main — hook fires automatically
-    git(&root, &["checkout", "main"]);
-    let task = fs::read_to_string(root.join(".subcontext/TASK.md")).unwrap();
-    assert_eq!(task, "main task\n");
+    // Work/ should be on the new branch
+    let branch = git(&root.join(".git/.subcontext/work"), &["symbolic-ref", "--short", "HEAD"]);
+    assert_eq!(branch, "overlay/feature-widgets");
 
     cleanup(&root);
 }
@@ -303,12 +368,12 @@ fn hook_ignores_file_checkouts() {
 
     // flag=0 means file checkout — should be a no-op
     let branch_before = git(
-        &root.join(".subcontext"),
+        &root.join(".git/.subcontext/work"),
         &["symbolic-ref", "--short", "HEAD"],
     );
     subcontext_ok(&root, &["_hook", "post-checkout", "a", "b", "0"]);
     let branch_after = git(
-        &root.join(".subcontext"),
+        &root.join(".git/.subcontext/work"),
         &["symbolic-ref", "--short", "HEAD"],
     );
     assert_eq!(branch_before, branch_after);
@@ -330,7 +395,6 @@ fn hook_never_fails_fatally() {
 fn hook_propagates_old_hook_failure() {
     let root = make_test_repo();
 
-    // Write a pre-existing hook that always fails
     let hook_dir = root.join(".git/hooks");
     fs::create_dir_all(&hook_dir).unwrap();
     let hook_path = hook_dir.join("post-checkout");
@@ -345,18 +409,44 @@ fn hook_propagates_old_hook_failure() {
 
     subcontext_ok(&root, &["install"]);
 
-    // Old hook was backed up
     assert!(
-        root.join(".subcontext/.mnt/config/hooks/old/post-checkout")
+        root.join(".git/.subcontext/config/hooks/old/post-checkout")
             .exists()
     );
 
-    // Invoke the hook directly — should exit non-zero because the old hook fails
     let out = subcontext(&root, &["_hook", "post-checkout", "abc123", "def456", "1"]);
     assert!(
         !out.status.success(),
-        "hook should propagate old hook failure, but exited successfully"
+        "hook should propagate old hook failure"
     );
+
+    cleanup(&root);
+}
+
+// ─── Post-commit hook ───────────────────────────────────────────────
+
+#[test]
+fn post_commit_auto_saves_overlay() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Add a file to overlay
+    fs::write(root.join("NOTES.md"), "original\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "initial"]);
+
+    // Modify the overlay file
+    fs::write(root.join("NOTES.md"), "modified\n").unwrap();
+
+    // Make a commit in the main repo (triggers post-commit hook)
+    fs::write(root.join("dummy.txt"), "x").unwrap();
+    git(&root, &["add", "dummy.txt"]);
+    git(&root, &["commit", "-m", "trigger post-commit"]);
+
+    // The overlay change should be auto-saved
+    let work_content =
+        fs::read_to_string(root.join(".git/.subcontext/work/NOTES.md")).unwrap();
+    assert_eq!(work_content, "modified\n");
 
     cleanup(&root);
 }
@@ -364,21 +454,29 @@ fn hook_propagates_old_hook_failure() {
 // ─── Uninstall ──────────────────────────────────────────────────────
 
 #[test]
-fn uninstall_removes_hook_and_settings() {
+fn uninstall_cleans_up() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
+    // Add an overlay file
+    fs::write(root.join("NOTES.md"), "notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+
     subcontext_ok(&root, &["uninstall"]);
 
-    // Hook dispatcher should be gone
+    // Hooks should be gone
     assert!(!root.join(".git/hooks/post-checkout").exists());
+    assert!(!root.join(".git/hooks/post-commit").exists());
 
-    // Settings should no longer contain subcontext startup
+    // Overlay file should be removed
+    assert!(!root.join("NOTES.md").exists());
+
+    // .git/.subcontext/ should be gone
+    assert!(!root.join(".git/.subcontext").exists());
+
+    // Settings should no longer contain subcontext
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(!settings.contains("subcontext startup"));
-
-    // .subcontext/ directory should still exist
-    assert!(root.join(".subcontext").is_dir());
 
     cleanup(&root);
 }
@@ -387,8 +485,8 @@ fn uninstall_removes_hook_and_settings() {
 fn uninstall_restores_original_hook() {
     let root = make_test_repo();
 
-    // Write a pre-existing executable hook
     let hook_path = root.join(".git/hooks/post-checkout");
+    fs::create_dir_all(root.join(".git/hooks")).unwrap();
     fs::write(&hook_path, "#!/bin/sh\necho original-hook\n").unwrap();
     #[cfg(unix)]
     {
@@ -399,14 +497,8 @@ fn uninstall_restores_original_hook() {
     }
 
     subcontext_ok(&root, &["install"]);
-
-    // Verify hook was replaced
-    let hook = fs::read_to_string(&hook_path).unwrap();
-    assert!(hook.contains("subcontext _hook post-checkout"));
-
     subcontext_ok(&root, &["uninstall"]);
 
-    // Original hook should be restored
     let hook = fs::read_to_string(&hook_path).unwrap();
     assert!(hook.contains("original-hook"));
     assert!(!hook.contains("subcontext"));
@@ -418,7 +510,6 @@ fn uninstall_restores_original_hook() {
 fn uninstall_preserves_other_settings() {
     let root = make_test_repo();
 
-    // Write pre-existing settings with custom key
     fs::create_dir_all(root.join(".claude")).unwrap();
     fs::write(
         root.join(".claude/settings.local.json"),
@@ -436,49 +527,50 @@ fn uninstall_preserves_other_settings() {
     cleanup(&root);
 }
 
+// ─── Startup ────────────────────────────────────────────────────────
+
+#[test]
+fn startup_is_noop() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let stdout = subcontext_ok(&root, &["startup", "--claude-code"]);
+    assert!(stdout.is_empty());
+
+    cleanup(&root);
+}
+
+// ─── Branch sanitization ────────────────────────────────────────────
+
+#[test]
+fn hook_sanitizes_slashes_in_branch_names() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    git(&root, &["checkout", "-b", "feat/nested/deep"]);
+
+    let branches = git_in_repo(&root, &["branch", "--list", "overlay/feat-nested-deep"]);
+    assert!(branches.contains("overlay/feat-nested-deep"));
+
+    cleanup(&root);
+}
+
+// ─── Repair ─────────────────────────────────────────────────────────
+
 #[test]
 fn install_repair_backs_up_subcontext_hook() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    // Re-install with --repair should back up the subcontext hook to hooks/backup/
     subcontext_ok(&root, &["install", "--repair"]);
 
-    let backup = root.join(".subcontext/.mnt/config/hooks/backup/post-checkout");
-    assert!(backup.exists(), "repair should create hooks/backup/post-checkout");
+    let backup = root.join(".git/.subcontext/config/hooks/backup/post-checkout");
+    assert!(
+        backup.exists(),
+        "repair should create hooks/backup/post-checkout"
+    );
     let content = fs::read_to_string(&backup).unwrap();
     assert!(content.contains("subcontext"));
-
-    // hooks/old/ should NOT have the subcontext dispatcher (it would cause a loop)
-    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
-    if old.exists() {
-        let content = fs::read_to_string(&old).unwrap();
-        assert!(
-            !content.contains("subcontext"),
-            "hooks/old/ should not contain the subcontext dispatcher"
-        );
-    }
-
-    cleanup(&root);
-}
-
-#[test]
-fn install_reinstall_skips_subcontext_hook_backup() {
-    let root = make_test_repo();
-    subcontext_ok(&root, &["install"]);
-
-    // Re-install without --repair should skip the subcontext hook, not back it up to old/
-    let out = subcontext(&root, &["install"]);
-    assert!(out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("already dispatches to subcontext"));
-
-    // hooks/old/ should not have the subcontext dispatcher
-    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
-    if old.exists() {
-        let content = fs::read_to_string(&old).unwrap();
-        assert!(!content.contains("subcontext"));
-    }
 
     cleanup(&root);
 }
@@ -487,7 +579,6 @@ fn install_reinstall_skips_subcontext_hook_backup() {
 fn install_comment_mentioning_subcontext_is_not_detected_as_dispatcher() {
     let root = make_test_repo();
 
-    // Write a hook that mentions subcontext only in comments
     let hook_path = root.join(".git/hooks/post-checkout");
     fs::create_dir_all(root.join(".git/hooks")).unwrap();
     fs::write(
@@ -505,41 +596,308 @@ fn install_comment_mentioning_subcontext_is_not_detected_as_dispatcher() {
 
     subcontext_ok(&root, &["install"]);
 
-    // The hook should have been backed up to old/ (not treated as a subcontext hook)
-    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
-    assert!(old.exists(), "comment-only mention should be backed up to old/");
+    let old = root.join(".git/.subcontext/config/hooks/old/post-checkout");
+    assert!(
+        old.exists(),
+        "comment-only mention should be backed up to old/"
+    );
     let content = fs::read_to_string(&old).unwrap();
     assert!(content.contains("echo hello"));
 
     cleanup(&root);
 }
 
+// ─── Auto-save on checkout ───────────────────────────────────────────
+
 #[test]
-fn uninstall_idempotent() {
+fn checkout_auto_saves_unsaved_overlay_changes() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    subcontext_ok(&root, &["uninstall"]);
-    // Running again should succeed without error
-    subcontext_ok(&root, &["uninstall"]);
+    // Add and save a file on main
+    fs::write(root.join("NOTES.md"), "original\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "initial"]);
+
+    // Modify the overlay file WITHOUT saving
+    fs::write(root.join("NOTES.md"), "modified\n").unwrap();
+
+    // Switch branch — should auto-save before unapply
+    git(&root, &["checkout", "-b", "feature"]);
+
+    // Switch back to main — should see the auto-saved changes
+    git(&root, &["checkout", "main"]);
+
+    let content = fs::read_to_string(root.join("NOTES.md")).unwrap();
+    assert_eq!(content, "modified\n", "unsaved overlay changes should be preserved across checkout");
 
     cleanup(&root);
 }
 
-// ─── Branch sanitization ────────────────────────────────────────────
+// ─── Edge cases ─────────────────────────────────────────────────────
 
 #[test]
-fn hook_sanitizes_slashes_in_branch_names() {
+fn add_nonexistent_file_fails() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    git(&root, &["checkout", "-b", "feat/nested/deep"]);
-
-    let branch = git(
-        &root.join(".subcontext"),
-        &["symbolic-ref", "--short", "HEAD"],
+    let out = subcontext(&root, &["add", "nonexistent.txt"]);
+    assert!(
+        !out.status.success(),
+        "adding nonexistent file should fail"
     );
-    assert_eq!(branch, "worktrees/feat-nested-deep");
 
     cleanup(&root);
+}
+
+#[test]
+fn add_nested_directory_file() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    fs::create_dir_all(root.join("docs/internal")).unwrap();
+    fs::write(root.join("docs/internal/notes.md"), "nested\n").unwrap();
+
+    subcontext_ok(&root, &["add", "docs/internal/notes.md"]);
+    subcontext_ok(&root, &["save", "-m", "nested file"]);
+
+    // Should exist in work/
+    assert!(root.join(".git/.subcontext/work/docs/internal/notes.md").exists());
+
+    // Should be excluded from git status
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("notes.md"),
+        "nested overlay file should be excluded, got: {status}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn save_with_no_overlay_files_is_noop() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // save with no files should succeed silently
+    subcontext_ok(&root, &["save", "-m", "empty"]);
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_is_idempotent() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["uninstall"]);
+
+    // Second uninstall should succeed (nothing to do)
+    let out = subcontext(&root, &["uninstall"]);
+    assert!(
+        out.status.success(),
+        "second uninstall should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn remove_nested_cleans_empty_parents() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    fs::create_dir_all(root.join("a/b")).unwrap();
+    fs::write(root.join("a/b/c.md"), "deep\n").unwrap();
+
+    subcontext_ok(&root, &["add", "a/b/c.md"]);
+    subcontext_ok(&root, &["remove", "a/b/c.md"]);
+
+    // File should be gone
+    assert!(!root.join("a/b/c.md").exists());
+    // Empty parent dirs should be cleaned up
+    assert!(!root.join("a/b").exists());
+    assert!(!root.join("a").exists());
+
+    cleanup(&root);
+}
+
+// ─── Orphan branches ─────────────────────────────────────────────────
+
+#[test]
+fn orphan_branch_gets_empty_overlay() {
+    let root = make_test_repo();
+
+    // Need a tracked file so the repo isn't empty
+    fs::write(root.join("README"), "hello\n").unwrap();
+    git(&root, &["add", "README"]);
+    git(&root, &["commit", "-m", "add readme"]);
+
+    subcontext_ok(&root, &["install"]);
+
+    // Add overlay content on main
+    fs::write(root.join("NOTES.md"), "main notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "main notes"]);
+
+    // Create an orphan branch (unrelated history)
+    git(&root, &["checkout", "--orphan", "orphan-branch"]);
+    // git checkout --orphan leaves files staged; clear them
+    git(&root, &["rm", "-rf", "."]);
+    git(&root, &["commit", "--allow-empty", "-m", "orphan root"]);
+
+    // The overlay should be empty — NOTES.md should NOT be inherited
+    assert!(
+        !root.join("NOTES.md").exists(),
+        "orphan branch should NOT inherit overlay files from previous branch"
+    );
+
+    // The overlay branch should exist and be empty
+    let branches = git_in_repo(&root, &["branch", "--list", "overlay/orphan-branch"]);
+    assert!(branches.contains("overlay/orphan-branch"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn checkout_to_unrelated_branch_gets_empty_overlay() {
+    let root = make_test_repo();
+
+    // Need a tracked file so the repo isn't empty
+    fs::write(root.join("README"), "hello\n").unwrap();
+    git(&root, &["add", "README"]);
+    git(&root, &["commit", "-m", "add readme"]);
+
+    subcontext_ok(&root, &["install"]);
+
+    // Add overlay content on main
+    fs::write(root.join("NOTES.md"), "main notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "main notes"]);
+
+    // Create an orphan branch with commits (unrelated history)
+    git(&root, &["checkout", "--orphan", "unrelated"]);
+    git(&root, &["rm", "-rf", "."]);
+    git(&root, &["commit", "--allow-empty", "-m", "unrelated root"]);
+    git(&root, &["commit", "--allow-empty", "-m", "unrelated second"]);
+
+    // Go back to main
+    git(&root, &["checkout", "main"]);
+
+    // Now check out the unrelated branch (it has commits but shares no history)
+    git(&root, &["checkout", "unrelated"]);
+
+    // Should still get an empty overlay (branches are unrelated)
+    assert!(
+        !root.join("NOTES.md").exists(),
+        "checking out unrelated branch should not inherit overlay"
+    );
+
+    cleanup(&root);
+}
+
+// ─── Worktrees ──────────────────────────────────────────────────────
+
+#[test]
+fn worktree_gets_overlay_forked_from_main() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Add overlay content on main
+    fs::write(root.join("NOTES.md"), "main notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "main notes"]);
+
+    // Create a branch for the worktree
+    git(&root, &["branch", "feature"]);
+
+    // Create a worktree
+    let wt_dir = root.parent().unwrap().join(format!(
+        "subcontext-wt-{}-{}",
+        std::process::id(),
+        COUNTER.load(Ordering::SeqCst)
+    ));
+    git(
+        &root,
+        &["worktree", "add", &wt_dir.to_string_lossy(), "feature"],
+    );
+
+    // The overlay branch should have been created (forked from main's overlay)
+    let branches = git_in_repo(&root, &["branch", "--list", "overlay/feature"]);
+    assert!(
+        branches.contains("overlay/feature"),
+        "overlay/feature branch should be created for worktree"
+    );
+
+    // The overlay file should be applied in the worktree
+    assert!(
+        wt_dir.join("NOTES.md").exists(),
+        "overlay file should be applied in worktree"
+    );
+    let content = fs::read_to_string(wt_dir.join("NOTES.md")).unwrap();
+    assert_eq!(
+        content, "main notes\n",
+        "worktree overlay should inherit content from main"
+    );
+
+    // Per-worktree work dir should exist
+    let wt_name = wt_dir.file_name().unwrap().to_string_lossy().to_string();
+    let wt_work = root
+        .join(".git/.subcontext/worktrees")
+        .join(&wt_name);
+    assert!(
+        wt_work.is_dir(),
+        "per-worktree work directory should exist at .git/.subcontext/worktrees/{wt_name}"
+    );
+
+    // Clean up worktree
+    git(&root, &["worktree", "remove", "--force", &wt_dir.to_string_lossy()]);
+    cleanup(&wt_dir);
+    cleanup(&root);
+}
+
+#[test]
+fn worktree_overlay_is_independent_from_main() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Add overlay content on main
+    fs::write(root.join("NOTES.md"), "main notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "main notes"]);
+
+    // Create worktree
+    git(&root, &["branch", "feature"]);
+    let wt_dir = root.parent().unwrap().join(format!(
+        "subcontext-wt2-{}-{}",
+        std::process::id(),
+        COUNTER.load(Ordering::SeqCst)
+    ));
+    git(
+        &root,
+        &["worktree", "add", &wt_dir.to_string_lossy(), "feature"],
+    );
+
+    // Modify the overlay in the worktree (write directly, then save via subcontext)
+    fs::write(wt_dir.join("NOTES.md"), "feature notes\n").unwrap();
+
+    // Main checkout should still have its own content
+    let main_content = fs::read_to_string(root.join("NOTES.md")).unwrap();
+    assert_eq!(main_content, "main notes\n", "main overlay should be unaffected by worktree changes");
+
+    // Clean up
+    git(&root, &["worktree", "remove", "--force", &wt_dir.to_string_lossy()]);
+    cleanup(&wt_dir);
+    cleanup(&root);
+}
+
+// ─── Helper ─────────────────────────────────────────────────────────
+
+/// Run a git command in the subcontext bare repo.
+fn git_in_repo(root: &Path, args: &[&str]) -> String {
+    let repo_path = root.join(".git/.subcontext/repo");
+    let git_dir_flag = format!("--git-dir={}", repo_path.display());
+    let mut full_args = vec![git_dir_flag.as_str()];
+    full_args.extend_from_slice(args);
+    git(root, &full_args)
 }

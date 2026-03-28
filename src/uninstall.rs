@@ -3,28 +3,53 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
+use crate::git::{config_dir, subcontext_dir, CheckoutContext};
+use crate::overlay;
+
 /// Run `subcontext uninstall` from the given repo root.
 pub fn uninstall(root: &Path) -> Result<()> {
-    let subcontext_dir = root.join(".subcontext");
+    let sc_dir = subcontext_dir(root);
 
-    if !subcontext_dir.exists() {
-        eprintln!("[subcontext] No .subcontext/ found — nothing to uninstall.");
+    if !sc_dir.exists() {
+        eprintln!("[subcontext] No .git/.subcontext/ found — nothing to uninstall.");
         return Ok(());
     }
 
-    // Step 1: Restore or remove the post-checkout hook
-    restore_hook(root)?;
+    // Step 1: Unapply overlay (remove overlay files from root, restore both-repo files)
+    let ctx = CheckoutContext::main_only(root);
+    if let Err(e) = overlay::unapply_overlay(&ctx) {
+        eprintln!("[subcontext] warning: failed to unapply overlay: {e:#}");
+    }
 
-    // Step 2: Remove subcontext entry from Claude settings
+    // Step 2: Restore or remove hooks
+    restore_hook(root, "post-checkout")?;
+    restore_hook(root, "post-commit")?;
+
+    // Step 3: Remove subcontext entry from Claude settings
     remove_claude_settings(root)?;
 
-    eprintln!("[subcontext] Uninstall complete. .subcontext/ directory was left in place.");
+    // Step 4: Clean up all subcontext excludes (including worktree sections)
+    overlay::clean_all_excludes(root)?;
+
+    // Step 5: Remove .git/.subcontext/
+    // First remove worktrees, then the directory
+    let work = sc_dir.join("work");
+    let config = sc_dir.join("config");
+    if work.exists() {
+        fs::remove_dir_all(&work).ok();
+    }
+    if config.exists() {
+        fs::remove_dir_all(&config).ok();
+    }
+    fs::remove_dir_all(&sc_dir).ok();
+
+    eprintln!("[subcontext] Uninstall complete.");
     Ok(())
 }
 
 /// Remove the subcontext hook dispatcher and restore the original hook if backed up.
-fn restore_hook(root: &Path) -> Result<()> {
-    let hook_path = root.join(".git").join("hooks").join("post-checkout");
+fn restore_hook(root: &Path, hook_name: &str) -> Result<()> {
+    let hook_path = root.join(".git").join("hooks").join(hook_name);
 
     if !hook_path.exists() {
         return Ok(());
@@ -32,21 +57,16 @@ fn restore_hook(root: &Path) -> Result<()> {
 
     // Only touch the hook if it's ours
     let content = fs::read_to_string(&hook_path).unwrap_or_default();
-    if !content.contains("subcontext _hook post-checkout") {
-        eprintln!("[subcontext] post-checkout hook is not ours — skipping.");
+    if !content.contains(&format!("subcontext _hook {hook_name}")) {
+        eprintln!("[subcontext] {hook_name} hook is not ours — skipping.");
         return Ok(());
     }
 
-    let backup_path = root
-        .join(".subcontext")
-        .join(".mnt")
-        .join("config")
-        .join("hooks")
-        .join("old")
-        .join("post-checkout");
+    let backup_path = config_dir(root).join("hooks").join("old").join(hook_name);
 
     if backup_path.exists() {
-        fs::copy(&backup_path, &hook_path).context("failed to restore original post-checkout hook")?;
+        fs::copy(&backup_path, &hook_path)
+            .with_context(|| format!("failed to restore original {hook_name} hook"))?;
 
         #[cfg(unix)]
         {
@@ -56,10 +76,11 @@ fn restore_hook(root: &Path) -> Result<()> {
             fs::set_permissions(&hook_path, perms)?;
         }
 
-        eprintln!("[subcontext] Restored original post-checkout hook.");
+        eprintln!("[subcontext] Restored original {hook_name} hook.");
     } else {
-        fs::remove_file(&hook_path).context("failed to remove post-checkout hook")?;
-        eprintln!("[subcontext] Removed post-checkout hook.");
+        fs::remove_file(&hook_path)
+            .with_context(|| format!("failed to remove {hook_name} hook"))?;
+        eprintln!("[subcontext] Removed {hook_name} hook.");
     }
 
     Ok(())
@@ -89,7 +110,10 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
                         hooks.iter().any(|h| {
                             h.get("command")
                                 .and_then(|c| c.as_str())
-                                .is_some_and(|c| c == "subcontext startup")
+                                .is_some_and(|c| {
+                                    c == "subcontext startup --claude-code"
+                                        || c == "subcontext startup"
+                                })
                         })
                     })
             });
@@ -110,3 +134,4 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
 
     Ok(())
 }
+
