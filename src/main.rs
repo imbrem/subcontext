@@ -5,6 +5,7 @@ mod install;
 mod settings;
 mod startup;
 mod status;
+mod uninstall;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -23,7 +24,12 @@ struct Cli {
 #[derive(Subcommand)]
 enum Commands {
     /// Initialize a subcontext repo in the current Git project
-    Install,
+    Install {
+        /// Re-install hooks even if they already contain subcontext dispatchers,
+        /// backing up the existing hook to hooks/backup/ (not executed)
+        #[arg(long)]
+        repair: bool,
+    },
 
     /// Clone an existing subcontext repo and attach it to this project
     Clone {
@@ -33,6 +39,9 @@ enum Commands {
 
     /// Print task context for Claude's SessionStart hook
     Startup,
+
+    /// Remove subcontext hooks and Claude settings from the current project
+    Uninstall,
 
     /// Show current repo, worktree, and subcontext status
     Status,
@@ -60,9 +69,9 @@ fn main() -> Result<()> {
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Commands::Install => {
+        Commands::Install { repair } => {
             let root = git::find_main_git_root(&cwd)?;
-            install::install(&root)?;
+            install::install(&root, repair)?;
         }
         Commands::Clone { url } => {
             let root = git::find_main_git_root(&cwd)?;
@@ -71,6 +80,10 @@ fn main() -> Result<()> {
         Commands::Startup => {
             let root = git::find_main_git_root(&cwd)?;
             startup::startup(&root)?;
+        }
+        Commands::Uninstall => {
+            let root = git::find_main_git_root(&cwd)?;
+            uninstall::uninstall(&root)?;
         }
         Commands::Status => {
             status::status(&cwd)?;

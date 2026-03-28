@@ -154,14 +154,23 @@ fn install_creates_expected_structure() {
 }
 
 #[test]
-fn install_refuses_if_already_exists() {
+fn install_reinstall_succeeds() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
+    // Re-running install should succeed (re-install hooks + settings)
     let out = subcontext(&root, &["install"]);
-    assert!(!out.status.success());
+    assert!(
+        out.status.success(),
+        "reinstall failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
-    assert!(stderr.contains("already exists"));
+    assert!(stderr.contains("re-installing"));
+
+    // Hook should still work
+    let hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
+    assert!(hook.contains("subcontext _hook post-checkout"));
 
     cleanup(&root);
 }
@@ -348,6 +357,171 @@ fn hook_propagates_old_hook_failure() {
         !out.status.success(),
         "hook should propagate old hook failure, but exited successfully"
     );
+
+    cleanup(&root);
+}
+
+// ─── Uninstall ──────────────────────────────────────────────────────
+
+#[test]
+fn uninstall_removes_hook_and_settings() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["uninstall"]);
+
+    // Hook dispatcher should be gone
+    assert!(!root.join(".git/hooks/post-checkout").exists());
+
+    // Settings should no longer contain subcontext startup
+    let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
+    assert!(!settings.contains("subcontext startup"));
+
+    // .subcontext/ directory should still exist
+    assert!(root.join(".subcontext").is_dir());
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_restores_original_hook() {
+    let root = make_test_repo();
+
+    // Write a pre-existing executable hook
+    let hook_path = root.join(".git/hooks/post-checkout");
+    fs::write(&hook_path, "#!/bin/sh\necho original-hook\n").unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    subcontext_ok(&root, &["install"]);
+
+    // Verify hook was replaced
+    let hook = fs::read_to_string(&hook_path).unwrap();
+    assert!(hook.contains("subcontext _hook post-checkout"));
+
+    subcontext_ok(&root, &["uninstall"]);
+
+    // Original hook should be restored
+    let hook = fs::read_to_string(&hook_path).unwrap();
+    assert!(hook.contains("original-hook"));
+    assert!(!hook.contains("subcontext"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_preserves_other_settings() {
+    let root = make_test_repo();
+
+    // Write pre-existing settings with custom key
+    fs::create_dir_all(root.join(".claude")).unwrap();
+    fs::write(
+        root.join(".claude/settings.local.json"),
+        r#"{"myCustomKey": true}"#,
+    )
+    .unwrap();
+
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["uninstall"]);
+
+    let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
+    assert!(settings.contains("myCustomKey"));
+    assert!(!settings.contains("subcontext startup"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn install_repair_backs_up_subcontext_hook() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Re-install with --repair should back up the subcontext hook to hooks/backup/
+    subcontext_ok(&root, &["install", "--repair"]);
+
+    let backup = root.join(".subcontext/.mnt/config/hooks/backup/post-checkout");
+    assert!(backup.exists(), "repair should create hooks/backup/post-checkout");
+    let content = fs::read_to_string(&backup).unwrap();
+    assert!(content.contains("subcontext"));
+
+    // hooks/old/ should NOT have the subcontext dispatcher (it would cause a loop)
+    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
+    if old.exists() {
+        let content = fs::read_to_string(&old).unwrap();
+        assert!(
+            !content.contains("subcontext"),
+            "hooks/old/ should not contain the subcontext dispatcher"
+        );
+    }
+
+    cleanup(&root);
+}
+
+#[test]
+fn install_reinstall_skips_subcontext_hook_backup() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Re-install without --repair should skip the subcontext hook, not back it up to old/
+    let out = subcontext(&root, &["install"]);
+    assert!(out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("already dispatches to subcontext"));
+
+    // hooks/old/ should not have the subcontext dispatcher
+    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
+    if old.exists() {
+        let content = fs::read_to_string(&old).unwrap();
+        assert!(!content.contains("subcontext"));
+    }
+
+    cleanup(&root);
+}
+
+#[test]
+fn install_comment_mentioning_subcontext_is_not_detected_as_dispatcher() {
+    let root = make_test_repo();
+
+    // Write a hook that mentions subcontext only in comments
+    let hook_path = root.join(".git/hooks/post-checkout");
+    fs::create_dir_all(root.join(".git/hooks")).unwrap();
+    fs::write(
+        &hook_path,
+        "#!/bin/sh\n# This hook was written before subcontext was installed\necho hello\n",
+    )
+    .unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mut perms = fs::metadata(&hook_path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&hook_path, perms).unwrap();
+    }
+
+    subcontext_ok(&root, &["install"]);
+
+    // The hook should have been backed up to old/ (not treated as a subcontext hook)
+    let old = root.join(".subcontext/.mnt/config/hooks/old/post-checkout");
+    assert!(old.exists(), "comment-only mention should be backed up to old/");
+    let content = fs::read_to_string(&old).unwrap();
+    assert!(content.contains("echo hello"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_idempotent() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["uninstall"]);
+    // Running again should succeed without error
+    subcontext_ok(&root, &["uninstall"]);
 
     cleanup(&root);
 }

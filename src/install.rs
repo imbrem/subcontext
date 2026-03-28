@@ -1,4 +1,4 @@
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
@@ -7,39 +7,42 @@ use crate::hook;
 use crate::settings::merge_claude_settings;
 
 /// Run `subcontext install` from the given repo root.
-pub fn install(root: &Path) -> Result<()> {
+pub fn install(root: &Path, repair: bool) -> Result<()> {
     let subcontext_dir = root.join(".subcontext");
-
-    // Step 1: Verify .subcontext/ doesn't already exist
-    if subcontext_dir.exists() {
-        bail!(
-            ".subcontext/ already exists. If you want to re-initialize, remove it first, \
-             or use `subcontext clone` to attach an existing context repo."
-        );
-    }
-
-    // Step 2-3: Init context repo (creates config branch)
-    eprintln!("[subcontext] Initializing context repo...");
     let branch = current_branch(root)?;
-    init_context_repo(root, &branch)?;
 
-    // Step 4: Check out config branch as a worktree
-    // (main worktree was switched to worktrees/<branch> in init, so config is free)
-    let mnt_config = subcontext_dir.join(".mnt").join("config");
-    eprintln!("[subcontext] Setting up config worktree...");
-    run_git(
-        &["worktree", "add", &mnt_config.to_string_lossy(), "config"],
-        &subcontext_dir,
-    )?;
+    if subcontext_dir.exists() {
+        // Re-install: skip repo init, just redo hooks + settings
+        eprintln!("[subcontext] .subcontext/ exists — re-installing hooks and settings...");
+    } else {
+        // Fresh install: init context repo + config worktree
+        eprintln!("[subcontext] Initializing context repo...");
+        init_context_repo(root, &branch)?;
+
+        let mnt_config = subcontext_dir.join(".mnt").join("config");
+        eprintln!("[subcontext] Setting up config worktree...");
+        run_git(
+            &["worktree", "add", &mnt_config.to_string_lossy(), "config"],
+            &subcontext_dir,
+        )?;
+    }
 
     // Step 5: Add excludes
     add_excludes(root)?;
 
     // Step 6: Back up existing hooks
-    backup_existing_hooks(root)?;
+    let hook_is_ours = hook_dispatches_to_subcontext(root);
+    backup_existing_hooks(root, repair, hook_is_ours)?;
 
-    // Step 7: Install hook dispatcher
-    install_hook_dispatcher(root)?;
+    // Step 7: Install hook dispatcher (skip if already ours and not repairing)
+    if hook_is_ours && !repair {
+        eprintln!(
+            "[subcontext] post-checkout hook already dispatches to subcontext — \
+             leaving it in place (use --repair to overwrite)"
+        );
+    } else {
+        install_hook_dispatcher(root)?;
+    }
 
     // Step 8: Migrate Claude settings
     merge_claude_settings(root)?;
@@ -59,7 +62,7 @@ pub fn install_from_step5(root: &Path) -> Result<()> {
     add_excludes(root)?;
 
     // Step 6: Back up existing hooks
-    backup_existing_hooks(root)?;
+    backup_existing_hooks(root, false, false)?;
 
     // Step 7: Install hook dispatcher
     install_hook_dispatcher(root)?;
@@ -169,19 +172,68 @@ fn add_to_exclude(exclude_path: &Path, entry: &str) -> Result<()> {
     Ok(())
 }
 
+/// Check whether a shell script line (outside of comments) invokes subcontext.
+/// Returns true if any non-comment line contains `subcontext` as a word boundary
+/// (preceded by whitespace, start-of-line, or path separator).
+fn line_invokes_subcontext(line: &str) -> bool {
+    let trimmed = line.trim();
+    // Skip comments
+    if trimmed.starts_with('#') {
+        return false;
+    }
+    // Look for `subcontext` preceded by a word boundary: start of token after
+    // whitespace, or after a path separator (/), or at line start.
+    // This avoids matching e.g. "notsubcontext" while still matching
+    // "exec subcontext", "/usr/bin/subcontext", etc.
+    let mut rest = trimmed;
+    while let Some(pos) = rest.find("subcontext") {
+        if pos == 0 {
+            return true;
+        }
+        let prev = rest.as_bytes()[pos - 1];
+        if prev == b' ' || prev == b'\t' || prev == b'/' || prev == b'=' || prev == b'"' || prev == b'\'' {
+            return true;
+        }
+        rest = &rest[pos + "subcontext".len()..];
+    }
+    false
+}
+
+/// Check whether the post-checkout hook dispatches to subcontext
+/// (i.e. a non-comment line invokes `subcontext`).
+fn hook_dispatches_to_subcontext(root: &Path) -> bool {
+    let hook_path = root.join(".git").join("hooks").join("post-checkout");
+    let content = match fs::read_to_string(&hook_path) {
+        Ok(c) => c,
+        Err(_) => return false,
+    };
+    content.lines().any(line_invokes_subcontext)
+}
+
 /// Step 6: Back up existing hooks.
-fn backup_existing_hooks(root: &Path) -> Result<()> {
+///
+/// If a hook dispatches to subcontext (detected via `is_subcontext_hook`) it is
+/// skipped — unless `repair` is true, in which case it is copied to
+/// `hooks/backup/` (which is *not* executed) so the user can inspect it.
+fn backup_existing_hooks(root: &Path, repair: bool, is_subcontext_hook: bool) -> Result<()> {
     let hooks_dir = root.join(".git").join("hooks");
     if !hooks_dir.exists() {
         return Ok(());
     }
+
+    let old_dir = root
+        .join(".subcontext")
+        .join(".mnt")
+        .join("config")
+        .join("hooks")
+        .join("old");
 
     let backup_dir = root
         .join(".subcontext")
         .join(".mnt")
         .join("config")
         .join("hooks")
-        .join("old");
+        .join("backup");
 
     for entry in fs::read_dir(&hooks_dir)? {
         let entry = entry?;
@@ -207,13 +259,25 @@ fn backup_existing_hooks(root: &Path) -> Result<()> {
             }
         }
 
-        fs::create_dir_all(&backup_dir)?;
-        let dest = backup_dir.join(path.file_name().unwrap());
+        let hook_name = path.file_name().unwrap().to_string_lossy().to_string();
+
+        // If this hook dispatches to subcontext, don't put it in old/ (it would loop).
+        if is_subcontext_hook && hook_name == "post-checkout" {
+            if repair {
+                fs::create_dir_all(&backup_dir)?;
+                let dest = backup_dir.join(&hook_name);
+                fs::copy(&path, &dest)?;
+                eprintln!(
+                    "[subcontext] Saved existing subcontext hook to hooks/backup/{hook_name}"
+                );
+            }
+            continue;
+        }
+
+        fs::create_dir_all(&old_dir)?;
+        let dest = old_dir.join(&hook_name);
         fs::copy(&path, &dest)?;
-        eprintln!(
-            "[subcontext] Backed up hook: {}",
-            path.file_name().unwrap().to_string_lossy()
-        );
+        eprintln!("[subcontext] Backed up hook: {hook_name}");
     }
 
     Ok(())
