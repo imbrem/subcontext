@@ -17,6 +17,8 @@ cargo run -- <command>       # run subcontext commands (install, clone, add, sav
 
 No linter or formatter is configured — use `cargo clippy` and `cargo fmt` as needed.
 
+**Always run `cargo fmt` before committing or pushing.**
+
 ## Architecture
 
 All source lives in `src/` with one module per command:
