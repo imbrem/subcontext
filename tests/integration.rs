@@ -58,6 +58,16 @@ fn test_env() -> Vec<(OsString, OsString)> {
             OsString::from("GIT_CONFIG_SYSTEM"),
             OsString::from("/dev/null"),
         ),
+        // Allow file:// transport for local submodule clones in tests
+        (OsString::from("GIT_CONFIG_COUNT"), OsString::from("1")),
+        (
+            OsString::from("GIT_CONFIG_KEY_0"),
+            OsString::from("protocol.file.allow"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_VALUE_0"),
+            OsString::from("always"),
+        ),
     ]
 }
 
@@ -943,6 +953,260 @@ fn worktree_overlay_is_independent_from_main() {
         &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
     );
     cleanup(&wt_dir);
+    cleanup(&root);
+}
+
+// ─── Submodule ─────────────────────────────────────────────────────
+
+/// Create a local bare repo that can be used as a submodule source.
+fn make_submodule_source() -> PathBuf {
+    let id = COUNTER.fetch_add(1, Ordering::SeqCst);
+    let dir = std::env::temp_dir().join(format!(
+        "subcontext-sub-{}-{}",
+        std::process::id(),
+        id
+    ));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    fs::create_dir_all(&dir).unwrap();
+
+    // Create a regular repo with some content
+    git(&dir, &["-c", "init.defaultBranch=main", "init"]);
+    fs::write(dir.join("lib.rs"), "pub fn hello() {}\n").unwrap();
+    git(&dir, &["add", "lib.rs"]);
+    git(&dir, &["commit", "-m", "initial lib commit"]);
+
+    // Clone as bare to use as remote source
+    let bare_dir = std::env::temp_dir().join(format!(
+        "subcontext-sub-bare-{}-{}",
+        std::process::id(),
+        id
+    ));
+    if bare_dir.exists() {
+        fs::remove_dir_all(&bare_dir).unwrap();
+    }
+    git(
+        &std::env::temp_dir(),
+        &["clone", "--bare", &dir.to_string_lossy(), &bare_dir.to_string_lossy()],
+    );
+
+    cleanup(&dir);
+    bare_dir
+}
+
+#[test]
+fn submodule_add_creates_submodule_in_overlay() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    // Add submodule
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy(), "lib/mylib"],
+    );
+
+    // Submodule files should be in checkout root
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule file should be copied to checkout root"
+    );
+    let content = fs::read_to_string(root.join("lib/mylib/lib.rs")).unwrap();
+    assert!(content.contains("pub fn hello()"));
+
+    // .gitmodules should exist in checkout root
+    assert!(
+        root.join(".gitmodules").exists(),
+        ".gitmodules should be copied to checkout root"
+    );
+
+    // Submodule files should be in work dir
+    assert!(root
+        .join(".git/.subcontext/work/lib/mylib/lib.rs")
+        .exists());
+
+    // Submodule dir should be excluded from host git status
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("lib/mylib"),
+        "submodule dir should be excluded from git status, got: {status}"
+    );
+
+    // .gitmodules should also be excluded
+    assert!(
+        !status.contains(".gitmodules"),
+        ".gitmodules should be excluded from git status, got: {status}"
+    );
+
+    cleanup(&sub_source);
+    cleanup(&root);
+}
+
+#[test]
+fn submodule_add_derives_path_from_url() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    // Add submodule without specifying path — should derive from URL
+    let source_name = sub_source
+        .file_name()
+        .unwrap()
+        .to_string_lossy()
+        .to_string();
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy()],
+    );
+
+    // Submodule should be at the derived path
+    assert!(
+        root.join(&source_name).join("lib.rs").exists(),
+        "submodule should be at path derived from URL: {source_name}"
+    );
+
+    cleanup(&sub_source);
+    cleanup(&root);
+}
+
+#[test]
+fn submodule_survives_branch_switch() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    // Add submodule on main
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy(), "lib/mylib"],
+    );
+    subcontext_ok(&root, &["save", "-m", "add submodule"]);
+
+    // Switch to new branch — submodule should be inherited
+    git(&root, &["checkout", "-b", "feature"]);
+
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule should be inherited on new branch"
+    );
+
+    // Switch back to main — submodule should still be there
+    git(&root, &["checkout", "main"]);
+
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule should be present after switching back to main"
+    );
+
+    cleanup(&sub_source);
+    cleanup(&root);
+}
+
+#[test]
+fn submodule_remove_cleans_up() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy(), "lib/mylib"],
+    );
+
+    // Verify it exists
+    assert!(root.join("lib/mylib/lib.rs").exists());
+
+    // Remove it
+    subcontext_ok(&root, &["submodule", "remove", "lib/mylib"]);
+
+    // Submodule files should be gone from checkout root
+    assert!(
+        !root.join("lib/mylib").exists(),
+        "submodule dir should be removed from checkout root"
+    );
+
+    // Should not be in excludes anymore
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("lib/mylib"),
+        "submodule should not appear in git status after removal"
+    );
+
+    cleanup(&sub_source);
+    cleanup(&root);
+}
+
+#[test]
+fn submodule_update_initializes_submodules() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    // Add submodule
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy(), "lib/mylib"],
+    );
+
+    // Verify submodule update works (should be a no-op since already initialized)
+    subcontext_ok(&root, &["submodule", "update"]);
+
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule files should still be present after update"
+    );
+
+    cleanup(&sub_source);
+    cleanup(&root);
+}
+
+#[test]
+fn submodule_coexists_with_regular_overlay_files() {
+    let root = make_test_repo();
+    let sub_source = make_submodule_source();
+    subcontext_ok(&root, &["install"]);
+
+    // Add a regular overlay file
+    fs::write(root.join("NOTES.md"), "my notes\n").unwrap();
+    subcontext_ok(&root, &["add", "NOTES.md"]);
+    subcontext_ok(&root, &["save", "-m", "add notes"]);
+
+    // Add a submodule
+    subcontext_ok(
+        &root,
+        &["submodule", "add", &sub_source.to_string_lossy(), "lib/mylib"],
+    );
+
+    // Both should exist
+    assert!(root.join("NOTES.md").exists(), "regular overlay file should exist");
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule file should exist"
+    );
+
+    // Neither should appear in git status
+    let status = git(&root, &["status", "--porcelain"]);
+    assert!(
+        !status.contains("NOTES.md"),
+        "regular overlay file should be excluded, got: {status}"
+    );
+    assert!(
+        !status.contains("lib/mylib"),
+        "submodule should be excluded, got: {status}"
+    );
+
+    // Switch branch and back — both should survive
+    git(&root, &["checkout", "-b", "feature"]);
+    git(&root, &["checkout", "main"]);
+
+    assert!(root.join("NOTES.md").exists(), "overlay file should survive branch switch");
+    assert!(
+        root.join("lib/mylib/lib.rs").exists(),
+        "submodule should survive branch switch"
+    );
+
+    cleanup(&sub_source);
     cleanup(&root);
 }
 
