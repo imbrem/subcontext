@@ -40,12 +40,8 @@ pub fn run_work_git(args: &[&str], work: &Path) -> Result<String> {
     // Read the gitdir from work/.git file
     let dot_git = work.join(".git");
     let gitdir = if dot_git.is_file() {
-        let content = std::fs::read_to_string(&dot_git)
-            .context("failed to read work/.git file")?;
-        let path = content
-            .strip_prefix("gitdir: ")
-            .unwrap_or(&content)
-            .trim();
+        let content = std::fs::read_to_string(&dot_git).context("failed to read work/.git file")?;
+        let path = content.strip_prefix("gitdir: ").unwrap_or(&content).trim();
         if Path::new(path).is_absolute() {
             PathBuf::from(path)
         } else {
@@ -150,12 +146,9 @@ pub fn find_checkout_context(start: &Path) -> Result<CheckoutContext> {
             return Ok(CheckoutContext::main_only(&current));
         }
         if dot_git.is_file() {
-            let content = std::fs::read_to_string(&dot_git)
-                .context("failed to read .git worktree file")?;
-            let gitdir_str = content
-                .strip_prefix("gitdir: ")
-                .unwrap_or(&content)
-                .trim();
+            let content =
+                std::fs::read_to_string(&dot_git).context("failed to read .git worktree file")?;
+            let gitdir_str = content.strip_prefix("gitdir: ").unwrap_or(&content).trim();
             let gitdir = if Path::new(gitdir_str).is_absolute() {
                 PathBuf::from(gitdir_str)
             } else {

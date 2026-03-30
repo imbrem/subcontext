@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-use crate::git::{config_dir, subcontext_dir, CheckoutContext};
+use crate::git::{CheckoutContext, config_dir, run_git, subcontext_dir};
 use crate::overlay;
 
 /// Run `subcontext uninstall` from the given repo root.
@@ -25,13 +25,16 @@ pub fn uninstall(root: &Path) -> Result<()> {
     restore_hook(root, "post-checkout")?;
     restore_hook(root, "post-commit")?;
 
-    // Step 3: Remove subcontext entry from Claude settings
+    // Step 3: Remove git alias
+    remove_git_alias(root);
+
+    // Step 4: Remove subcontext entry from Claude settings
     remove_claude_settings(root)?;
 
-    // Step 4: Clean up all subcontext excludes (including worktree sections)
+    // Step 5: Clean up all subcontext excludes (including worktree sections)
     overlay::clean_all_excludes(root)?;
 
-    // Step 5: Remove .git/.subcontext/
+    // Step 6: Remove .git/.subcontext/
     // First remove worktrees, then the directory
     let work = sc_dir.join("work");
     let config = sc_dir.join("config");
@@ -47,6 +50,14 @@ pub fn uninstall(root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Remove the `git subcontext` alias from local git config.
+fn remove_git_alias(root: &Path) {
+    match run_git(&["config", "--unset", "alias.subcontext"], root) {
+        Ok(_) => eprintln!("[subcontext] Removed git alias."),
+        Err(_) => {} // alias may not exist
+    }
+}
+
 /// Remove the subcontext hook dispatcher and restore the original hook if backed up.
 fn restore_hook(root: &Path, hook_name: &str) -> Result<()> {
     let hook_path = root.join(".git").join("hooks").join(hook_name);
@@ -57,7 +68,9 @@ fn restore_hook(root: &Path, hook_name: &str) -> Result<()> {
 
     // Only touch the hook if it's ours
     let content = fs::read_to_string(&hook_path).unwrap_or_default();
-    if !content.contains(&format!("subcontext _hook {hook_name}")) {
+    if !content.contains(&format!("subcontext _hook {hook_name}"))
+        && !content.contains(&format!("git subcontext _hook {hook_name}"))
+    {
         eprintln!("[subcontext] {hook_name} hook is not ours — skipping.");
         return Ok(());
     }
@@ -94,8 +107,8 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&settings_path)
-        .context("failed to read .claude/settings.local.json")?;
+    let content =
+        fs::read_to_string(&settings_path).context("failed to read .claude/settings.local.json")?;
     let mut settings: Value =
         serde_json::from_str(&content).context("failed to parse .claude/settings.local.json")?;
 
@@ -108,12 +121,11 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
                     .and_then(|h| h.as_array())
                     .is_some_and(|hooks| {
                         hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| {
-                                    c == "subcontext startup --claude-code"
-                                        || c == "subcontext startup"
-                                })
+                            h.get("command").and_then(|c| c.as_str()).is_some_and(|c| {
+                                c == "git subcontext startup --claude-code"
+                                    || c == "subcontext startup --claude-code"
+                                    || c == "subcontext startup"
+                            })
                         })
                     })
             });
@@ -134,4 +146,3 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
 
     Ok(())
 }
-

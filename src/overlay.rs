@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use std::fs;
 use std::path::Path;
 
-use crate::git::{run_git, run_subcontext_git, run_work_git, CheckoutContext};
+use crate::git::{CheckoutContext, run_git, run_subcontext_git, run_work_git};
 
 // ─── Branch operations (bare repo only, no checkout context needed) ──
 
@@ -13,17 +13,15 @@ pub fn create_overlay_branch(root: &Path, branch: &str) -> Result<()> {
 
     // Create a commit pointing to the empty tree
     let commit = run_subcontext_git(
-        &[
-            "commit-tree",
-            &empty_tree,
-            "-m",
-            &format!("init {branch}"),
-        ],
+        &["commit-tree", &empty_tree, "-m", &format!("init {branch}")],
         root,
     )?;
 
     // Create the ref
-    run_subcontext_git(&["update-ref", &format!("refs/heads/{branch}"), &commit], root)?;
+    run_subcontext_git(
+        &["update-ref", &format!("refs/heads/{branch}"), &commit],
+        root,
+    )?;
 
     Ok(())
 }
@@ -37,8 +35,10 @@ pub fn create_overlay_branch_from(root: &Path, branch: &str, source: &str) -> Re
 
 /// Check if an overlay branch exists in the subcontext repo.
 pub fn overlay_branch_exists(root: &Path, branch: &str) -> Result<bool> {
-    let result =
-        run_subcontext_git(&["show-ref", "--verify", &format!("refs/heads/{branch}")], root);
+    let result = run_subcontext_git(
+        &["show-ref", "--verify", &format!("refs/heads/{branch}")],
+        root,
+    );
     Ok(result.is_ok())
 }
 
@@ -124,12 +124,15 @@ pub fn apply_overlay(ctx: &CheckoutContext) -> Result<()> {
         if let Some(parent) = dest.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::copy(&src, &dest)
-            .with_context(|| format!("failed to copy overlay file: {file}"))?;
+        fs::copy(&src, &dest).with_context(|| format!("failed to copy overlay file: {file}"))?;
 
         // If this file is tracked by the host repo, set skip-worktree
         if is_tracked_by_host(ctx, file)? {
-            run_git(&["update-index", "--skip-worktree", file], &ctx.checkout_root).ok();
+            run_git(
+                &["update-index", "--skip-worktree", file],
+                &ctx.checkout_root,
+            )
+            .ok();
         }
     }
 
@@ -179,7 +182,11 @@ pub fn unapply_overlay(ctx: &CheckoutContext) -> Result<()> {
 
         if tracked {
             // Restore host repo version
-            run_git(&["update-index", "--no-skip-worktree", file], &ctx.checkout_root).ok();
+            run_git(
+                &["update-index", "--no-skip-worktree", file],
+                &ctx.checkout_root,
+            )
+            .ok();
             run_git(&["checkout", "--", file], &ctx.checkout_root).ok();
         } else {
             // Remove overlay-only file
@@ -234,7 +241,11 @@ pub fn add_file(ctx: &CheckoutContext, path: &str) -> Result<()> {
 
     // If tracked by host repo, set skip-worktree
     if is_tracked_by_host(ctx, path)? {
-        run_git(&["update-index", "--skip-worktree", path], &ctx.checkout_root).ok();
+        run_git(
+            &["update-index", "--skip-worktree", path],
+            &ctx.checkout_root,
+        )
+        .ok();
     }
 
     sync_excludes(ctx)?;
@@ -253,7 +264,11 @@ pub fn remove_file(ctx: &CheckoutContext, path: &str) -> Result<()> {
 
     if tracked {
         // Restore host repo version
-        run_git(&["update-index", "--no-skip-worktree", path], &ctx.checkout_root).ok();
+        run_git(
+            &["update-index", "--no-skip-worktree", path],
+            &ctx.checkout_root,
+        )
+        .ok();
         run_git(&["checkout", "--", path], &ctx.checkout_root).ok();
     } else {
         // Remove from checkout root

@@ -14,8 +14,7 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
             return Ok((current.clone(), current));
         }
         if dot_git.is_file() {
-            let contents =
-                std::fs::read_to_string(&dot_git).context("failed to read .git file")?;
+            let contents = std::fs::read_to_string(&dot_git).context("failed to read .git file")?;
             let gitdir = contents
                 .strip_prefix("gitdir: ")
                 .unwrap_or(&contents)

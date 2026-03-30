@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::git::{
-    config_dir, current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name,
-    subcontext_dir, work_dir, CheckoutContext,
+    CheckoutContext, config_dir, current_branch, repo_dir, run_git, run_subcontext_git,
+    sanitize_branch_name, subcontext_dir, work_dir,
 };
 use crate::overlay;
 use crate::settings::merge_claude_settings;
@@ -21,6 +21,7 @@ pub fn install(root: &Path, repair: bool) -> Result<()> {
         init_context_repo(root, &branch)?;
     }
 
+    install_git_alias(root)?;
     install_from_hooks(root, repair)?;
 
     print_summary(&branch);
@@ -66,6 +67,18 @@ pub fn install_from_hooks(root: &Path, repair: bool) -> Result<()> {
     Ok(())
 }
 
+/// Install a local git alias so `git subcontext` dispatches to the `subcontext` binary.
+fn install_git_alias(root: &Path) -> Result<()> {
+    // Resolve the absolute path to the currently running binary
+    let exe = std::env::current_exe().context("failed to resolve subcontext binary path")?;
+    let exe_str = exe.to_string_lossy();
+    let alias_value = format!("!{exe_str}");
+
+    run_git(&["config", "alias.subcontext", &alias_value], root)?;
+    eprintln!("[subcontext] Configured git alias: git subcontext → {exe_str}");
+    Ok(())
+}
+
 /// Initialize the subcontext bare repo, config branch/worktree, and first overlay branch.
 fn init_context_repo(root: &Path, host_branch: &str) -> Result<()> {
     let sc_dir = subcontext_dir(root);
@@ -82,21 +95,11 @@ fn init_context_repo(root: &Path, host_branch: &str) -> Result<()> {
         &["commit-tree", &empty_tree, "-m", "init config branch"],
         root,
     )?;
-    run_subcontext_git(
-        &[
-            "update-ref",
-            "refs/heads/config",
-            &config_commit,
-        ],
-        root,
-    )?;
+    run_subcontext_git(&["update-ref", "refs/heads/config", &config_commit], root)?;
 
     // 3. Add config worktree
     let cfg = config_dir(root);
-    run_subcontext_git(
-        &["worktree", "add", &cfg.to_string_lossy(), "config"],
-        root,
-    )?;
+    run_subcontext_git(&["worktree", "add", &cfg.to_string_lossy(), "config"], root)?;
 
     // 4. Create overlay/<current-branch> via plumbing (empty)
     let safe_branch = sanitize_branch_name(host_branch);
@@ -221,9 +224,9 @@ fn install_hook_dispatcher(root: &Path, hook_name: &str) -> Result<()> {
     let hook_path = hooks_dir.join(hook_name);
     let script = format!(
         r#"#!/bin/sh
-# Installed by subcontext. Dispatches to `subcontext _hook {hook_name}`.
+# Installed by subcontext. Dispatches to `git subcontext _hook {hook_name}`.
 # Your original hook (if any) is backed up and called automatically.
-exec subcontext _hook {hook_name} "$@"
+exec git subcontext _hook {hook_name} "$@"
 "#
     );
 
@@ -268,11 +271,7 @@ fn print_summary(branch: &str) {
     eprintln!("  Config mount:  .git/.subcontext/config/");
     eprintln!("  Work mount:    .git/.subcontext/work/");
     eprintln!("  Overlay branch: overlay/{safe}");
-    eprintln!(
-        "  Hooks:         .git/hooks/post-checkout, .git/hooks/post-commit"
-    );
+    eprintln!("  Hooks:         .git/hooks/post-checkout, .git/hooks/post-commit");
     eprintln!();
-    eprintln!(
-        "  Use `subcontext add <file>` to add files to the overlay."
-    );
+    eprintln!("  Use `git subcontext add <file>` to add files to the overlay.");
 }

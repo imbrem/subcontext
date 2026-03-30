@@ -11,7 +11,7 @@ fn subcontext_hook_entry() -> Value {
         "hooks": [
             {
                 "type": "command",
-                "command": "subcontext startup --claude-code"
+                "command": "git subcontext startup --claude-code"
             }
         ]
     })
@@ -59,11 +59,11 @@ pub fn merge_claude_settings(root: &Path) -> Result<()> {
             .and_then(|h| h.as_array())
             .is_some_and(|hooks| {
                 hooks.iter().any(|h| {
-                    h.get("command")
-                        .and_then(|c| c.as_str())
-                        .is_some_and(|c| {
-                            c == "subcontext startup --claude-code" || c == "subcontext startup"
-                        })
+                    h.get("command").and_then(|c| c.as_str()).is_some_and(|c| {
+                        c == "git subcontext startup --claude-code"
+                            || c == "subcontext startup --claude-code"
+                            || c == "subcontext startup"
+                    })
                 })
             })
     });
