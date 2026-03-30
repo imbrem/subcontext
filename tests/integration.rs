@@ -37,6 +37,18 @@ fn test_path() -> OsString {
     path
 }
 
+fn test_env() -> Vec<(OsString, OsString)> {
+    vec![
+        (OsString::from("PATH"), test_path()),
+        (OsString::from("GIT_AUTHOR_NAME"), OsString::from("Test")),
+        (OsString::from("GIT_AUTHOR_EMAIL"), OsString::from("test@test.com")),
+        (OsString::from("GIT_COMMITTER_NAME"), OsString::from("Test")),
+        (OsString::from("GIT_COMMITTER_EMAIL"), OsString::from("test@test.com")),
+        (OsString::from("GIT_CONFIG_GLOBAL"), OsString::from("/dev/null")),
+        (OsString::from("GIT_CONFIG_SYSTEM"), OsString::from("/dev/null")),
+    ]
+}
+
 fn make_test_repo() -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
     let dir =
@@ -46,7 +58,7 @@ fn make_test_repo() -> PathBuf {
     }
     fs::create_dir_all(&dir).unwrap();
 
-    git(&dir, &["init"]);
+    git(&dir, &["-c", "init.defaultBranch=main", "init"]);
     git(&dir, &["commit", "--allow-empty", "-m", "init"]);
 
     dir
@@ -59,7 +71,7 @@ fn cleanup(dir: &Path) {
 fn git(cwd: &Path, args: &[&str]) -> String {
     let out = Command::new("git")
         .args(args)
-        .env("PATH", test_path())
+        .envs(test_env())
         .current_dir(cwd)
         .output()
         .unwrap();
@@ -76,7 +88,7 @@ fn subcontext(cwd: &Path, args: &[&str]) -> std::process::Output {
     let bin = test_bin_dir().join("subcontext");
     Command::new(bin)
         .args(args)
-        .env("PATH", test_path())
+        .envs(test_env())
         .current_dir(cwd)
         .output()
         .unwrap()
@@ -114,14 +126,18 @@ fn install_creates_expected_structure() {
 
     // Claude settings were written
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
-    assert!(settings.contains("subcontext startup"));
+    assert!(settings.contains("git subcontext startup"));
 
     // Hook dispatchers installed
     let pc_hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
-    assert!(pc_hook.contains("subcontext _hook post-checkout"));
+    assert!(pc_hook.contains("git subcontext _hook post-checkout"));
 
     let pcm_hook = fs::read_to_string(root.join(".git/hooks/post-commit")).unwrap();
-    assert!(pcm_hook.contains("subcontext _hook post-commit"));
+    assert!(pcm_hook.contains("git subcontext _hook post-commit"));
+
+    // Git alias should be configured
+    let alias = git(&root, &["config", "alias.subcontext"]);
+    assert!(alias.contains("subcontext"), "git alias should point to subcontext binary");
 
     // Overlay branch exists
     let branches = git_in_repo(&root, &["branch", "--list", "overlay/main"]);
@@ -167,7 +183,7 @@ fn install_preserves_existing_claude_settings() {
 
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(settings.contains("myCustomKey"));
-    assert!(settings.contains("subcontext startup"));
+    assert!(settings.contains("git subcontext startup"));
 
     cleanup(&root);
 }
@@ -266,9 +282,10 @@ fn new_branch_from_empty_overlay_starts_empty() {
     let files = fs::read_to_string(root.join(".git/.subcontext/work/.gitkeep")).ok();
     assert!(files.is_none(), "new branch from empty overlay should be empty");
 
-    // No overlay files should be in root
+    // No overlay files should be in root (ignore .claude/ which is created by install)
     let status = git(&root, &["status", "--porcelain"]);
-    assert!(status.is_empty(), "should have no untracked files, got: {status}");
+    let non_claude: Vec<&str> = status.lines().filter(|l| !l.contains(".claude/")).collect();
+    assert!(non_claude.is_empty(), "should have no untracked overlay files, got: {status}");
 
     cleanup(&root);
 }
@@ -476,7 +493,7 @@ fn uninstall_cleans_up() {
 
     // Settings should no longer contain subcontext
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
-    assert!(!settings.contains("subcontext startup"));
+    assert!(!settings.contains("git subcontext startup"));
 
     cleanup(&root);
 }
@@ -522,7 +539,7 @@ fn uninstall_preserves_other_settings() {
 
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(settings.contains("myCustomKey"));
-    assert!(!settings.contains("subcontext startup"));
+    assert!(!settings.contains("git subcontext startup"));
 
     cleanup(&root);
 }

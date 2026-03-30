@@ -21,6 +21,7 @@ pub fn install(root: &Path, repair: bool) -> Result<()> {
         init_context_repo(root, &branch)?;
     }
 
+    install_git_alias(root)?;
     install_from_hooks(root, repair)?;
 
     print_summary(&branch);
@@ -63,6 +64,21 @@ pub fn install_from_hooks(root: &Path, repair: bool) -> Result<()> {
     // Commit config branch
     commit_config_branch(root)?;
 
+    Ok(())
+}
+
+/// Install a local git alias so `git subcontext` dispatches to the `subcontext` binary.
+fn install_git_alias(root: &Path) -> Result<()> {
+    // Resolve the absolute path to the currently running binary
+    let exe = std::env::current_exe().context("failed to resolve subcontext binary path")?;
+    let exe_str = exe.to_string_lossy();
+    let alias_value = format!("!{exe_str}");
+
+    run_git(
+        &["config", "alias.subcontext", &alias_value],
+        root,
+    )?;
+    eprintln!("[subcontext] Configured git alias: git subcontext → {exe_str}");
     Ok(())
 }
 
@@ -221,9 +237,9 @@ fn install_hook_dispatcher(root: &Path, hook_name: &str) -> Result<()> {
     let hook_path = hooks_dir.join(hook_name);
     let script = format!(
         r#"#!/bin/sh
-# Installed by subcontext. Dispatches to `subcontext _hook {hook_name}`.
+# Installed by subcontext. Dispatches to `git subcontext _hook {hook_name}`.
 # Your original hook (if any) is backed up and called automatically.
-exec subcontext _hook {hook_name} "$@"
+exec git subcontext _hook {hook_name} "$@"
 "#
     );
 
@@ -273,6 +289,6 @@ fn print_summary(branch: &str) {
     );
     eprintln!();
     eprintln!(
-        "  Use `subcontext add <file>` to add files to the overlay."
+        "  Use `git subcontext add <file>` to add files to the overlay."
     );
 }
