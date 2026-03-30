@@ -3,8 +3,8 @@ use std::fs;
 use std::path::Path;
 
 use crate::git::{
-    config_dir, current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name,
-    subcontext_dir, work_dir, CheckoutContext,
+    CheckoutContext, config_dir, current_branch, repo_dir, run_git, run_subcontext_git,
+    sanitize_branch_name, subcontext_dir, work_dir,
 };
 use crate::overlay;
 use crate::settings::merge_claude_settings;
@@ -74,10 +74,7 @@ fn install_git_alias(root: &Path) -> Result<()> {
     let exe_str = exe.to_string_lossy();
     let alias_value = format!("!{exe_str}");
 
-    run_git(
-        &["config", "alias.subcontext", &alias_value],
-        root,
-    )?;
+    run_git(&["config", "alias.subcontext", &alias_value], root)?;
     eprintln!("[subcontext] Configured git alias: git subcontext → {exe_str}");
     Ok(())
 }
@@ -98,21 +95,11 @@ fn init_context_repo(root: &Path, host_branch: &str) -> Result<()> {
         &["commit-tree", &empty_tree, "-m", "init config branch"],
         root,
     )?;
-    run_subcontext_git(
-        &[
-            "update-ref",
-            "refs/heads/config",
-            &config_commit,
-        ],
-        root,
-    )?;
+    run_subcontext_git(&["update-ref", "refs/heads/config", &config_commit], root)?;
 
     // 3. Add config worktree
     let cfg = config_dir(root);
-    run_subcontext_git(
-        &["worktree", "add", &cfg.to_string_lossy(), "config"],
-        root,
-    )?;
+    run_subcontext_git(&["worktree", "add", &cfg.to_string_lossy(), "config"], root)?;
 
     // 4. Create overlay/<current-branch> via plumbing (empty)
     let safe_branch = sanitize_branch_name(host_branch);
@@ -284,11 +271,7 @@ fn print_summary(branch: &str) {
     eprintln!("  Config mount:  .git/.subcontext/config/");
     eprintln!("  Work mount:    .git/.subcontext/work/");
     eprintln!("  Overlay branch: overlay/{safe}");
-    eprintln!(
-        "  Hooks:         .git/hooks/post-checkout, .git/hooks/post-commit"
-    );
+    eprintln!("  Hooks:         .git/hooks/post-checkout, .git/hooks/post-commit");
     eprintln!();
-    eprintln!(
-        "  Use `git subcontext add <file>` to add files to the overlay."
-    );
+    eprintln!("  Use `git subcontext add <file>` to add files to the overlay.");
 }

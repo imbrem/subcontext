@@ -4,7 +4,7 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::git::{
-    config_dir, current_branch, run_git, sanitize_branch_name, subcontext_dir, CheckoutContext,
+    CheckoutContext, config_dir, current_branch, run_git, sanitize_branch_name, subcontext_dir,
 };
 use crate::overlay;
 

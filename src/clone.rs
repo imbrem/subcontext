@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use std::path::Path;
 
 use crate::git::{
-    current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name, subcontext_dir,
-    work_dir, CheckoutContext,
+    CheckoutContext, current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name,
+    subcontext_dir, work_dir,
 };
 use crate::install::install_from_hooks;
 use crate::overlay;
@@ -28,8 +28,9 @@ pub fn clone(root: &Path, url: &str) -> Result<()> {
 
     // Set up config worktree
     let cfg = sc_dir.join("config");
-    run_subcontext_git(&["worktree", "add", &cfg.to_string_lossy(), "config"], root)
-        .context("failed to set up config worktree (does the 'config' branch exist in the remote?)")?;
+    run_subcontext_git(&["worktree", "add", &cfg.to_string_lossy(), "config"], root).context(
+        "failed to set up config worktree (does the 'config' branch exist in the remote?)",
+    )?;
 
     // Set up work/ worktree for current branch's overlay
     let branch = current_branch(root)?;

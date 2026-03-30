@@ -3,7 +3,7 @@ use serde_json::Value;
 use std::fs;
 use std::path::Path;
 
-use crate::git::{config_dir, run_git, subcontext_dir, CheckoutContext};
+use crate::git::{CheckoutContext, config_dir, run_git, subcontext_dir};
 use crate::overlay;
 
 /// Run `subcontext uninstall` from the given repo root.
@@ -107,8 +107,8 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    let content = fs::read_to_string(&settings_path)
-        .context("failed to read .claude/settings.local.json")?;
+    let content =
+        fs::read_to_string(&settings_path).context("failed to read .claude/settings.local.json")?;
     let mut settings: Value =
         serde_json::from_str(&content).context("failed to parse .claude/settings.local.json")?;
 
@@ -121,13 +121,11 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
                     .and_then(|h| h.as_array())
                     .is_some_and(|hooks| {
                         hooks.iter().any(|h| {
-                            h.get("command")
-                                .and_then(|c| c.as_str())
-                                .is_some_and(|c| {
-                                    c == "git subcontext startup --claude-code"
-                                        || c == "subcontext startup --claude-code"
-                                        || c == "subcontext startup"
-                                })
+                            h.get("command").and_then(|c| c.as_str()).is_some_and(|c| {
+                                c == "git subcontext startup --claude-code"
+                                    || c == "subcontext startup --claude-code"
+                                    || c == "subcontext startup"
+                            })
                         })
                     })
             });
@@ -148,4 +146,3 @@ fn remove_claude_settings(root: &Path) -> Result<()> {
 
     Ok(())
 }
-

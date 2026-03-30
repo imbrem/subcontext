@@ -41,18 +41,29 @@ fn test_env() -> Vec<(OsString, OsString)> {
     vec![
         (OsString::from("PATH"), test_path()),
         (OsString::from("GIT_AUTHOR_NAME"), OsString::from("Test")),
-        (OsString::from("GIT_AUTHOR_EMAIL"), OsString::from("test@test.com")),
+        (
+            OsString::from("GIT_AUTHOR_EMAIL"),
+            OsString::from("test@test.com"),
+        ),
         (OsString::from("GIT_COMMITTER_NAME"), OsString::from("Test")),
-        (OsString::from("GIT_COMMITTER_EMAIL"), OsString::from("test@test.com")),
-        (OsString::from("GIT_CONFIG_GLOBAL"), OsString::from("/dev/null")),
-        (OsString::from("GIT_CONFIG_SYSTEM"), OsString::from("/dev/null")),
+        (
+            OsString::from("GIT_COMMITTER_EMAIL"),
+            OsString::from("test@test.com"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_GLOBAL"),
+            OsString::from("/dev/null"),
+        ),
+        (
+            OsString::from("GIT_CONFIG_SYSTEM"),
+            OsString::from("/dev/null"),
+        ),
     ]
 }
 
 fn make_test_repo() -> PathBuf {
     let id = COUNTER.fetch_add(1, Ordering::SeqCst);
-    let dir =
-        std::env::temp_dir().join(format!("subcontext-test-{}-{}", std::process::id(), id));
+    let dir = std::env::temp_dir().join(format!("subcontext-test-{}-{}", std::process::id(), id));
     if dir.exists() {
         fs::remove_dir_all(&dir).unwrap();
     }
@@ -137,7 +148,10 @@ fn install_creates_expected_structure() {
 
     // Git alias should be configured
     let alias = git(&root, &["config", "alias.subcontext"]);
-    assert!(alias.contains("subcontext"), "git alias should point to subcontext binary");
+    assert!(
+        alias.contains("subcontext"),
+        "git alias should point to subcontext binary"
+    );
 
     // Overlay branch exists
     let branches = git_in_repo(&root, &["branch", "--list", "overlay/main"]);
@@ -253,7 +267,10 @@ fn overlay_files_switch_with_branches() {
 
     // NOTES.md should be inherited from main's overlay
     let content = fs::read_to_string(root.join("NOTES.md")).unwrap();
-    assert_eq!(content, "main notes\n", "new branch should inherit parent overlay");
+    assert_eq!(
+        content, "main notes\n",
+        "new branch should inherit parent overlay"
+    );
 
     // Overwrite with different content on feature
     fs::write(root.join("NOTES.md"), "feature notes\n").unwrap();
@@ -280,12 +297,18 @@ fn new_branch_from_empty_overlay_starts_empty() {
 
     // Overlay should still be empty
     let files = fs::read_to_string(root.join(".git/.subcontext/work/.gitkeep")).ok();
-    assert!(files.is_none(), "new branch from empty overlay should be empty");
+    assert!(
+        files.is_none(),
+        "new branch from empty overlay should be empty"
+    );
 
     // No overlay files should be in root (ignore .claude/ which is created by install)
     let status = git(&root, &["status", "--porcelain"]);
     let non_claude: Vec<&str> = status.lines().filter(|l| !l.contains(".claude/")).collect();
-    assert!(non_claude.is_empty(), "should have no untracked overlay files, got: {status}");
+    assert!(
+        non_claude.is_empty(),
+        "should have no untracked overlay files, got: {status}"
+    );
 
     cleanup(&root);
 }
@@ -372,7 +395,10 @@ fn hook_creates_new_overlay_branch_on_checkout() {
     assert!(branches.contains("overlay/feature-widgets"));
 
     // Work/ should be on the new branch
-    let branch = git(&root.join(".git/.subcontext/work"), &["symbolic-ref", "--short", "HEAD"]);
+    let branch = git(
+        &root.join(".git/.subcontext/work"),
+        &["symbolic-ref", "--short", "HEAD"],
+    );
     assert_eq!(branch, "overlay/feature-widgets");
 
     cleanup(&root);
@@ -461,8 +487,7 @@ fn post_commit_auto_saves_overlay() {
     git(&root, &["commit", "-m", "trigger post-commit"]);
 
     // The overlay change should be auto-saved
-    let work_content =
-        fs::read_to_string(root.join(".git/.subcontext/work/NOTES.md")).unwrap();
+    let work_content = fs::read_to_string(root.join(".git/.subcontext/work/NOTES.md")).unwrap();
     assert_eq!(work_content, "modified\n");
 
     cleanup(&root);
@@ -646,7 +671,10 @@ fn checkout_auto_saves_unsaved_overlay_changes() {
     git(&root, &["checkout", "main"]);
 
     let content = fs::read_to_string(root.join("NOTES.md")).unwrap();
-    assert_eq!(content, "modified\n", "unsaved overlay changes should be preserved across checkout");
+    assert_eq!(
+        content, "modified\n",
+        "unsaved overlay changes should be preserved across checkout"
+    );
 
     cleanup(&root);
 }
@@ -659,10 +687,7 @@ fn add_nonexistent_file_fails() {
     subcontext_ok(&root, &["install"]);
 
     let out = subcontext(&root, &["add", "nonexistent.txt"]);
-    assert!(
-        !out.status.success(),
-        "adding nonexistent file should fail"
-    );
+    assert!(!out.status.success(), "adding nonexistent file should fail");
 
     cleanup(&root);
 }
@@ -679,7 +704,10 @@ fn add_nested_directory_file() {
     subcontext_ok(&root, &["save", "-m", "nested file"]);
 
     // Should exist in work/
-    assert!(root.join(".git/.subcontext/work/docs/internal/notes.md").exists());
+    assert!(
+        root.join(".git/.subcontext/work/docs/internal/notes.md")
+            .exists()
+    );
 
     // Should be excluded from git status
     let status = git(&root, &["status", "--porcelain"]);
@@ -796,7 +824,10 @@ fn checkout_to_unrelated_branch_gets_empty_overlay() {
     git(&root, &["checkout", "--orphan", "unrelated"]);
     git(&root, &["rm", "-rf", "."]);
     git(&root, &["commit", "--allow-empty", "-m", "unrelated root"]);
-    git(&root, &["commit", "--allow-empty", "-m", "unrelated second"]);
+    git(
+        &root,
+        &["commit", "--allow-empty", "-m", "unrelated second"],
+    );
 
     // Go back to main
     git(&root, &["checkout", "main"]);
@@ -859,16 +890,17 @@ fn worktree_gets_overlay_forked_from_main() {
 
     // Per-worktree work dir should exist
     let wt_name = wt_dir.file_name().unwrap().to_string_lossy().to_string();
-    let wt_work = root
-        .join(".git/.subcontext/worktrees")
-        .join(&wt_name);
+    let wt_work = root.join(".git/.subcontext/worktrees").join(&wt_name);
     assert!(
         wt_work.is_dir(),
         "per-worktree work directory should exist at .git/.subcontext/worktrees/{wt_name}"
     );
 
     // Clean up worktree
-    git(&root, &["worktree", "remove", "--force", &wt_dir.to_string_lossy()]);
+    git(
+        &root,
+        &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
+    );
     cleanup(&wt_dir);
     cleanup(&root);
 }
@@ -900,10 +932,16 @@ fn worktree_overlay_is_independent_from_main() {
 
     // Main checkout should still have its own content
     let main_content = fs::read_to_string(root.join("NOTES.md")).unwrap();
-    assert_eq!(main_content, "main notes\n", "main overlay should be unaffected by worktree changes");
+    assert_eq!(
+        main_content, "main notes\n",
+        "main overlay should be unaffected by worktree changes"
+    );
 
     // Clean up
-    git(&root, &["worktree", "remove", "--force", &wt_dir.to_string_lossy()]);
+    git(
+        &root,
+        &["worktree", "remove", "--force", &wt_dir.to_string_lossy()],
+    );
     cleanup(&wt_dir);
     cleanup(&root);
 }
