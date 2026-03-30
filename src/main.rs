@@ -6,6 +6,7 @@ mod overlay;
 mod settings;
 mod startup;
 mod status;
+mod submodule;
 mod uninstall;
 
 use anyhow::{Result, bail};
@@ -74,6 +75,12 @@ enum Commands {
     /// Show current repo, worktree, and subcontext status
     Status,
 
+    /// Manage submodules within the overlay
+    Submodule {
+        #[command(subcommand)]
+        command: SubmoduleCommand,
+    },
+
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
     Hook {
@@ -92,6 +99,24 @@ enum HookCommand {
     },
     /// Handle post-commit events
     PostCommit,
+}
+
+#[derive(Subcommand)]
+enum SubmoduleCommand {
+    /// Add a submodule to the overlay
+    Add {
+        /// URL of the repository to add as a submodule
+        url: String,
+        /// Path where the submodule should be placed (default: derived from URL)
+        path: Option<String>,
+    },
+    /// Initialize and update overlay submodules
+    Update,
+    /// Remove a submodule from the overlay
+    Remove {
+        /// Path of the submodule to remove
+        path: String,
+    },
 }
 
 fn main() -> Result<()> {
@@ -142,6 +167,26 @@ fn main() -> Result<()> {
         Commands::Status => {
             status::status(&cwd)?;
         }
+        Commands::Submodule { command } => {
+            let root = git::find_main_git_root(&cwd)?;
+            let ctx = CheckoutContext::main_only(&root);
+            match command {
+                SubmoduleCommand::Add { url, path } => {
+                    let resolved = path
+                        .as_ref()
+                        .map(|p| resolve_new_path(&cwd, &root, p))
+                        .transpose()?;
+                    submodule::add(&ctx, &url, resolved.as_deref())?;
+                }
+                SubmoduleCommand::Update => {
+                    submodule::update(&ctx)?;
+                }
+                SubmoduleCommand::Remove { path } => {
+                    let resolved = resolve_new_path(&cwd, &root, &path)?;
+                    submodule::remove(&ctx, &resolved)?;
+                }
+            }
+        }
         Commands::Hook {
             hook:
                 HookCommand::PostCheckout {
@@ -174,6 +219,45 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Resolve a path that may not exist yet (e.g., submodule destination) to be relative to root.
+fn resolve_new_path(cwd: &Path, root: &Path, path: &str) -> Result<String> {
+    let root_canonical = root.canonicalize().unwrap_or(root.to_path_buf());
+
+    let abs = if Path::new(path).is_absolute() {
+        Path::new(path).to_path_buf()
+    } else {
+        let cwd_canonical = cwd.canonicalize().unwrap_or(cwd.to_path_buf());
+        cwd_canonical.join(path)
+    };
+
+    // Try canonicalize (resolves ..), fall back to manual normalization
+    let abs = if let Ok(canonical) = abs.canonicalize() {
+        canonical
+    } else {
+        normalize_path(&abs)
+    };
+
+    match abs.strip_prefix(&root_canonical) {
+        Ok(rel) => Ok(rel.to_string_lossy().to_string()),
+        Err(_) => bail!("path {path} is outside the repository root"),
+    }
+}
+
+/// Normalize a path by resolving `.` and `..` components without filesystem access.
+fn normalize_path(path: &Path) -> std::path::PathBuf {
+    let mut result = std::path::PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            std::path::Component::CurDir => {}
+            c => result.push(c),
+        }
+    }
+    result
 }
 
 /// Resolve a user-provided file path to be relative to the repo root.
