@@ -222,16 +222,29 @@ pub fn save_overlay(ctx: &CheckoutContext, message: &str) -> Result<()> {
         }
     }
 
-    // Copy submodule contents back and stage inside each submodule
+    // Copy submodule contents back and stage+commit inside each submodule.
+    // We must commit inside each submodule so the parent overlay sees an updated
+    // gitlink. Using `submodule foreach` avoids GIT_DIR inheritance issues that
+    // occur in hook context (where GIT_DIR points to the host repo).
     let submodules = list_overlay_submodule_paths(ctx)?;
-    for submodule in &submodules {
-        let src = ctx.checkout_root.join(submodule);
-        let dest = work.join(submodule);
-        if src.exists() && src.is_dir() {
-            copy_dir_recursive(&src, &dest)?;
-            // Stage changes inside the submodule
-            run_git(&["add", "-A"], &dest).ok();
+    if !submodules.is_empty() {
+        for submodule in &submodules {
+            let src = ctx.checkout_root.join(submodule);
+            let dest = work.join(submodule);
+            if src.exists() && src.is_dir() {
+                copy_dir_recursive(&src, &dest)?;
+            }
         }
+        run_work_git(
+            &[
+                "submodule",
+                "foreach",
+                "--quiet",
+                "git add -A && git diff --cached --quiet || git commit -m 'auto-save (submodule)'",
+            ],
+            &work,
+        )
+        .ok();
     }
 
     // Stage and commit in work/

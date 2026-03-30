@@ -115,10 +115,7 @@ fn clean_submodule_gitdir(work: &std::path::Path, submodule_path: &str) {
     let dot_git = work.join(".git");
     let gitdir = if dot_git.is_file() {
         if let Ok(content) = std::fs::read_to_string(&dot_git) {
-            let p = content
-                .strip_prefix("gitdir: ")
-                .unwrap_or(&content)
-                .trim();
+            let p = content.strip_prefix("gitdir: ").unwrap_or(&content).trim();
             if std::path::Path::new(p).is_absolute() {
                 PathBuf::from(p)
             } else {
