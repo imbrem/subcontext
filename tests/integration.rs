@@ -821,23 +821,9 @@ fn local_install_registers_child_in_global() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // And that branch contains child.json with the expected content.
+    // The branch contains a single object.json with type "child" and child
+    // data inlined under "data".
     let json = Command::new("git")
-        .args([
-            &format!("--git-dir={}", global_repo.display()),
-            "show",
-            &format!("object/{project_uuid}:child.json"),
-        ])
-        .envs(test_env())
-        .output()
-        .unwrap();
-    assert!(json.status.success());
-    let text = String::from_utf8_lossy(&json.stdout);
-    assert!(text.contains(&project_uuid));
-    assert!(text.contains("\"kind\": \"project\""), "json: {text}");
-
-    // object.json should also exist with type "child".
-    let obj_json = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
@@ -846,11 +832,13 @@ fn local_install_registers_child_in_global() {
         .envs(test_env())
         .output()
         .unwrap();
-    assert!(obj_json.status.success());
-    let obj_text = String::from_utf8_lossy(&obj_json.stdout);
+    assert!(json.status.success());
+    let text = String::from_utf8_lossy(&json.stdout);
+    assert!(text.contains("\"type\": \"child\""), "object.json: {text}");
+    assert!(text.contains(&project_uuid), "object.json: {text}");
     assert!(
-        obj_text.contains("\"type\": \"child\""),
-        "object.json: {obj_text}"
+        text.contains("\"kind\": \"project\""),
+        "object.json: {text}"
     );
 
     cleanup(&fake_home);
@@ -1708,19 +1696,26 @@ fn task_add_creates_task_branch_and_updates_db() {
         .trim_start_matches("object/")
         .to_string();
 
-    // TASK.md on the task branch has expected YAML
-    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
-    assert!(task_md.contains("name: write-docs"));
-    assert!(task_md.contains(&format!("uuid: {uuid}")));
-    assert!(task_md.contains("kind: todo"));
-    assert!(task_md.contains("status: created"));
-    assert!(task_md.contains("project_uuid:"));
-
-    // object.json should exist with type "task"
+    // object.json on the task branch has all task data inlined
     let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(obj_json.contains("\"type\": \"task\""), "obj: {obj_json}");
     assert!(
-        obj_json.contains("\"type\": \"task\""),
-        "object.json: {obj_json}"
+        obj_json.contains("\"name\": \"write-docs\""),
+        "obj: {obj_json}"
+    );
+    assert!(
+        obj_json.contains(&format!("\"uuid\": \"{uuid}\"")),
+        "obj: {obj_json}"
+    );
+    assert!(obj_json.contains("\"kind\": \"todo\""), "obj: {obj_json}");
+    assert!(
+        obj_json.contains("\"status\": \"created\""),
+        "obj: {obj_json}"
+    );
+    assert!(obj_json.contains("\"project_uuid\":"), "obj: {obj_json}");
+    assert!(
+        obj_json.contains("\"description\": null"),
+        "obj: {obj_json}"
     );
 
     // State branch has a commit for the task add
@@ -1751,9 +1746,12 @@ fn task_done_marks_task_and_adds_completed_at() {
         .trim_start_matches("object/")
         .to_string();
 
-    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
-    assert!(task_md.contains("status: done"));
-    assert!(task_md.contains("completed_at: 2026-01-02T03:04:05Z"));
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(obj_json.contains("\"status\": \"done\""), "obj: {obj_json}");
+    assert!(
+        obj_json.contains("\"completed_at\": \"2026-01-02T03:04:05Z\""),
+        "obj: {obj_json}"
+    );
 
     let log = git_in_repo(&root, &["log", "--oneline", "state"]);
     assert!(log.contains("task done: ship-it"));
@@ -1787,15 +1785,15 @@ fn task_done_accepts_now_and_rejects_local_time() {
             .trim()
             .trim_start_matches("* ")
             .trim_start_matches("object/");
-        let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
-        if task_md.contains("name: a\n") {
-            assert!(task_md.contains("status: done"));
-            // completed_at line ends with Z
-            let line = task_md
+        let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+        if obj_json.contains("\"name\": \"a\"") {
+            assert!(obj_json.contains("\"status\": \"done\""), "obj: {obj_json}");
+            // completed_at value ends with Z
+            let line = obj_json
                 .lines()
-                .find(|l| l.starts_with("completed_at:"))
+                .find(|l| l.contains("completed_at"))
                 .unwrap();
-            assert!(line.ends_with('Z'), "completed_at should be UTC: {line}");
+            assert!(line.contains('Z'), "completed_at should be UTC: {line}");
         }
     }
 
@@ -1893,13 +1891,13 @@ fn task_add_creates_shadow_task_in_global() {
     assert!(!source_object_uuid.is_empty());
     drop(conn);
 
-    // child.json now has the checkout_path pointing to the child's .git.
+    // object.json now has checkout_path in the data pointing to the child's .git.
     let global_repo = global_path.join("global/repo");
     let json = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
-            &format!("object/{project_uuid}:child.json"),
+            &format!("object/{project_uuid}:object.json"),
         ])
         .envs(test_env())
         .output()
@@ -1909,7 +1907,7 @@ fn task_add_creates_shadow_task_in_global() {
     let expected = root.join(".git").to_string_lossy().to_string();
     assert!(
         text.contains(&expected) && text.contains("checkout_path"),
-        "expected checkout_path {expected} in child.json: {text}"
+        "expected checkout_path {expected} in object.json: {text}"
     );
 
     cleanup(&fake_home);
@@ -2027,7 +2025,7 @@ fn task_add_shadow_promotes_checkout_path_to_list() {
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
-            &format!("object/{project_uuid}:child.json"),
+            &format!("object/{project_uuid}:object.json"),
         ])
         .envs(test_env())
         .output()
@@ -2037,7 +2035,7 @@ fn task_add_shadow_promotes_checkout_path_to_list() {
     let path_b = root_b.join(".git").to_string_lossy().to_string();
     assert!(
         text.contains(&path_a) && text.contains(&path_b),
-        "both paths should appear in child.json: {text}"
+        "both paths should appear in object.json: {text}"
     );
     assert!(
         text.contains("checkout_path") && text.contains('['),

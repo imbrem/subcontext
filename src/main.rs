@@ -134,6 +134,9 @@ enum TaskCommand {
         /// Task status (e.g. created, active, inactive, done)
         #[arg(long)]
         status: Option<String>,
+        /// Short task description
+        #[arg(long)]
+        description: Option<String>,
     },
     /// Mark a task as done
     Done {
@@ -261,13 +264,19 @@ fn main() -> Result<()> {
             if use_global {
                 let scope = global::global_task_scope(backend)?;
                 match command {
-                    TaskCommand::Add { name, kind, status } => {
+                    TaskCommand::Add {
+                        name,
+                        kind,
+                        status,
+                        description,
+                    } => {
                         task::add_task(
                             backend,
                             &scope,
                             &name,
                             kind.as_deref(),
                             status.as_deref(),
+                            description.as_deref(),
                             None,
                         )
                         .map(|_| ())?;
@@ -280,13 +289,19 @@ fn main() -> Result<()> {
                 let root = local_root.unwrap();
                 let scope = task::TaskScope::for_local(backend, &root)?;
                 match command {
-                    TaskCommand::Add { name, kind, status } => {
+                    TaskCommand::Add {
+                        name,
+                        kind,
+                        status,
+                        description,
+                    } => {
                         let (local_uuid, local_commit) = task::add_task(
                             backend,
                             &scope,
                             &name,
                             kind.as_deref(),
                             status.as_deref(),
+                            description.as_deref(),
                             None,
                         )?;
                         // Also add a shadow task to the global subcontext,
@@ -300,6 +315,7 @@ fn main() -> Result<()> {
                                 &name,
                                 kind.as_deref(),
                                 status.as_deref(),
+                                description.as_deref(),
                                 Some((&scope.project_uuid, &local_uuid, &local_commit)),
                             )?;
                             if let Some(commit) = global::record_child_checkout_path(
