@@ -148,11 +148,9 @@ pub fn done_task(root: &Path, name: &str, time: Option<&str>) -> Result<()> {
     )?;
     drop(conn);
 
-    commit_state(root, &format!("task done: {name}"))?;
+    let completed_at = resolve_timestamp(time)?;
 
-    let completed_at = time
-        .map(|s| s.to_string())
-        .unwrap_or_else(current_iso8601);
+    commit_state(root, &format!("task done: {name}"))?;
     let md = build_task_md(&TaskData {
         name: task_name,
         uuid: task_uuid.clone(),
@@ -192,17 +190,18 @@ fn build_task_md(t: &TaskData) -> String {
 }
 
 fn create_task_branch(root: &Path, task_uuid: &str, md: &str) -> Result<()> {
-    let branch = format!("tasks/{task_uuid}");
+    let ref_name = format!("refs/heads/tasks/{task_uuid}");
+    // Defensive: refuse to clobber an existing ref (UUID collision).
+    if run_subcontext_git(&["show-ref", "--verify", "--quiet", &ref_name], root).is_ok() {
+        bail!("task branch {ref_name} already exists");
+    }
     let blob = hash_object(root, md)?;
     let tree = mktree(root, &[("TASK.md", &blob)])?;
     let commit = run_subcontext_git(
         &["commit-tree", &tree, "-m", &format!("init task {task_uuid}")],
         root,
     )?;
-    run_subcontext_git(
-        &["update-ref", &format!("refs/heads/{branch}"), &commit],
-        root,
-    )?;
+    run_subcontext_git(&["update-ref", &ref_name, &commit], root)?;
     Ok(())
 }
 
@@ -278,6 +277,26 @@ fn mktree(root: &Path, entries: &[(&str, &str)]) -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
 }
 
+/// Resolve a user-provided timestamp. `None` or `Some("now")` → current UTC time.
+/// Any other value must be an ISO8601 UTC timestamp ending in 'Z'.
+fn resolve_timestamp(time: Option<&str>) -> Result<String> {
+    match time {
+        None => Ok(current_iso8601()),
+        Some(s) if s.eq_ignore_ascii_case("now") => Ok(current_iso8601()),
+        Some(s) => {
+            if !s.ends_with('Z') {
+                bail!(
+                    "--time must be an ISO8601 UTC timestamp ending with 'Z' \
+                     (got: {s}). Use \"now\" for the current time."
+                );
+            }
+            Ok(s.to_string())
+        }
+    }
+}
+
+/// Current time as an ISO8601 UTC timestamp (seconds precision, 'Z' suffix).
+/// Uses Unix time (seconds since 1970-01-01T00:00:00Z), not local time.
 fn current_iso8601() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let secs = SystemTime::now()
@@ -311,4 +330,57 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso8601_epoch_is_1970() {
+        assert_eq!(iso8601_from_unix(0), "1970-01-01T00:00:00Z");
+    }
+
+    #[test]
+    fn iso8601_known_values() {
+        // 2000-01-01T00:00:00Z = 946684800
+        assert_eq!(iso8601_from_unix(946_684_800), "2000-01-01T00:00:00Z");
+        // 2026-04-12T12:34:56Z = 1775997296
+        assert_eq!(iso8601_from_unix(1_775_997_296), "2026-04-12T12:34:56Z");
+        // Leap day 2024-02-29T23:59:59Z = 1709251199
+        assert_eq!(iso8601_from_unix(1_709_251_199), "2024-02-29T23:59:59Z");
+    }
+
+    #[test]
+    fn iso8601_handles_pre_epoch() {
+        // 1969-12-31T23:59:59Z = -1
+        assert_eq!(iso8601_from_unix(-1), "1969-12-31T23:59:59Z");
+    }
+
+    #[test]
+    fn resolve_timestamp_accepts_now() {
+        let out = resolve_timestamp(Some("now")).unwrap();
+        assert!(out.ends_with('Z'));
+        let out = resolve_timestamp(Some("NOW")).unwrap();
+        assert!(out.ends_with('Z'));
+    }
+
+    #[test]
+    fn resolve_timestamp_accepts_z_terminated() {
+        let t = "2026-04-05T12:00:00Z";
+        assert_eq!(resolve_timestamp(Some(t)).unwrap(), t);
+    }
+
+    #[test]
+    fn resolve_timestamp_rejects_non_utc() {
+        assert!(resolve_timestamp(Some("2026-04-05T12:00:00")).is_err());
+        assert!(resolve_timestamp(Some("2026-04-05T12:00:00+02:00")).is_err());
+    }
+
+    #[test]
+    fn resolve_timestamp_none_is_current() {
+        let out = resolve_timestamp(None).unwrap();
+        assert!(out.ends_with('Z'));
+        assert_eq!(out.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
+    }
 }

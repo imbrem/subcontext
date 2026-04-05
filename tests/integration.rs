@@ -1049,6 +1049,41 @@ fn task_done_marks_task_and_adds_completed_at() {
 }
 
 #[test]
+fn task_done_accepts_now_and_rejects_local_time() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "a"]);
+    subcontext_ok(&root, &["task", "add", "b"]);
+
+    // "now" is accepted
+    subcontext_ok(&root, &["task", "done", "a", "--time", "now"]);
+
+    // Non-UTC (no 'Z') is rejected
+    let out = subcontext(&root, &["task", "done", "b", "--time", "2026-04-05T12:00:00"]);
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("ending with 'Z'"), "stderr: {stderr}");
+
+    // Find the task branch for "a" and confirm completed_at ends with Z
+    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    for line in branches.lines() {
+        let uuid = line.trim().trim_start_matches("* ").trim_start_matches("tasks/");
+        let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+        if task_md.contains("name: a\n") {
+            assert!(task_md.contains("status: done"));
+            // completed_at line ends with Z
+            let line = task_md
+                .lines()
+                .find(|l| l.starts_with("completed_at:"))
+                .unwrap();
+            assert!(line.ends_with('Z'), "completed_at should be UTC: {line}");
+        }
+    }
+
+    cleanup(&root);
+}
+
+#[test]
 fn task_add_duplicate_name_fails() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
