@@ -25,11 +25,7 @@ pub fn add(
     eprintln!("[subcontext] Adding submodule {url} at {submodule_path}...");
 
     // Add submodule in the overlay work directory
-    run_work_git(
-        backend,
-        &["submodule", "add", url, &submodule_path],
-        &work,
-    )?;
+    run_work_git(backend, &["submodule", "add", url, &submodule_path], &work)?;
 
     // Commit the submodule addition
     run_work_git(backend, &["add", "-A"], &work)?;

@@ -108,7 +108,13 @@ fn determine_fork_source(
     const NULL_SHA: &str = "0000000000000000000000000000000000000000";
 
     // Orphan: unborn HEAD (git checkout --orphan) → always empty
-    if run_git(backend, &["rev-parse", "--verify", "HEAD"], &ctx.checkout_root).is_err() {
+    if run_git(
+        backend,
+        &["rev-parse", "--verify", "HEAD"],
+        &ctx.checkout_root,
+    )
+    .is_err()
+    {
         return Ok(None);
     }
 

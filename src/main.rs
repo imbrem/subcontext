@@ -225,12 +225,7 @@ fn main() -> Result<()> {
 }
 
 /// Resolve a path that may not exist yet (e.g., submodule destination) to be relative to root.
-fn resolve_new_path(
-    backend: &dyn Backend,
-    cwd: &Path,
-    root: &Path,
-    path: &str,
-) -> Result<String> {
+fn resolve_new_path(backend: &dyn Backend, cwd: &Path, root: &Path, path: &str) -> Result<String> {
     let root_canonical = backend.canonicalize(root).unwrap_or(root.to_path_buf());
 
     let abs = if Path::new(path).is_absolute() {
@@ -241,7 +236,9 @@ fn resolve_new_path(
     };
 
     // Try canonicalize (resolves ..), fall back to manual normalization
-    let abs = backend.canonicalize(&abs).unwrap_or_else(|_| normalize_path(&abs));
+    let abs = backend
+        .canonicalize(&abs)
+        .unwrap_or_else(|_| normalize_path(&abs));
 
     match abs.strip_prefix(&root_canonical) {
         Ok(rel) => Ok(rel.to_string_lossy().to_string()),

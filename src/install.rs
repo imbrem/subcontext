@@ -263,7 +263,11 @@ fn commit_config_branch(backend: &dyn Backend, root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    run_git(backend, &["commit", "-m", "subcontext: update config"], &cfg)?;
+    run_git(
+        backend,
+        &["commit", "-m", "subcontext: update config"],
+        &cfg,
+    )?;
 
     Ok(())
 }

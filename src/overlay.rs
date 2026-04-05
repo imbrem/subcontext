@@ -54,10 +54,7 @@ pub fn overlay_branch_exists(backend: &dyn Backend, root: &Path, branch: &str) -
 // ─── Work directory management ───────────────────────────────────────
 
 /// Get the current branch name in the overlay work directory.
-pub fn current_work_branch(
-    backend: &dyn Backend,
-    ctx: &CheckoutContext,
-) -> Result<Option<String>> {
+pub fn current_work_branch(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<Option<String>> {
     let work = ctx.overlay_work_dir();
     if !backend.exists(&work) {
         return Ok(None);

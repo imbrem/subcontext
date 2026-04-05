@@ -107,8 +107,7 @@ impl Backend for SystemBackend {
     }
 
     fn read_to_string(&self, path: &Path) -> Result<String> {
-        std::fs::read_to_string(path)
-            .with_context(|| format!("failed to read {}", path.display()))
+        std::fs::read_to_string(path).with_context(|| format!("failed to read {}", path.display()))
     }
 
     fn write(&self, path: &Path, contents: &[u8]) -> Result<()> {
@@ -122,9 +121,8 @@ impl Backend for SystemBackend {
     }
 
     fn copy(&self, from: &Path, to: &Path) -> Result<u64> {
-        std::fs::copy(from, to).with_context(|| {
-            format!("failed to copy {} → {}", from.display(), to.display())
-        })
+        std::fs::copy(from, to)
+            .with_context(|| format!("failed to copy {} → {}", from.display(), to.display()))
     }
 
     fn remove_file(&self, path: &Path) -> Result<()> {
