@@ -704,6 +704,198 @@ fn install_global_preserves_existing_config() {
     cleanup(&fake_home);
 }
 
+fn make_global_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!(
+        "subcontext-global-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    if dir.exists() {
+        fs::remove_dir_all(&dir).unwrap();
+    }
+    dir
+}
+
+fn subcontext_with_global(cwd: &Path, global_path: &Path, args: &[&str]) -> std::process::Output {
+    let bin = test_bin_dir().join("subcontext");
+    Command::new(bin)
+        .args(args)
+        .envs(test_env())
+        .env("GIT_SUBCONTEXT_PATH", global_path)
+        .current_dir(cwd)
+        .output()
+        .unwrap()
+}
+
+#[test]
+fn install_global_creates_subcontext_directory_with_user_kind() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+
+    let global_path = make_global_dir();
+
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(
+        out.status.success(),
+        "install --global failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Nested dir structure mirrors .git/.subcontext
+    assert!(
+        global_path.join("global/repo/HEAD").exists(),
+        "bare repo should be present"
+    );
+    assert!(global_path.join("global/config").is_dir());
+    assert!(global_path.join("global/work").is_dir());
+    assert!(global_path.join("global/state").is_dir());
+
+    // subcontext.yaml has kind: user
+    let yaml = fs::read_to_string(global_path.join("global/config/subcontext.yaml")).unwrap();
+    assert!(yaml.contains("kind: user"), "yaml: {yaml}");
+    assert!(yaml.contains("project_uuid:"));
+
+    // state/tasks.db exists
+    assert!(global_path.join("global/state/tasks.db").exists());
+
+    // Re-running is idempotent.
+    let out2 = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out2.status.success());
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+}
+
+#[test]
+fn local_install_registers_child_in_global() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    // Install global first.
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out.status.success());
+
+    // Install locally in a fresh git repo.
+    let root = make_test_repo();
+    let out = subcontext_with_global(&root, &global_path, &["install"]);
+    assert!(
+        out.status.success(),
+        "local install failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Read the project UUID that was written locally.
+    let yaml = fs::read_to_string(root.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    let project_uuid = yaml
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("project_uuid:")
+                .map(|s| s.trim().to_string())
+        })
+        .expect("project_uuid missing");
+
+    // Verify the global bare repo now has a children/<uuid> branch.
+    let global_repo = global_path.join("global/repo");
+    let out = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "show-ref",
+            "--verify",
+            &format!("refs/heads/children/{project_uuid}"),
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "children branch missing: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // And that branch contains child.json with the expected content.
+    let json = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "show",
+            &format!("children/{project_uuid}:child.json"),
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let text = String::from_utf8_lossy(&json.stdout);
+    assert!(text.contains(&project_uuid));
+    assert!(text.contains("\"kind\": \"project\""), "json: {text}");
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_global_uses_global_subcontext() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out.status.success());
+
+    // Running `task add` outside any git repo (cwd=fake_home) should
+    // automatically target the global subcontext.
+    let out = subcontext_with_global(&fake_home, &global_path, &["task", "add", "review-plans"]);
+    assert!(
+        out.status.success(),
+        "global task add failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // A tasks/<uuid> branch should exist in the global bare repo.
+    let global_repo = global_path.join("global/repo");
+    let branches = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "branch",
+            "--list",
+            "tasks/*",
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    assert!(branches.status.success());
+    let text = String::from_utf8_lossy(&branches.stdout);
+    assert!(
+        text.contains("tasks/"),
+        "expected tasks/* branch, got: {text}"
+    );
+
+    // --global flag works from inside a git repo too.
+    let root = make_test_repo();
+    let out = subcontext_with_global(&root, &global_path, &["task", "--global", "add", "other"]);
+    assert!(
+        out.status.success(),
+        "--global from repo failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
 #[test]
 fn uninstall_restores_original_hook() {
     let root = make_test_repo();
