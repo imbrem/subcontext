@@ -128,7 +128,7 @@ enum TaskCommand {
     Add {
         /// Task name
         name: String,
-        /// Task kind (e.g. goal, todo, step, task)
+        /// Task kind (e.g. goal, todo, tick, task)
         #[arg(long)]
         kind: Option<String>,
         /// Task status (e.g. created, active, inactive, done)
