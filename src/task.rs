@@ -117,15 +117,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-/// Open the tasks DB at `scope.db_path()` and ensure the schema is
-/// up-to-date. Safe to call against a DB created by an older subcontext
-/// version: `ALTER TABLE ... ADD COLUMN` is attempted idempotently and
-/// swallows the "duplicate column name" error raised when it already exists.
 fn open_db(scope: &TaskScope) -> Result<Connection> {
-    let conn = Connection::open(scope.db_path())?;
-    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN source_uuid TEXT", []);
-    let _ = conn.execute("ALTER TABLE tasks ADD COLUMN source_context TEXT", []);
-    Ok(conn)
+    Ok(Connection::open(scope.db_path())?)
 }
 
 fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
