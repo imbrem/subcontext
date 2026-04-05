@@ -1,13 +1,11 @@
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, params};
-use std::io::Write;
+use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
 use uuid::Uuid;
 
-use crate::git::{
-    current_branch, repo_dir, run_subcontext_git, run_work_git, state_dir,
-};
+use crate::backend::{Backend, GitInvocation};
+use crate::git::{current_branch, repo_dir, run_subcontext_git, run_work_git, state_dir};
 use crate::project::read_project_uuid;
 
 const DB_NAME: &str = "tasks.db";
@@ -19,18 +17,21 @@ fn db_path(root: &Path) -> PathBuf {
 }
 
 /// Initialize the `state` branch, its worktree, and the tasks.db schema.
-pub fn init_state_branch(root: &Path) -> Result<()> {
+pub fn init_state_branch(backend: &dyn Backend, root: &Path) -> Result<()> {
     // Create empty state branch via plumbing
-    let empty_tree = run_subcontext_git(&["hash-object", "-t", "tree", "/dev/null"], root)?;
+    let empty_tree =
+        run_subcontext_git(backend, &["hash-object", "-t", "tree", "/dev/null"], root)?;
     let commit = run_subcontext_git(
+        backend,
         &["commit-tree", &empty_tree, "-m", "init state branch"],
         root,
     )?;
-    run_subcontext_git(&["update-ref", "refs/heads/state", &commit], root)?;
+    run_subcontext_git(backend, &["update-ref", "refs/heads/state", &commit], root)?;
 
     // Add worktree
     let state = state_dir(root);
     run_subcontext_git(
+        backend,
         &["worktree", "add", &state.to_string_lossy(), "state"],
         root,
     )?;
@@ -41,7 +42,7 @@ pub fn init_state_branch(root: &Path) -> Result<()> {
     drop(conn);
 
     // Commit
-    commit_state(root, "init tasks db")?;
+    commit_state(backend, root, "init tasks db")?;
     Ok(())
 }
 
@@ -64,26 +65,27 @@ fn create_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-fn commit_state(root: &Path, message: &str) -> Result<()> {
+fn commit_state(backend: &dyn Backend, root: &Path, message: &str) -> Result<()> {
     let state = state_dir(root);
-    run_work_git(&["add", "-A"], &state)?;
-    let status = run_work_git(&["status", "--porcelain"], &state)?;
+    run_work_git(backend, &["add", "-A"], &state)?;
+    let status = run_work_git(backend, &["status", "--porcelain"], &state)?;
     if status.is_empty() {
         return Ok(());
     }
-    run_work_git(&["commit", "-m", message], &state)?;
+    run_work_git(backend, &["commit", "-m", message], &state)?;
     Ok(())
 }
 
 /// Add a new task.
 pub fn add_task(
+    backend: &dyn Backend,
     root: &Path,
     name: &str,
     kind: Option<&str>,
     status: Option<&str>,
 ) -> Result<()> {
-    let branch = current_branch(root)?;
-    let project_uuid = read_project_uuid(root)?;
+    let branch = current_branch(backend, root)?;
+    let project_uuid = read_project_uuid(backend, root)?;
     let task_uuid = Uuid::new_v4().to_string();
     let kind = kind.unwrap_or(DEFAULT_KIND);
     let status = status.unwrap_or(DEFAULT_STATUS);
@@ -110,7 +112,7 @@ pub fn add_task(
     )?;
     drop(conn);
 
-    commit_state(root, &format!("task add: {name}"))?;
+    commit_state(backend, root, &format!("task add: {name}"))?;
 
     let md = build_task_md(&TaskData {
         name: name.to_string(),
@@ -120,15 +122,15 @@ pub fn add_task(
         project_uuid,
         completed_at: None,
     });
-    create_task_branch(root, &task_uuid, &md)?;
+    create_task_branch(backend, root, &task_uuid, &md)?;
 
     eprintln!("[subcontext] Added task '{name}' ({task_uuid})");
     Ok(())
 }
 
 /// Mark an existing task as done.
-pub fn done_task(root: &Path, name: &str, time: Option<&str>) -> Result<()> {
-    let branch = current_branch(root)?;
+pub fn done_task(backend: &dyn Backend, root: &Path, name: &str, time: Option<&str>) -> Result<()> {
+    let branch = current_branch(backend, root)?;
 
     let conn = Connection::open(db_path(root))?;
     let row: (String, String, String, String) = conn
@@ -150,7 +152,8 @@ pub fn done_task(root: &Path, name: &str, time: Option<&str>) -> Result<()> {
 
     let completed_at = resolve_timestamp(time)?;
 
-    commit_state(root, &format!("task done: {name}"))?;
+    commit_state(backend, root, &format!("task done: {name}"))?;
+
     let md = build_task_md(&TaskData {
         name: task_name,
         uuid: task_uuid.clone(),
@@ -159,7 +162,7 @@ pub fn done_task(root: &Path, name: &str, time: Option<&str>) -> Result<()> {
         project_uuid,
         completed_at: Some(completed_at),
     });
-    update_task_branch(root, &task_uuid, &md)?;
+    update_task_branch(backend, root, &task_uuid, &md)?;
 
     eprintln!("[subcontext] Marked task '{name}' as done");
     Ok(())
@@ -189,29 +192,42 @@ fn build_task_md(t: &TaskData) -> String {
     s
 }
 
-fn create_task_branch(root: &Path, task_uuid: &str, md: &str) -> Result<()> {
+fn create_task_branch(backend: &dyn Backend, root: &Path, task_uuid: &str, md: &str) -> Result<()> {
     let ref_name = format!("refs/heads/tasks/{task_uuid}");
     // Defensive: refuse to clobber an existing ref (UUID collision).
-    if run_subcontext_git(&["show-ref", "--verify", "--quiet", &ref_name], root).is_ok() {
+    if run_subcontext_git(
+        backend,
+        &["show-ref", "--verify", "--quiet", &ref_name],
+        root,
+    )
+    .is_ok()
+    {
         bail!("task branch {ref_name} already exists");
     }
-    let blob = hash_object(root, md)?;
-    let tree = mktree(root, &[("TASK.md", &blob)])?;
+    let blob = hash_object(backend, root, md)?;
+    let tree = build_tree(backend, root, "TASK.md", &blob)?;
     let commit = run_subcontext_git(
-        &["commit-tree", &tree, "-m", &format!("init task {task_uuid}")],
+        backend,
+        &[
+            "commit-tree",
+            &tree,
+            "-m",
+            &format!("init task {task_uuid}"),
+        ],
         root,
     )?;
-    run_subcontext_git(&["update-ref", &ref_name, &commit], root)?;
+    run_subcontext_git(backend, &["update-ref", &ref_name, &commit], root)?;
     Ok(())
 }
 
-fn update_task_branch(root: &Path, task_uuid: &str, md: &str) -> Result<()> {
+fn update_task_branch(backend: &dyn Backend, root: &Path, task_uuid: &str, md: &str) -> Result<()> {
     let branch = format!("tasks/{task_uuid}");
     let ref_name = format!("refs/heads/{branch}");
-    let parent = run_subcontext_git(&["rev-parse", &ref_name], root)?;
-    let blob = hash_object(root, md)?;
-    let tree = mktree(root, &[("TASK.md", &blob)])?;
+    let parent = run_subcontext_git(backend, &["rev-parse", &ref_name], root)?;
+    let blob = hash_object(backend, root, md)?;
+    let tree = build_tree(backend, root, "TASK.md", &blob)?;
     let commit = run_subcontext_git(
+        backend,
         &[
             "commit-tree",
             &tree,
@@ -222,59 +238,78 @@ fn update_task_branch(root: &Path, task_uuid: &str, md: &str) -> Result<()> {
         ],
         root,
     )?;
-    run_subcontext_git(&["update-ref", &ref_name, &commit], root)?;
+    run_subcontext_git(backend, &["update-ref", &ref_name, &commit], root)?;
     Ok(())
 }
 
-fn hash_object(root: &Path, content: &str) -> Result<String> {
-    let git_dir = repo_dir(root);
-    let git_dir_flag = format!("--git-dir={}", git_dir.display());
-    let mut child = Command::new("git")
-        .args([&git_dir_flag, "hash-object", "-w", "--stdin"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn git hash-object")?;
-    child
-        .stdin
-        .as_mut()
-        .unwrap()
-        .write_all(content.as_bytes())?;
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "git hash-object failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
+/// Hash `content` as a blob in the subcontext bare repo, returning its SHA.
+/// Routes through the Backend by writing to a scratch file and calling
+/// `git hash-object -w`.
+fn hash_object(backend: &dyn Backend, root: &Path, content: &str) -> Result<String> {
+    let tmp = scratch_path(root, "blob");
+    if let Some(parent) = tmp.parent() {
+        backend.create_dir_all(parent)?;
     }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    backend.write(&tmp, content.as_bytes())?;
+    let result = run_subcontext_git(
+        backend,
+        &["hash-object", "-w", &tmp.to_string_lossy()],
+        root,
+    );
+    backend.remove_file(&tmp).ok();
+    result
 }
 
-fn mktree(root: &Path, entries: &[(&str, &str)]) -> Result<String> {
+/// Build a single-entry tree in the subcontext bare repo using a temporary
+/// index file (so we don't need to pipe stdin into `git mktree`).
+fn build_tree(backend: &dyn Backend, root: &Path, name: &str, blob: &str) -> Result<String> {
+    let idx = scratch_path(root, "index");
+    if let Some(parent) = idx.parent() {
+        backend.create_dir_all(parent)?;
+    }
+    // Ensure no stale index is left from a prior failed run.
+    if backend.exists(&idx) {
+        backend.remove_file(&idx).ok();
+    }
+
     let git_dir = repo_dir(root);
     let git_dir_flag = format!("--git-dir={}", git_dir.display());
-    let mut child = Command::new("git")
-        .args([&git_dir_flag, "mktree"])
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("failed to spawn git mktree")?;
-    {
-        let stdin = child.stdin.as_mut().unwrap();
-        for (name, hash) in entries {
-            writeln!(stdin, "100644 blob {hash}\t{name}")?;
-        }
-    }
-    let output = child.wait_with_output()?;
-    if !output.status.success() {
-        bail!(
-            "git mktree failed: {}",
-            String::from_utf8_lossy(&output.stderr).trim()
-        );
-    }
-    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    let cacheinfo = format!("100644,{blob},{name}");
+    let idx_os: &OsStr = idx.as_os_str();
+
+    let update_args = [
+        git_dir_flag.as_str(),
+        "update-index",
+        "--add",
+        "--cacheinfo",
+        &cacheinfo,
+    ];
+    backend.git(&GitInvocation {
+        args: &update_args,
+        cwd: root,
+        env_set: &[("GIT_INDEX_FILE", idx_os)],
+        env_remove: &[],
+    })?;
+
+    let write_tree_args = [git_dir_flag.as_str(), "write-tree"];
+    let tree = backend.git(&GitInvocation {
+        args: &write_tree_args,
+        cwd: root,
+        env_set: &[("GIT_INDEX_FILE", idx_os)],
+        env_remove: &[],
+    })?;
+
+    backend.remove_file(&idx).ok();
+    Ok(tree)
+}
+
+fn scratch_path(root: &Path, tag: &str) -> PathBuf {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    crate::git::subcontext_dir(root).join(format!(".task-{tag}-{nanos}-{}.tmp", std::process::id()))
 }
 
 /// Resolve a user-provided timestamp. `None` or `Some("now")` → current UTC time.
