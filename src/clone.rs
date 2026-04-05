@@ -3,7 +3,7 @@ use std::path::Path;
 
 use crate::git::{
     CheckoutContext, current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name,
-    subcontext_dir, work_dir,
+    state_dir, subcontext_dir, work_dir,
 };
 use crate::install::install_from_hooks;
 use crate::overlay;
@@ -46,6 +46,18 @@ pub fn clone(root: &Path, url: &str) -> Result<()> {
         &["worktree", "add", &work.to_string_lossy(), &overlay_branch],
         root,
     )?;
+
+    // Set up state worktree if the remote has a state branch
+    if overlay::overlay_branch_exists(root, "state")? {
+        let state = state_dir(root);
+        run_subcontext_git(
+            &["worktree", "add", &state.to_string_lossy(), "state"],
+            root,
+        )?;
+    } else {
+        // Remote did not ship a state branch; create one locally.
+        crate::task::init_state_branch(root)?;
+    }
 
     // Apply overlay
     let ctx = CheckoutContext::main_only(root);

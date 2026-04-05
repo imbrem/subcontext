@@ -956,3 +956,128 @@ fn git_in_repo(root: &Path, args: &[&str]) -> String {
     full_args.extend_from_slice(args);
     git(root, &full_args)
 }
+
+// ─── Tasks ──────────────────────────────────────────────────────────
+
+#[test]
+fn install_writes_project_config_and_state_branch() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // subcontext.yaml on config branch with a project UUID
+    let cfg = fs::read_to_string(root.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    assert!(cfg.contains("project_uuid:"));
+    assert!(cfg.contains("kind: project"));
+    assert!(cfg.contains("version: 0.0.0"));
+
+    // State branch + worktree + tasks.db exist
+    let branches = git_in_repo(&root, &["branch", "--list", "state"]);
+    assert!(branches.contains("state"));
+    assert!(root.join(".git/.subcontext/state/tasks.db").exists());
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_creates_task_branch_and_updates_db() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "write-docs", "--kind", "todo"]);
+
+    // A tasks/<uuid> branch was created
+    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    assert!(
+        branches.contains("tasks/"),
+        "expected a tasks/<uuid> branch, got: {branches}"
+    );
+
+    // Extract the UUID from the branch name
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("tasks/")
+        .to_string();
+
+    // TASK.md on the task branch has expected YAML
+    let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+    assert!(task_md.contains("name: write-docs"));
+    assert!(task_md.contains(&format!("uuid: {uuid}")));
+    assert!(task_md.contains("kind: todo"));
+    assert!(task_md.contains("status: created"));
+    assert!(task_md.contains("project_uuid:"));
+
+    // State branch has a commit for the task add
+    let log = git_in_repo(&root, &["log", "--oneline", "state"]);
+    assert!(log.contains("task add: write-docs"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_done_marks_task_and_adds_completed_at() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "ship-it"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "done", "ship-it", "--time", "2026-01-02T03:04:05Z"],
+    );
+
+    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("tasks/")
+        .to_string();
+
+    let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+    assert!(task_md.contains("status: done"));
+    assert!(task_md.contains("completed_at: 2026-01-02T03:04:05Z"));
+
+    let log = git_in_repo(&root, &["log", "--oneline", "state"]);
+    assert!(log.contains("task done: ship-it"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_duplicate_name_fails() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "dup"]);
+
+    let out = subcontext(&root, &["task", "add", "dup"]);
+    assert!(!out.status.success(), "duplicate task name should fail");
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_done_unknown_task_fails() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let out = subcontext(&root, &["task", "done", "nope"]);
+    assert!(!out.status.success(), "done on unknown task should fail");
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_removes_state_worktree() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["uninstall"]);
+
+    assert!(!root.join(".git/.subcontext").exists());
+
+    cleanup(&root);
+}

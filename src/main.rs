@@ -3,9 +3,11 @@ mod git;
 mod hook;
 mod install;
 mod overlay;
+mod project;
 mod settings;
 mod startup;
 mod status;
+mod task;
 mod uninstall;
 
 use anyhow::{Result, bail};
@@ -74,11 +76,40 @@ enum Commands {
     /// Show current repo, worktree, and subcontext status
     Status,
 
+    /// Manage tasks
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
     Hook {
         #[command(subcommand)]
         hook: HookCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// Create a task with the given name and a fresh UUID
+    Add {
+        /// Task name
+        name: String,
+        /// Task kind (e.g. goal, todo, step, task)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Task status (e.g. created, active, inactive, done)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Mark a task as done
+    Done {
+        /// Task name
+        name: String,
+        /// Completion timestamp (ISO8601). Defaults to now.
+        #[arg(long)]
+        time: Option<String>,
     },
 }
 
@@ -141,6 +172,17 @@ fn main() -> Result<()> {
         }
         Commands::Status => {
             status::status(&cwd)?;
+        }
+        Commands::Task { command } => {
+            let root = git::find_main_git_root(&cwd)?;
+            match command {
+                TaskCommand::Add { name, kind, status } => {
+                    task::add_task(&root, &name, kind.as_deref(), status.as_deref())?;
+                }
+                TaskCommand::Done { name, time } => {
+                    task::done_task(&root, &name, time.as_deref())?;
+                }
+            }
         }
         Commands::Hook {
             hook:
