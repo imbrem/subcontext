@@ -52,9 +52,9 @@ pub fn uninstall(root: &Path) -> Result<()> {
 
 /// Remove the `git subcontext` alias from local git config.
 fn remove_git_alias(root: &Path) {
-    match run_git(&["config", "--unset", "alias.subcontext"], root) {
-        Ok(_) => eprintln!("[subcontext] Removed git alias."),
-        Err(_) => {} // alias may not exist
+    // alias may not exist, so ignore errors
+    if run_git(&["config", "--unset", "alias.subcontext"], root).is_ok() {
+        eprintln!("[subcontext] Removed git alias.");
     }
 }
 

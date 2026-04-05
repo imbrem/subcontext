@@ -96,30 +96,30 @@ fn determine_fork_source(
     }
 
     // If we have a previous overlay branch from this checkout, check ancestry
-    if let Some(src) = prev_overlay {
-        if overlay::overlay_branch_exists(&ctx.main_root, src)? {
-            // Same commit (checkout -b) → fork
-            if prev == new {
-                return Ok(Some(src.clone()));
-            }
-            // Null prev (should not happen if prev_overlay is set, but handle it)
-            if prev == NULL_SHA || new == NULL_SHA {
-                return Ok(Some(src.clone()));
-            }
-            // Check if branches share a common ancestor
-            if run_git(&["merge-base", prev, new], &ctx.checkout_root).is_ok() {
-                return Ok(Some(src.clone()));
-            }
-            // Unrelated branches (e.g., checkout to an orphan branch) → empty
-            return Ok(None);
+    if let Some(src) = prev_overlay
+        && overlay::overlay_branch_exists(&ctx.main_root, src)?
+    {
+        // Same commit (checkout -b) → fork
+        if prev == new {
+            return Ok(Some(src.clone()));
         }
+        // Null prev (should not happen if prev_overlay is set, but handle it)
+        if prev == NULL_SHA || new == NULL_SHA {
+            return Ok(Some(src.clone()));
+        }
+        // Check if branches share a common ancestor
+        if run_git(&["merge-base", prev, new], &ctx.checkout_root).is_ok() {
+            return Ok(Some(src.clone()));
+        }
+        // Unrelated branches (e.g., checkout to an orphan branch) → empty
+        return Ok(None);
     }
 
     // No previous overlay (e.g., new worktree). Try the main checkout's overlay.
-    if ctx.is_worktree() {
-        if let Some(branch) = overlay::main_checkout_overlay_branch(&ctx.main_root)? {
-            return Ok(Some(branch));
-        }
+    if ctx.is_worktree()
+        && let Some(branch) = overlay::main_checkout_overlay_branch(&ctx.main_root)?
+    {
+        return Ok(Some(branch));
     }
 
     Ok(None)
