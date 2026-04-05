@@ -149,6 +149,9 @@ fn install_creates_expected_structure() {
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(settings.contains("git subcontext startup"));
 
+    // Install should NOT write .mcp.json into the host repo
+    assert!(!root.join(".mcp.json").exists());
+
     // Hook dispatchers installed
     let pc_hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
     assert!(pc_hook.contains("git subcontext _hook post-checkout"));
@@ -530,7 +533,175 @@ fn uninstall_cleans_up() {
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(!settings.contains("git subcontext startup"));
 
+    // Uninstall should never have created a .mcp.json in the host repo
+    assert!(!root.join(".mcp.json").exists());
+
     cleanup(&root);
+}
+
+#[test]
+fn mcp_status_tool_returns_text() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Send init + tools/list + tools/call over stdin
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = test_bin_dir().join("subcontext");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .envs(test_env())
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subcontext_status","arguments":{{}}}}}}"#
+    )
+    .unwrap();
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Three responses, one per line
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 responses, got: {stdout}");
+    assert!(lines[0].contains("protocolVersion"));
+    assert!(lines[1].contains("subcontext_status"));
+    assert!(lines[2].contains("Main repo:"));
+    assert!(lines[2].contains("installed"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn install_global_writes_disabled_mcp_server() {
+    // Use an isolated HOME so we don't touch the real ~/.claude.json.
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+
+    let bin = test_bin_dir().join("subcontext");
+    let out = Command::new(&bin)
+        .args(["install", "--global"])
+        .envs(test_env())
+        .env("HOME", &fake_home)
+        .current_dir(&fake_home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "install --global failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let config_path = fake_home.join(".claude.json");
+    assert!(config_path.exists(), "~/.claude.json should be created");
+
+    let content = fs::read_to_string(&config_path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+    // Should be under _disabled_mcpServers, NOT mcpServers (inactive by default).
+    let disabled = value
+        .get("_disabled_mcpServers")
+        .and_then(|v| v.as_object())
+        .expect("_disabled_mcpServers should exist");
+    assert!(disabled.contains_key("subcontext"));
+    assert!(
+        value
+            .get("mcpServers")
+            .and_then(|v| v.as_object())
+            .is_none_or(|s| !s.contains_key("subcontext")),
+        "subcontext should NOT be in active mcpServers"
+    );
+
+    let entry = &disabled["subcontext"];
+    assert_eq!(entry["type"], "stdio");
+    assert_eq!(entry["args"], serde_json::json!(["mcp"]));
+    // command should be an absolute path to a binary (not the `git` alias),
+    // so the server works from any directory.
+    let command = entry["command"].as_str().unwrap();
+    assert!(
+        Path::new(command).is_absolute(),
+        "command should be absolute path, got: {command}"
+    );
+    assert!(
+        command.ends_with("subcontext"),
+        "command should point at the subcontext binary, got: {command}"
+    );
+
+    // Second invocation is idempotent.
+    let out2 = Command::new(&bin)
+        .args(["install", "--global"])
+        .envs(test_env())
+        .env("HOME", &fake_home)
+        .current_dir(&fake_home)
+        .output()
+        .unwrap();
+    assert!(out2.status.success());
+
+    let content2 = fs::read_to_string(&config_path).unwrap();
+    let value2: serde_json::Value = serde_json::from_str(&content2).unwrap();
+    assert_eq!(
+        value2["_disabled_mcpServers"]["subcontext"], *entry,
+        "second run should leave entry untouched"
+    );
+
+    cleanup(&fake_home);
+}
+
+#[test]
+fn install_global_preserves_existing_config() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let config_path = fake_home.join(".claude.json");
+    fs::write(
+        &config_path,
+        r#"{"mcpServers":{"other":{"command":"echo","args":["hi"]}},"keepMe":true}"#,
+    )
+    .unwrap();
+
+    let bin = test_bin_dir().join("subcontext");
+    let out = Command::new(&bin)
+        .args(["install", "--global"])
+        .envs(test_env())
+        .env("HOME", &fake_home)
+        .current_dir(&fake_home)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    let content = fs::read_to_string(&config_path).unwrap();
+    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(value["keepMe"], true);
+    assert_eq!(value["mcpServers"]["other"]["command"], "echo");
+    assert!(value["_disabled_mcpServers"]["subcontext"].is_object());
+
+    cleanup(&fake_home);
 }
 
 #[test]

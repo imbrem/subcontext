@@ -3,6 +3,8 @@ mod clone;
 mod git;
 mod hook;
 mod install;
+mod mcp;
+mod mcp_config;
 mod overlay;
 mod settings;
 mod startup;
@@ -35,6 +37,13 @@ enum Commands {
         /// Re-install hooks even if they already contain subcontext dispatchers
         #[arg(long)]
         repair: bool,
+
+        /// Install the subcontext MCP server into the user's Claude Code config
+        /// (`~/.claude.json`) instead of setting up a repo-local install.
+        /// The server is registered as inactive; activate it by editing the
+        /// file and moving the entry into `mcpServers`.
+        #[arg(long, conflicts_with = "repair")]
+        global: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
@@ -83,6 +92,9 @@ enum Commands {
         command: SubmoduleCommand,
     },
 
+    /// Run the subcontext MCP server over stdio
+    Mcp,
+
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
     Hook {
@@ -127,9 +139,13 @@ fn main() -> Result<()> {
     let backend: &dyn Backend = &SystemBackend;
 
     match cli.command {
-        Commands::Install { repair } => {
-            let root = git::find_main_git_root(backend, &cwd)?;
-            install::install(backend, &root, repair)?;
+        Commands::Install { repair, global } => {
+            if global {
+                mcp_config::install_global(backend)?;
+            } else {
+                let root = git::find_main_git_root(backend, &cwd)?;
+                install::install(backend, &root, repair)?;
+            }
         }
         Commands::Clone { url } => {
             let root = git::find_main_git_root(backend, &cwd)?;
@@ -189,6 +205,9 @@ fn main() -> Result<()> {
                     submodule::remove(backend, &ctx, &resolved)?;
                 }
             }
+        }
+        Commands::Mcp => {
+            mcp::run(backend)?;
         }
         Commands::Hook {
             hook:
