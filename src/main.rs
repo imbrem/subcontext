@@ -34,6 +34,13 @@ enum Commands {
         /// Re-install hooks even if they already contain subcontext dispatchers
         #[arg(long)]
         repair: bool,
+
+        /// Install the subcontext MCP server into the user's Claude Code config
+        /// (`~/.claude.json`) instead of setting up a repo-local install.
+        /// The server is registered as inactive — activate it via `/mcp`
+        /// in Claude Code.
+        #[arg(long, conflicts_with = "repair")]
+        global: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
@@ -104,9 +111,13 @@ fn main() -> Result<()> {
     let cwd = env::current_dir()?;
 
     match cli.command {
-        Commands::Install { repair } => {
-            let root = git::find_main_git_root(&cwd)?;
-            install::install(&root, repair)?;
+        Commands::Install { repair, global } => {
+            if global {
+                mcp_config::install_global()?;
+            } else {
+                let root = git::find_main_git_root(&cwd)?;
+                install::install(&root, repair)?;
+            }
         }
         Commands::Clone { url } => {
             let root = git::find_main_git_root(&cwd)?;

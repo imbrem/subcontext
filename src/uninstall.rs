@@ -4,7 +4,6 @@ use std::fs;
 use std::path::Path;
 
 use crate::git::{CheckoutContext, config_dir, run_git, subcontext_dir};
-use crate::mcp_config::remove_mcp_config;
 use crate::overlay;
 
 /// Run `subcontext uninstall` from the given repo root.
@@ -31,11 +30,6 @@ pub fn uninstall(root: &Path) -> Result<()> {
 
     // Step 4: Remove subcontext entry from Claude settings
     remove_claude_settings(root)?;
-
-    // Step 4b: Remove subcontext entry from .mcp.json
-    if let Err(e) = remove_mcp_config(root) {
-        eprintln!("[subcontext] warning: failed to update .mcp.json: {e:#}");
-    }
 
     // Step 5: Clean up all subcontext excludes (including worktree sections)
     overlay::clean_all_excludes(root)?;

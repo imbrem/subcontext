@@ -1,102 +1,94 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
 use std::fs;
-use std::path::Path;
+use std::path::PathBuf;
 
 const SERVER_NAME: &str = "subcontext";
 
-/// The MCP server entry that subcontext injects into `.mcp.json`.
+/// Path to Claude Code's user-scoped config file: `~/.claude.json`.
+fn user_config_path() -> Result<PathBuf> {
+    let home = std::env::var_os("HOME").context("HOME environment variable is not set")?;
+    Ok(PathBuf::from(home).join(".claude.json"))
+}
+
+/// The stdio MCP server entry. Uses `git subcontext mcp` so the user gets the
+/// same binary that the `git subcontext` alias resolves to in whichever repo
+/// they are working in.
 fn server_entry() -> Value {
     json!({
+        "type": "stdio",
         "command": "git",
         "args": ["subcontext", "mcp"]
     })
 }
 
-/// Merge the subcontext MCP server entry into `.mcp.json` at the project root.
-/// Creates the file if it doesn't exist. Idempotent.
-pub fn merge_mcp_config(root: &Path) -> Result<()> {
-    let path = root.join(".mcp.json");
+/// Install the subcontext MCP server globally (user scope), **inactive by
+/// default**. The entry is written to `~/.claude.json` under
+/// `_disabled_mcpServers` so the user must explicitly move it to
+/// `mcpServers` (via `/mcp` in Claude Code, or by editing the file) to
+/// activate it.
+///
+/// Idempotent: if an entry under either key already exists, it is left alone.
+pub fn install_global() -> Result<()> {
+    let path = user_config_path()?;
 
     let mut config: Value = if path.exists() {
-        let content = fs::read_to_string(&path).context("failed to read .mcp.json")?;
+        let content = fs::read_to_string(&path)
+            .with_context(|| format!("failed to read {}", path.display()))?;
         if content.trim().is_empty() {
             json!({})
         } else {
-            serde_json::from_str(&content).context("failed to parse .mcp.json")?
+            serde_json::from_str(&content)
+                .with_context(|| format!("failed to parse {}", path.display()))?
         }
     } else {
         json!({})
     };
 
-    let obj = config
-        .as_object_mut()
-        .context(".mcp.json root is not an object")?;
+    let obj = config.as_object_mut().with_context(|| {
+        format!("{} root is not a JSON object", path.display())
+    })?;
 
-    let servers = obj
-        .entry("mcpServers")
+    // If an active entry already exists, don't touch it.
+    if obj
+        .get("mcpServers")
+        .and_then(|v| v.as_object())
+        .is_some_and(|s| s.contains_key(SERVER_NAME))
+    {
+        eprintln!(
+            "[subcontext] `{SERVER_NAME}` is already active in {}. Leaving it as-is.",
+            path.display()
+        );
+        return Ok(());
+    }
+
+    let disabled = obj
+        .entry("_disabled_mcpServers")
         .or_insert_with(|| json!({}))
         .as_object_mut()
-        .context("mcpServers field is not an object")?;
+        .context("_disabled_mcpServers field is not an object")?;
 
-    // Only insert if missing; don't clobber user edits.
-    if !servers.contains_key(SERVER_NAME) {
-        servers.insert(SERVER_NAME.to_string(), server_entry());
+    if disabled.contains_key(SERVER_NAME) {
+        eprintln!(
+            "[subcontext] `{SERVER_NAME}` MCP server already installed (inactive) in {}.",
+            path.display()
+        );
+        return Ok(());
     }
+
+    disabled.insert(SERVER_NAME.to_string(), server_entry());
 
     let formatted = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, format!("{formatted}\n")).context("failed to write .mcp.json")?;
+    fs::write(&path, format!("{formatted}\n"))
+        .with_context(|| format!("failed to write {}", path.display()))?;
 
-    eprintln!("[subcontext] Configured MCP server in .mcp.json.");
-    Ok(())
-}
-
-/// Remove the subcontext MCP server entry from `.mcp.json`.
-/// Removes the file entirely if it becomes empty.
-pub fn remove_mcp_config(root: &Path) -> Result<()> {
-    let path = root.join(".mcp.json");
-    if !path.exists() {
-        return Ok(());
-    }
-
-    let content = fs::read_to_string(&path).context("failed to read .mcp.json")?;
-    if content.trim().is_empty() {
-        return Ok(());
-    }
-
-    let mut config: Value =
-        serde_json::from_str(&content).context("failed to parse .mcp.json")?;
-
-    let mut removed = false;
-    if let Some(obj) = config.as_object_mut()
-        && let Some(servers) = obj.get_mut("mcpServers").and_then(|v| v.as_object_mut())
-    {
-        removed = servers.remove(SERVER_NAME).is_some();
-
-        // If no servers remain, drop the key.
-        if servers.is_empty() {
-            obj.remove("mcpServers");
-        }
-    }
-
-    if !removed {
-        return Ok(());
-    }
-
-    // If the file is now an empty object, remove it entirely so we don't
-    // leave behind an unused file in the host repo.
-    let is_empty = config
-        .as_object()
-        .is_some_and(|o| o.is_empty());
-
-    if is_empty {
-        fs::remove_file(&path).context("failed to remove empty .mcp.json")?;
-        eprintln!("[subcontext] Removed .mcp.json (no servers remained).");
-    } else {
-        let formatted = serde_json::to_string_pretty(&config)?;
-        fs::write(&path, format!("{formatted}\n")).context("failed to write .mcp.json")?;
-        eprintln!("[subcontext] Removed subcontext MCP server from .mcp.json.");
-    }
-
+    eprintln!(
+        "[subcontext] Installed `{SERVER_NAME}` MCP server (inactive) in {}.",
+        path.display()
+    );
+    eprintln!(
+        "[subcontext] To activate it, run /mcp in Claude Code or move the entry \
+         from `_disabled_mcpServers` to `mcpServers`."
+    );
     Ok(())
 }
