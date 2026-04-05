@@ -619,8 +619,18 @@ fn install_global_writes_disabled_mcp_server() {
 
     let entry = &disabled["subcontext"];
     assert_eq!(entry["type"], "stdio");
-    assert_eq!(entry["command"], "git");
-    assert_eq!(entry["args"], serde_json::json!(["subcontext", "mcp"]));
+    assert_eq!(entry["args"], serde_json::json!(["mcp"]));
+    // command should be an absolute path to a binary (not the `git` alias),
+    // so the server works from any directory.
+    let command = entry["command"].as_str().unwrap();
+    assert!(
+        Path::new(command).is_absolute(),
+        "command should be absolute path, got: {command}"
+    );
+    assert!(
+        command.ends_with("subcontext"),
+        "command should point at the subcontext binary, got: {command}"
+    );
 
     // Second invocation is idempotent.
     let out2 = Command::new(&bin)

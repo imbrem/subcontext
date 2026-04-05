@@ -11,22 +11,33 @@ fn user_config_path() -> Result<PathBuf> {
     Ok(PathBuf::from(home).join(".claude.json"))
 }
 
-/// The stdio MCP server entry. Uses `git subcontext mcp` so the user gets the
-/// same binary that the `git subcontext` alias resolves to in whichever repo
-/// they are working in.
-fn server_entry() -> Value {
-    json!({
+/// Build the stdio MCP server entry pointing at the currently-running
+/// subcontext binary. We resolve an absolute path because the `git
+/// subcontext` alias is only set locally in each installed repo — a
+/// *globally*-registered MCP server needs a path that works from anywhere.
+fn server_entry() -> Result<Value> {
+    let exe =
+        std::env::current_exe().context("failed to resolve subcontext binary path")?;
+    let exe_str = exe.to_string_lossy().to_string();
+    Ok(json!({
         "type": "stdio",
-        "command": "git",
-        "args": ["subcontext", "mcp"]
-    })
+        "command": exe_str,
+        "args": ["mcp"]
+    }))
 }
 
 /// Install the subcontext MCP server globally (user scope), **inactive by
-/// default**. The entry is written to `~/.claude.json` under
-/// `_disabled_mcpServers` so the user must explicitly move it to
-/// `mcpServers` (via `/mcp` in Claude Code, or by editing the file) to
-/// activate it.
+/// default**.
+///
+/// Claude Code has no documented mechanism for "install a user-scoped MCP
+/// server but keep it inactive". The real `mcpServers` field in
+/// `~/.claude.json` always activates its entries on session start. To keep
+/// the entry dormant, we write it to a `_disabled_mcpServers` key (an
+/// unknown top-level field that Claude Code ignores) as a parking spot.
+///
+/// The effect: the server is present in the config as a ready-to-use
+/// template, but never started by Claude Code. To activate it, the user
+/// moves the entry from `_disabled_mcpServers` to `mcpServers` by hand.
 ///
 /// Idempotent: if an entry under either key already exists, it is left alone.
 pub fn install_global() -> Result<()> {
@@ -76,7 +87,7 @@ pub fn install_global() -> Result<()> {
         return Ok(());
     }
 
-    disabled.insert(SERVER_NAME.to_string(), server_entry());
+    disabled.insert(SERVER_NAME.to_string(), server_entry()?);
 
     let formatted = serde_json::to_string_pretty(&config)?;
     fs::write(&path, format!("{formatted}\n"))
@@ -87,8 +98,9 @@ pub fn install_global() -> Result<()> {
         path.display()
     );
     eprintln!(
-        "[subcontext] To activate it, run /mcp in Claude Code or move the entry \
-         from `_disabled_mcpServers` to `mcpServers`."
+        "[subcontext] To activate it, edit {} and move the \"{SERVER_NAME}\" entry\n\
+         [subcontext] from \"_disabled_mcpServers\" into \"mcpServers\".",
+        path.display()
     );
     Ok(())
 }
