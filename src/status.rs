@@ -1,20 +1,23 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+use crate::backend::Backend;
 use crate::git;
 
 /// Find the nearest git root and the main repo root.
-fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
-    let mut current = start
-        .canonicalize()
+fn find_git_roots(backend: &dyn Backend, start: &Path) -> Result<(PathBuf, PathBuf)> {
+    let mut current = backend
+        .canonicalize(start)
         .context("failed to canonicalize start path")?;
     loop {
         let dot_git = current.join(".git");
-        if dot_git.is_dir() {
+        if backend.is_dir(&dot_git) {
             return Ok((current.clone(), current));
         }
-        if dot_git.is_file() {
-            let contents = std::fs::read_to_string(&dot_git).context("failed to read .git file")?;
+        if backend.is_file(&dot_git) {
+            let contents = backend
+                .read_to_string(&dot_git)
+                .context("failed to read .git file")?;
             let gitdir = contents
                 .strip_prefix("gitdir: ")
                 .unwrap_or(&contents)
@@ -24,8 +27,8 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
             } else {
                 current.join(gitdir)
             };
-            let main_git_dir = gitdir_path
-                .canonicalize()
+            let main_git_dir = backend
+                .canonicalize(&gitdir_path)
                 .context("failed to resolve worktree gitdir")?;
             let main_root = main_git_dir
                 .parent()
@@ -41,8 +44,8 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
     }
 }
 
-pub fn status(cwd: &Path) -> Result<()> {
-    let (current_root, main_root) = find_git_roots(cwd)?;
+pub fn status(backend: &dyn Backend, cwd: &Path) -> Result<()> {
+    let (current_root, main_root) = find_git_roots(backend, cwd)?;
     let is_worktree = current_root != main_root;
 
     if is_worktree {
@@ -53,7 +56,7 @@ pub fn status(cwd: &Path) -> Result<()> {
         println!("Worktree:    no (this is the main checkout)");
     }
 
-    match git::current_branch(&current_root) {
+    match git::current_branch(backend, &current_root) {
         Ok(branch) => println!("Branch:      {}", branch),
         Err(_) => println!("Branch:      (detached HEAD)"),
     }
@@ -62,7 +65,7 @@ pub fn status(cwd: &Path) -> Result<()> {
     if is_worktree {
         println!(
             "Subcontext:  {}",
-            if sc_dir.is_dir() {
+            if backend.is_dir(&sc_dir) {
                 "installed (in main repo)"
             } else {
                 "not installed"
@@ -71,7 +74,7 @@ pub fn status(cwd: &Path) -> Result<()> {
     } else {
         println!(
             "Subcontext:  {}",
-            if sc_dir.is_dir() {
+            if backend.is_dir(&sc_dir) {
                 "installed"
             } else {
                 "not installed"
