@@ -98,7 +98,7 @@ fn init_context_repo(backend: &dyn Backend, root: &Path, host_branch: &str) -> R
     backend.create_dir_all(&sc_dir)?;
 
     // 1. Init bare repo
-    run_git(backend, &["init", "--bare", &repo.to_string_lossy()], root)?;
+    backend.init_bare(root, &repo)?;
 
     // 2. Create config branch via plumbing
     let empty_tree =
@@ -270,18 +270,14 @@ fn commit_config_branch(backend: &dyn Backend, root: &Path) -> Result<()> {
         return Ok(());
     }
 
-    run_git(backend, &["add", "-A"], &cfg)?;
+    backend.add_all(&cfg)?;
 
-    let status = run_git(backend, &["status", "--porcelain"], &cfg)?;
+    let status = backend.status_porcelain(&cfg)?;
     if status.is_empty() {
         return Ok(());
     }
 
-    run_git(
-        backend,
-        &["commit", "-m", "subcontext: update config"],
-        &cfg,
-    )?;
+    backend.commit(&cfg, "subcontext: update config")?;
 
     Ok(())
 }
