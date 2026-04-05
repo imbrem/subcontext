@@ -559,8 +559,16 @@ fn mcp_status_tool_returns_text() {
         .unwrap();
 
     let stdin = child.stdin.as_mut().unwrap();
-    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
-    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#
+    )
+    .unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#
+    )
+    .unwrap();
     writeln!(
         stdin,
         r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subcontext_status","arguments":{{}}}}}}"#

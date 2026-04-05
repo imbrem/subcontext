@@ -57,9 +57,9 @@ pub fn install_global(backend: &dyn Backend) -> Result<()> {
         json!({})
     };
 
-    let obj = config.as_object_mut().with_context(|| {
-        format!("{} root is not a JSON object", path.display())
-    })?;
+    let obj = config
+        .as_object_mut()
+        .with_context(|| format!("{} root is not a JSON object", path.display()))?;
 
     // If an active entry already exists, don't touch it.
     if obj
