@@ -99,11 +99,13 @@ pub fn init_state_branch_in(backend: &dyn Backend, bare: &Path, state: &Path) ->
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
-             task_uuid     TEXT PRIMARY KEY,
-             task_name     TEXT NOT NULL,
-             task_status   TEXT NOT NULL,
-             task_kind     TEXT NOT NULL,
-             project_uuid  TEXT NOT NULL
+             task_uuid       TEXT PRIMARY KEY,
+             task_name       TEXT NOT NULL,
+             task_status     TEXT NOT NULL,
+             task_kind       TEXT NOT NULL,
+             project_uuid    TEXT NOT NULL,
+             source_uuid     TEXT DEFAULT NULL,
+             source_context  TEXT DEFAULT NULL
          );
          CREATE TABLE IF NOT EXISTS task_names (
              branch_name   TEXT NOT NULL,
@@ -113,6 +115,10 @@ fn create_schema(conn: &Connection) -> Result<()> {
          );",
     )?;
     Ok(())
+}
+
+fn open_db(scope: &TaskScope) -> Result<Connection> {
+    Ok(Connection::open(scope.db_path())?)
 }
 
 fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
@@ -125,20 +131,31 @@ fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result
     Ok(())
 }
 
-/// Add a new task.
+/// Add a new task. Returns the new task's UUID.
+///
+/// If `source` is `Some((source_uuid, source_context))`, the new task is a
+/// **shadow** of another task: its `source_uuid` / `source_context` columns
+/// are populated, and `source_context` is used as the `task_names.branch_name`
+/// namespace (so shadow tasks from different origin projects don't collide).
 pub fn add_task(
     backend: &dyn Backend,
     scope: &TaskScope,
     name: &str,
     kind: Option<&str>,
     status: Option<&str>,
-) -> Result<()> {
-    let branch = &scope.host_branch;
+    source: Option<(&str, &str)>,
+) -> Result<String> {
+    // Shadow tasks live under their origin's project UUID as the branch
+    // namespace; native tasks live under the scope's host_branch.
+    let branch: String = match source {
+        Some((_, ctx)) => ctx.to_string(),
+        None => scope.host_branch.clone(),
+    };
     let task_uuid = Uuid::new_v4().to_string();
     let kind = kind.unwrap_or(DEFAULT_KIND);
     let status = status.unwrap_or(DEFAULT_STATUS);
 
-    let conn = Connection::open(scope.db_path())?;
+    let conn = open_db(scope)?;
     let existing: Option<String> = conn
         .query_row(
             "SELECT task_uuid FROM task_names WHERE branch_name = ?1 AND task_name = ?2",
@@ -149,10 +166,23 @@ pub fn add_task(
     if existing.is_some() {
         bail!("task '{name}' already exists on branch '{branch}'");
     }
+    let (source_uuid, source_context) = match source {
+        Some((u, c)) => (Some(u.to_string()), Some(c.to_string())),
+        None => (None, None),
+    };
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, project_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![task_uuid, name, status, kind, scope.project_uuid],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, project_uuid, \
+                            source_uuid, source_context) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![
+            task_uuid,
+            name,
+            status,
+            kind,
+            scope.project_uuid,
+            source_uuid,
+            source_context
+        ],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -160,7 +190,12 @@ pub fn add_task(
     )?;
     drop(conn);
 
-    commit_state_in(backend, &scope.state_dir, &format!("task add: {name}"))?;
+    let commit_msg = if source.is_some() {
+        format!("task add (shadow): {name}")
+    } else {
+        format!("task add: {name}")
+    };
+    commit_state_in(backend, &scope.state_dir, &commit_msg)?;
 
     let md = build_task_md(&TaskData {
         name: name.to_string(),
@@ -169,11 +204,17 @@ pub fn add_task(
         kind: kind.to_string(),
         project_uuid: scope.project_uuid.clone(),
         completed_at: None,
+        source_uuid: source_uuid.clone(),
+        source_context: source_context.clone(),
     });
     create_task_branch(backend, scope, &task_uuid, &md)?;
 
-    eprintln!("[subcontext] Added task '{name}' ({task_uuid})");
-    Ok(())
+    if source.is_some() {
+        eprintln!("[subcontext] Added shadow task '{name}' ({task_uuid})");
+    } else {
+        eprintln!("[subcontext] Added task '{name}' ({task_uuid})");
+    }
+    Ok(task_uuid)
 }
 
 /// Mark an existing task as done.
@@ -185,17 +226,34 @@ pub fn done_task(
 ) -> Result<()> {
     let branch = &scope.host_branch;
 
-    let conn = Connection::open(scope.db_path())?;
-    let row: (String, String, String, String) = conn
+    let conn = open_db(scope)?;
+    let row: (
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    ) = conn
         .query_row(
-            "SELECT t.task_uuid, t.task_name, t.task_kind, t.project_uuid
+            "SELECT t.task_uuid, t.task_name, t.task_kind, t.project_uuid, \
+                    t.source_uuid, t.source_context
              FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid
              WHERE n.branch_name = ?1 AND n.task_name = ?2",
             params![branch, name],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            },
         )
         .with_context(|| format!("task '{name}' not found on branch '{branch}'"))?;
-    let (task_uuid, task_name, kind, project_uuid) = row;
+    let (task_uuid, task_name, kind, project_uuid, source_uuid, source_context) = row;
 
     conn.execute(
         "UPDATE tasks SET task_status = 'done' WHERE task_uuid = ?1",
@@ -214,6 +272,8 @@ pub fn done_task(
         kind,
         project_uuid,
         completed_at: Some(completed_at),
+        source_uuid,
+        source_context,
     });
     update_task_branch(backend, scope, &task_uuid, &md)?;
 
@@ -228,6 +288,8 @@ struct TaskData {
     kind: String,
     project_uuid: String,
     completed_at: Option<String>,
+    source_uuid: Option<String>,
+    source_context: Option<String>,
 }
 
 fn build_task_md(t: &TaskData) -> String {
@@ -240,6 +302,12 @@ fn build_task_md(t: &TaskData) -> String {
     s.push_str(&format!("project_uuid: {}\n", t.project_uuid));
     if let Some(ts) = &t.completed_at {
         s.push_str(&format!("completed_at: {ts}\n"));
+    }
+    if let Some(u) = &t.source_uuid {
+        s.push_str(&format!("source_uuid: {u}\n"));
+    }
+    if let Some(c) = &t.source_context {
+        s.push_str(&format!("source_context: {c}\n"));
     }
     s.push_str("---\n");
     s
