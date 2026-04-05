@@ -103,25 +103,32 @@ fn create_schema(conn: &Connection) -> Result<()> {
              task_name       TEXT NOT NULL,
              task_status     TEXT NOT NULL,
              task_kind       TEXT NOT NULL,
-             project_uuid    TEXT NOT NULL,
-             source_uuid     TEXT DEFAULT NULL,
-             source_context  TEXT DEFAULT NULL
+             task_description TEXT DEFAULT NULL,
+             project_uuid    TEXT NOT NULL
          );
          CREATE TABLE IF NOT EXISTS task_names (
              branch_name   TEXT NOT NULL,
              task_name     TEXT NOT NULL,
              task_uuid     TEXT NOT NULL,
              PRIMARY KEY (branch_name, task_name)
+         );
+         CREATE TABLE IF NOT EXISTS objects (
+             uuid                  TEXT PRIMARY KEY,
+             type                  TEXT NOT NULL,
+             current_commit        TEXT NOT NULL,
+             source_context_uuid   TEXT DEFAULT NULL,
+             source_object_uuid    TEXT DEFAULT NULL,
+             source_context_commit TEXT DEFAULT NULL
          );",
     )?;
     Ok(())
 }
 
-fn open_db(scope: &TaskScope) -> Result<Connection> {
+pub fn open_db(scope: &TaskScope) -> Result<Connection> {
     Ok(Connection::open(scope.db_path())?)
 }
 
-fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
+pub fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
     run_work_git(backend, &["add", "-A"], state)?;
     let status = run_work_git(backend, &["status", "--porcelain"], state)?;
     if status.is_empty() {
@@ -131,24 +138,26 @@ fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result
     Ok(())
 }
 
-/// Add a new task. Returns the new task's UUID.
+/// Add a new task. Returns `(task_uuid, branch_commit)`.
 ///
-/// If `source` is `Some((source_uuid, source_context))`, the new task is a
-/// **shadow** of another task: its `source_uuid` / `source_context` columns
-/// are populated, and `source_context` is used as the `task_names.branch_name`
-/// namespace (so shadow tasks from different origin projects don't collide).
+/// If `source` is `Some((source_context_uuid, source_object_uuid,
+/// source_context_commit))`, the new task is a **shadow** of another task:
+/// `source_context_uuid` is used as the `task_names.branch_name` namespace
+/// (so shadow tasks from different origin projects don't collide), and the
+/// source fields are recorded in `object.json` and the `objects` table.
 pub fn add_task(
     backend: &dyn Backend,
     scope: &TaskScope,
     name: &str,
     kind: Option<&str>,
     status: Option<&str>,
-    source: Option<(&str, &str)>,
-) -> Result<String> {
+    description: Option<&str>,
+    source: Option<(&str, &str, &str)>,
+) -> Result<(String, String)> {
     // Shadow tasks live under their origin's project UUID as the branch
     // namespace; native tasks live under the scope's host_branch.
     let branch: String = match source {
-        Some((_, ctx)) => ctx.to_string(),
+        Some((ctx, _, _)) => ctx.to_string(),
         None => scope.host_branch.clone(),
     };
     let task_uuid = Uuid::new_v4().to_string();
@@ -166,23 +175,10 @@ pub fn add_task(
     if existing.is_some() {
         bail!("task '{name}' already exists on branch '{branch}'");
     }
-    let (source_uuid, source_context) = match source {
-        Some((u, c)) => (Some(u.to_string()), Some(c.to_string())),
-        None => (None, None),
-    };
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, project_uuid, \
-                            source_uuid, source_context) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![
-            task_uuid,
-            name,
-            status,
-            kind,
-            scope.project_uuid,
-            source_uuid,
-            source_context
-        ],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![task_uuid, name, status, kind, description, scope.project_uuid],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -197,24 +193,36 @@ pub fn add_task(
     };
     commit_state_in(backend, &scope.state_dir, &commit_msg)?;
 
-    let md = build_task_md(&TaskData {
-        name: name.to_string(),
-        uuid: task_uuid.clone(),
-        status: status.to_string(),
-        kind: kind.to_string(),
-        project_uuid: scope.project_uuid.clone(),
-        completed_at: None,
-        source_uuid: source_uuid.clone(),
-        source_context: source_context.clone(),
-    });
-    create_task_branch(backend, scope, &task_uuid, &md)?;
+    let object_json = build_task_object_json(
+        &TaskData {
+            name: name.to_string(),
+            uuid: task_uuid.clone(),
+            status: status.to_string(),
+            kind: kind.to_string(),
+            project_uuid: scope.project_uuid.clone(),
+            completed_at: None,
+            description: description.map(|s| s.to_string()),
+        },
+        source,
+    );
+    let commit = create_object_branch(backend, scope, &task_uuid, &object_json)?;
+
+    // Record in the objects table.
+    let conn = open_db(scope)?;
+    insert_object(&conn, &task_uuid, "task", &commit, source)?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object add: {task_uuid}"),
+    )?;
 
     if source.is_some() {
         eprintln!("[subcontext] Added shadow task '{name}' ({task_uuid})");
     } else {
         eprintln!("[subcontext] Added task '{name}' ({task_uuid})");
     }
-    Ok(task_uuid)
+    Ok((task_uuid, commit))
 }
 
 /// Mark an existing task as done.
@@ -227,33 +235,16 @@ pub fn done_task(
     let branch = &scope.host_branch;
 
     let conn = open_db(scope)?;
-    let row: (
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    ) = conn
+    let row: (String, String) = conn
         .query_row(
-            "SELECT t.task_uuid, t.task_name, t.task_kind, t.project_uuid, \
-                    t.source_uuid, t.source_context
+            "SELECT t.task_uuid, t.task_name \
              FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid
              WHERE n.branch_name = ?1 AND n.task_name = ?2",
             params![branch, name],
-            |r| {
-                Ok((
-                    r.get(0)?,
-                    r.get(1)?,
-                    r.get(2)?,
-                    r.get(3)?,
-                    r.get(4)?,
-                    r.get(5)?,
-                ))
-            },
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .with_context(|| format!("task '{name}' not found on branch '{branch}'"))?;
-    let (task_uuid, task_name, kind, project_uuid, source_uuid, source_context) = row;
+    let (task_uuid, _task_name) = row;
 
     conn.execute(
         "UPDATE tasks SET task_status = 'done' WHERE task_uuid = ?1",
@@ -265,17 +256,34 @@ pub fn done_task(
 
     commit_state_in(backend, &scope.state_dir, &format!("task done: {name}"))?;
 
-    let md = build_task_md(&TaskData {
-        name: task_name,
-        uuid: task_uuid.clone(),
-        status: "done".to_string(),
-        kind,
-        project_uuid,
-        completed_at: Some(completed_at),
-        source_uuid,
-        source_context,
-    });
-    update_task_branch(backend, scope, &task_uuid, &md)?;
+    // Read existing object.json, update the data fields.
+    let obj_branch = format!("object/{task_uuid}");
+    let existing = run_git_in_bare(
+        backend,
+        &["show", &format!("{obj_branch}:object.json")],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )?;
+    let mut val: serde_json::Value = serde_json::from_str(&existing)
+        .with_context(|| format!("invalid object.json on {obj_branch}"))?;
+    val["data"]["status"] = serde_json::Value::String("done".to_string());
+    val["data"]["completed_at"] = serde_json::Value::String(completed_at);
+
+    let new_json = serde_json::to_string_pretty(&val)? + "\n";
+    let new_commit = update_object_branch(backend, scope, &task_uuid, &new_json)?;
+
+    // Update the object's current_commit.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![new_commit, task_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object update: {task_uuid}"),
+    )?;
 
     eprintln!("[subcontext] Marked task '{name}' as done");
     Ok(())
@@ -288,38 +296,78 @@ struct TaskData {
     kind: String,
     project_uuid: String,
     completed_at: Option<String>,
-    source_uuid: Option<String>,
-    source_context: Option<String>,
+    description: Option<String>,
 }
 
-fn build_task_md(t: &TaskData) -> String {
-    let mut s = String::new();
-    s.push_str("---\n");
-    s.push_str(&format!("name: {}\n", t.name));
-    s.push_str(&format!("uuid: {}\n", t.uuid));
-    s.push_str(&format!("status: {}\n", t.status));
-    s.push_str(&format!("kind: {}\n", t.kind));
-    s.push_str(&format!("project_uuid: {}\n", t.project_uuid));
+/// Build a complete `object.json` for a task, with all data inlined under
+/// the `"data"` key.
+fn build_task_object_json(t: &TaskData, source: Option<(&str, &str, &str)>) -> String {
+    let mut data = serde_json::json!({
+        "name": t.name,
+        "uuid": t.uuid,
+        "status": t.status,
+        "kind": t.kind,
+        "project_uuid": t.project_uuid,
+    });
     if let Some(ts) = &t.completed_at {
-        s.push_str(&format!("completed_at: {ts}\n"));
+        data["completed_at"] = serde_json::Value::String(ts.clone());
     }
-    if let Some(u) = &t.source_uuid {
-        s.push_str(&format!("source_uuid: {u}\n"));
+    // Always include description (null when absent).
+    data["description"] = match &t.description {
+        Some(d) => serde_json::Value::String(d.clone()),
+        None => serde_json::Value::Null,
+    };
+
+    let mut obj = serde_json::json!({
+        "type": "task",
+        "data": data,
+    });
+    if let Some((ctx_uuid, obj_uuid, ctx_commit)) = source {
+        obj["source_context_uuid"] = serde_json::Value::String(ctx_uuid.to_string());
+        obj["source_object_uuid"] = serde_json::Value::String(obj_uuid.to_string());
+        obj["source_context_commit"] = serde_json::Value::String(ctx_commit.to_string());
     }
-    if let Some(c) = &t.source_context {
-        s.push_str(&format!("source_context: {c}\n"));
-    }
-    s.push_str("---\n");
-    s
+    serde_json::to_string_pretty(&obj).unwrap() + "\n"
 }
 
-fn create_task_branch(
+/// Build a complete `object.json` for a child object.
+pub fn build_child_object_json(child_data: &serde_json::Value) -> String {
+    let obj = serde_json::json!({
+        "type": "child",
+        "data": child_data,
+    });
+    serde_json::to_string_pretty(&obj).unwrap() + "\n"
+}
+
+/// Insert a row into the `objects` table.
+pub fn insert_object(
+    conn: &Connection,
+    uuid: &str,
+    obj_type: &str,
+    commit: &str,
+    source: Option<(&str, &str, &str)>,
+) -> Result<()> {
+    let (src_ctx, src_obj, src_commit) = match source {
+        Some((c, o, cc)) => (Some(c), Some(o), Some(cc)),
+        None => (None, None, None),
+    };
+    conn.execute(
+        "INSERT INTO objects (uuid, type, current_commit, \
+                              source_context_uuid, source_object_uuid, source_context_commit) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![uuid, obj_type, commit, src_ctx, src_obj, src_commit],
+    )?;
+    Ok(())
+}
+
+/// Create a new `object/<uuid>` branch containing a single `object.json`.
+pub fn create_object_branch(
     backend: &dyn Backend,
     scope: &TaskScope,
-    task_uuid: &str,
-    md: &str,
-) -> Result<()> {
-    let ref_name = format!("refs/heads/tasks/{task_uuid}");
+    uuid: &str,
+    object_json: &str,
+) -> Result<String> {
+    let ref_name = format!("refs/heads/object/{uuid}");
     // Defensive: refuse to clobber an existing ref (UUID collision).
     if run_git_in_bare(
         backend,
@@ -329,18 +377,13 @@ fn create_task_branch(
     )
     .is_ok()
     {
-        bail!("task branch {ref_name} already exists");
+        bail!("object branch {ref_name} already exists");
     }
-    let blob = hash_object(backend, scope, md)?;
-    let tree = build_tree(backend, scope, "TASK.md", &blob)?;
+    let blob = hash_object(backend, scope, object_json)?;
+    let tree = build_tree_single(backend, scope, "object.json", &blob)?;
     let commit = run_git_in_bare(
         backend,
-        &[
-            "commit-tree",
-            &tree,
-            "-m",
-            &format!("init task {task_uuid}"),
-        ],
+        &["commit-tree", &tree, "-m", &format!("init object {uuid}")],
         &scope.repo_dir,
         &scope.repo_dir,
     )?;
@@ -350,25 +393,25 @@ fn create_task_branch(
         &scope.repo_dir,
         &scope.repo_dir,
     )?;
-    Ok(())
+    Ok(commit)
 }
 
-fn update_task_branch(
+/// Update the `object/<uuid>` branch with a new `object.json`.
+pub fn update_object_branch(
     backend: &dyn Backend,
     scope: &TaskScope,
-    task_uuid: &str,
-    md: &str,
-) -> Result<()> {
-    let branch = format!("tasks/{task_uuid}");
-    let ref_name = format!("refs/heads/{branch}");
+    uuid: &str,
+    object_json: &str,
+) -> Result<String> {
+    let ref_name = format!("refs/heads/object/{uuid}");
     let parent = run_git_in_bare(
         backend,
         &["rev-parse", &ref_name],
         &scope.repo_dir,
         &scope.repo_dir,
     )?;
-    let blob = hash_object(backend, scope, md)?;
-    let tree = build_tree(backend, scope, "TASK.md", &blob)?;
+    let blob = hash_object(backend, scope, object_json)?;
+    let tree = build_tree_single(backend, scope, "object.json", &blob)?;
     let commit = run_git_in_bare(
         backend,
         &[
@@ -377,7 +420,7 @@ fn update_task_branch(
             "-p",
             &parent,
             "-m",
-            &format!("update task {task_uuid}"),
+            &format!("update object {uuid}"),
         ],
         &scope.repo_dir,
         &scope.repo_dir,
@@ -388,7 +431,7 @@ fn update_task_branch(
         &scope.repo_dir,
         &scope.repo_dir,
     )?;
-    Ok(())
+    Ok(commit)
 }
 
 /// Hash `content` as a blob in the subcontext bare repo, returning its SHA.
@@ -411,13 +454,17 @@ fn hash_object(backend: &dyn Backend, scope: &TaskScope, content: &str) -> Resul
 }
 
 /// Build a single-entry tree in the subcontext bare repo using a temporary
-/// index file (so we don't need to pipe stdin into `git mktree`).
-fn build_tree(backend: &dyn Backend, scope: &TaskScope, name: &str, blob: &str) -> Result<String> {
+/// index file.
+fn build_tree_single(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    name: &str,
+    blob: &str,
+) -> Result<String> {
     let idx = scratch_path(&scope.scratch_base, "index");
     if let Some(parent) = idx.parent() {
         backend.create_dir_all(parent)?;
     }
-    // Ensure no stale index is left from a prior failed run.
     if backend.exists(&idx) {
         backend.remove_file(&idx).ok();
     }
