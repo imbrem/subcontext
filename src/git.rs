@@ -193,7 +193,8 @@ pub fn find_main_git_root(backend: &dyn Backend, start: &Path) -> Result<PathBuf
 
 /// Get the current branch name via `git symbolic-ref --short HEAD`.
 pub fn current_branch(backend: &dyn Backend, repo_root: &Path) -> Result<String> {
-    run_git(backend, &["symbolic-ref", "--short", "HEAD"], repo_root)
+    backend
+        .current_branch(repo_root)
         .context("failed to determine current branch (detached HEAD?)")
 }
 

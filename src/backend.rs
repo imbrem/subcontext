@@ -42,6 +42,88 @@ pub trait Backend {
     /// Returns an error if git exits with a non-zero status.
     fn git(&self, inv: &GitInvocation<'_>) -> Result<String>;
 
+    // ─── High-level git helpers ──────────────────────────────────────
+    //
+    // These all shell out via [`Backend::git`] so a mock backend only needs
+    // to override `git` to intercept every git call. Overriding the helpers
+    // directly is also supported for finer-grained control.
+
+    /// Run `git <args>` in `cwd` with no environment overrides.
+    fn git_in(&self, cwd: &Path, args: &[&str]) -> Result<String> {
+        self.git(&GitInvocation::new(args, cwd))
+    }
+
+    /// `git init <path>` — initialize a non-bare repository at `path`.
+    fn init(&self, cwd: &Path, path: &Path) -> Result<String> {
+        let p = path.to_string_lossy();
+        self.git_in(cwd, &["init", &p])
+    }
+
+    /// `git init --bare <path>` — initialize a bare repository at `path`.
+    fn init_bare(&self, cwd: &Path, path: &Path) -> Result<String> {
+        let p = path.to_string_lossy();
+        self.git_in(cwd, &["init", "--bare", &p])
+    }
+
+    /// `git clone <url> <dest>`.
+    fn clone(&self, cwd: &Path, url: &str, dest: &Path) -> Result<String> {
+        let d = dest.to_string_lossy();
+        self.git_in(cwd, &["clone", url, &d])
+    }
+
+    /// `git clone --bare <url> <dest>`.
+    fn clone_bare(&self, cwd: &Path, url: &str, dest: &Path) -> Result<String> {
+        let d = dest.to_string_lossy();
+        self.git_in(cwd, &["clone", "--bare", url, &d])
+    }
+
+    /// `git worktree add <path> <reference>`.
+    fn worktree_add(&self, cwd: &Path, path: &Path, reference: &str) -> Result<String> {
+        let p = path.to_string_lossy();
+        self.git_in(cwd, &["worktree", "add", &p, reference])
+    }
+
+    /// `git worktree remove <path>`.
+    fn worktree_remove(&self, cwd: &Path, path: &str) -> Result<String> {
+        self.git_in(cwd, &["worktree", "remove", path])
+    }
+
+    /// `git add -A` — stage every change under `cwd`.
+    fn add_all(&self, cwd: &Path) -> Result<String> {
+        self.git_in(cwd, &["add", "-A"])
+    }
+
+    /// `git commit -m <message>`.
+    fn commit(&self, cwd: &Path, message: &str) -> Result<String> {
+        self.git_in(cwd, &["commit", "-m", message])
+    }
+
+    /// `git status --porcelain`.
+    fn status_porcelain(&self, cwd: &Path) -> Result<String> {
+        self.git_in(cwd, &["status", "--porcelain"])
+    }
+
+    /// `git symbolic-ref --short HEAD` — the name of the current branch.
+    /// Errors on detached HEAD.
+    fn current_branch(&self, cwd: &Path) -> Result<String> {
+        self.git_in(cwd, &["symbolic-ref", "--short", "HEAD"])
+    }
+
+    /// `git rev-parse <reference>`.
+    fn rev_parse(&self, cwd: &Path, reference: &str) -> Result<String> {
+        self.git_in(cwd, &["rev-parse", reference])
+    }
+
+    /// `git checkout <reference>`.
+    fn checkout(&self, cwd: &Path, reference: &str) -> Result<String> {
+        self.git_in(cwd, &["checkout", reference])
+    }
+
+    /// `git checkout -b <branch>`.
+    fn checkout_new_branch(&self, cwd: &Path, branch: &str) -> Result<String> {
+        self.git_in(cwd, &["checkout", "-b", branch])
+    }
+
     // ─── Filesystem ──────────────────────────────────────────────────
 
     fn read_to_string(&self, path: &Path) -> Result<String>;
