@@ -1,3 +1,4 @@
+mod backend;
 mod clone;
 mod git;
 mod hook;
@@ -14,6 +15,7 @@ use clap::{Parser, Subcommand};
 use std::env;
 use std::path::Path;
 
+use backend::{Backend, SystemBackend};
 use git::CheckoutContext;
 
 #[derive(Parser)]
@@ -122,38 +124,39 @@ enum SubmoduleCommand {
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
+    let backend: &dyn Backend = &SystemBackend;
 
     match cli.command {
         Commands::Install { repair } => {
-            let root = git::find_main_git_root(&cwd)?;
-            install::install(&root, repair)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
+            install::install(backend, &root, repair)?;
         }
         Commands::Clone { url } => {
-            let root = git::find_main_git_root(&cwd)?;
-            clone::clone(&root, &url)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
+            clone::clone(backend, &root, &url)?;
         }
         Commands::Add { files } => {
-            let root = git::find_main_git_root(&cwd)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
             let ctx = CheckoutContext::main_only(&root);
             for file in &files {
-                let resolved = resolve_file_path(&cwd, &root, file)?;
-                overlay::add_file(&ctx, &resolved)?;
+                let resolved = resolve_file_path(backend, &cwd, &root, file)?;
+                overlay::add_file(backend, &ctx, &resolved)?;
                 eprintln!("[subcontext] Added: {resolved}");
             }
         }
         Commands::Save { message } => {
-            let root = git::find_main_git_root(&cwd)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
             let ctx = CheckoutContext::main_only(&root);
             let msg = message.as_deref().unwrap_or("manual save");
-            overlay::save_overlay(&ctx, msg)?;
+            overlay::save_overlay(backend, &ctx, msg)?;
             eprintln!("[subcontext] Saved overlay changes.");
         }
         Commands::Remove { files } => {
-            let root = git::find_main_git_root(&cwd)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
             let ctx = CheckoutContext::main_only(&root);
             for file in &files {
-                let resolved = resolve_file_path(&cwd, &root, file)?;
-                overlay::remove_file(&ctx, &resolved)?;
+                let resolved = resolve_file_path(backend, &cwd, &root, file)?;
+                overlay::remove_file(backend, &ctx, &resolved)?;
                 eprintln!("[subcontext] Removed: {resolved}");
             }
         }
@@ -161,29 +164,29 @@ fn main() -> Result<()> {
             startup::startup()?;
         }
         Commands::Uninstall => {
-            let root = git::find_main_git_root(&cwd)?;
-            uninstall::uninstall(&root)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
+            uninstall::uninstall(backend, &root)?;
         }
         Commands::Status => {
-            status::status(&cwd)?;
+            status::status(backend, &cwd)?;
         }
         Commands::Submodule { command } => {
-            let root = git::find_main_git_root(&cwd)?;
+            let root = git::find_main_git_root(backend, &cwd)?;
             let ctx = CheckoutContext::main_only(&root);
             match command {
                 SubmoduleCommand::Add { url, path } => {
                     let resolved = path
                         .as_ref()
-                        .map(|p| resolve_new_path(&cwd, &root, p))
+                        .map(|p| resolve_new_path(backend, &cwd, &root, p))
                         .transpose()?;
-                    submodule::add(&ctx, &url, resolved.as_deref())?;
+                    submodule::add(backend, &ctx, &url, resolved.as_deref())?;
                 }
                 SubmoduleCommand::Update => {
-                    submodule::update(&ctx)?;
+                    submodule::update(backend, &ctx)?;
                 }
                 SubmoduleCommand::Remove { path } => {
-                    let resolved = resolve_new_path(&cwd, &root, &path)?;
-                    submodule::remove(&ctx, &resolved)?;
+                    let resolved = resolve_new_path(backend, &cwd, &root, &path)?;
+                    submodule::remove(backend, &ctx, &resolved)?;
                 }
             }
         }
@@ -195,26 +198,26 @@ fn main() -> Result<()> {
                     flag,
                 },
         } => {
-            let ctx = match git::find_checkout_context(&cwd) {
+            let ctx = match git::find_checkout_context(backend, &cwd) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     eprintln!("[subcontext] warning: {e:#}");
                     return Ok(());
                 }
             };
-            hook::post_checkout(&ctx, &prev_head, &new_head, &flag)?;
+            hook::post_checkout(backend, &ctx, &prev_head, &new_head, &flag)?;
         }
         Commands::Hook {
             hook: HookCommand::PostCommit,
         } => {
-            let ctx = match git::find_checkout_context(&cwd) {
+            let ctx = match git::find_checkout_context(backend, &cwd) {
                 Ok(ctx) => ctx,
                 Err(e) => {
                     eprintln!("[subcontext] warning: {e:#}");
                     return Ok(());
                 }
             };
-            hook::post_commit(&ctx)?;
+            hook::post_commit(backend, &ctx)?;
         }
     }
 
@@ -222,22 +225,20 @@ fn main() -> Result<()> {
 }
 
 /// Resolve a path that may not exist yet (e.g., submodule destination) to be relative to root.
-fn resolve_new_path(cwd: &Path, root: &Path, path: &str) -> Result<String> {
-    let root_canonical = root.canonicalize().unwrap_or(root.to_path_buf());
+fn resolve_new_path(backend: &dyn Backend, cwd: &Path, root: &Path, path: &str) -> Result<String> {
+    let root_canonical = backend.canonicalize(root).unwrap_or(root.to_path_buf());
 
     let abs = if Path::new(path).is_absolute() {
         Path::new(path).to_path_buf()
     } else {
-        let cwd_canonical = cwd.canonicalize().unwrap_or(cwd.to_path_buf());
+        let cwd_canonical = backend.canonicalize(cwd).unwrap_or(cwd.to_path_buf());
         cwd_canonical.join(path)
     };
 
     // Try canonicalize (resolves ..), fall back to manual normalization
-    let abs = if let Ok(canonical) = abs.canonicalize() {
-        canonical
-    } else {
-        normalize_path(&abs)
-    };
+    let abs = backend
+        .canonicalize(&abs)
+        .unwrap_or_else(|_| normalize_path(&abs));
 
     match abs.strip_prefix(&root_canonical) {
         Ok(rel) => Ok(rel.to_string_lossy().to_string()),
@@ -262,15 +263,15 @@ fn normalize_path(path: &Path) -> std::path::PathBuf {
 
 /// Resolve a user-provided file path to be relative to the repo root.
 /// Handles both absolute paths and paths relative to the current directory.
-fn resolve_file_path(cwd: &Path, root: &Path, file: &str) -> Result<String> {
+fn resolve_file_path(backend: &dyn Backend, cwd: &Path, root: &Path, file: &str) -> Result<String> {
     let abs = if Path::new(file).is_absolute() {
         Path::new(file).to_path_buf()
     } else {
         cwd.join(file)
     };
 
-    let abs = abs.canonicalize().unwrap_or(abs);
-    let root_canonical = root.canonicalize().unwrap_or(root.to_path_buf());
+    let abs = backend.canonicalize(&abs).unwrap_or(abs);
+    let root_canonical = backend.canonicalize(root).unwrap_or(root.to_path_buf());
 
     match abs.strip_prefix(&root_canonical) {
         Ok(rel) => Ok(rel.to_string_lossy().to_string()),

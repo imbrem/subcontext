@@ -17,7 +17,8 @@ cargo run -- <command>       # run subcontext commands (install, clone, add, sav
 
 No linter or formatter is configured — use `cargo clippy` and `cargo fmt` as needed.
 
-**Always run `cargo fmt` before committing or pushing.**
+**⚠️ CRITICAL: Always run `cargo fmt` before committing or pushing. CI fails on unformatted code.**
+Run `cargo fmt && cargo test` as the final check before every commit.
 
 ## Architecture
 
