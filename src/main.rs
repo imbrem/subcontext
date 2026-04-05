@@ -102,6 +102,11 @@ enum Commands {
         /// current repo's subcontext. Implied when run outside a git repo.
         #[arg(long, global = true)]
         global: bool,
+        /// Only act on the local (per-repo) subcontext — skip creating a
+        /// shadow task in the global subcontext. No effect outside a git
+        /// repo or when `--global` is passed.
+        #[arg(long, global = true, conflicts_with = "global")]
+        local: bool,
         #[command(subcommand)]
         command: TaskCommand,
     },
@@ -246,23 +251,66 @@ fn main() -> Result<()> {
         }
         Commands::Task {
             global: global_flag,
+            local: local_flag,
             command,
         } => {
             // Use the global scope when --global is passed OR when we're
             // outside a git repo. Otherwise fall back to the local scope.
-            let use_global = global_flag || git::find_main_git_root(backend, &cwd).is_err();
-            let scope = if use_global {
-                global::global_task_scope(backend)?
-            } else {
-                let root = git::find_main_git_root(backend, &cwd)?;
-                task::TaskScope::for_local(backend, &root)?
-            };
-            match command {
-                TaskCommand::Add { name, kind, status } => {
-                    task::add_task(backend, &scope, &name, kind.as_deref(), status.as_deref())?;
+            let local_root = git::find_main_git_root(backend, &cwd).ok();
+            let use_global = global_flag || local_root.is_none();
+            if use_global {
+                let scope = global::global_task_scope(backend)?;
+                match command {
+                    TaskCommand::Add { name, kind, status } => {
+                        task::add_task(
+                            backend,
+                            &scope,
+                            &name,
+                            kind.as_deref(),
+                            status.as_deref(),
+                            None,
+                        )?;
+                    }
+                    TaskCommand::Done { name, time } => {
+                        task::done_task(backend, &scope, &name, time.as_deref())?;
+                    }
                 }
-                TaskCommand::Done { name, time } => {
-                    task::done_task(backend, &scope, &name, time.as_deref())?;
+            } else {
+                let root = local_root.unwrap();
+                let scope = task::TaskScope::for_local(backend, &root)?;
+                match command {
+                    TaskCommand::Add { name, kind, status } => {
+                        let local_uuid = task::add_task(
+                            backend,
+                            &scope,
+                            &name,
+                            kind.as_deref(),
+                            status.as_deref(),
+                            None,
+                        )?;
+                        // Also add a shadow task to the global subcontext,
+                        // unless the user asked to stay local or no global
+                        // subcontext exists.
+                        if !local_flag && global::global_exists(backend)? {
+                            let global_scope = global::global_task_scope(backend)?;
+                            task::add_task(
+                                backend,
+                                &global_scope,
+                                &name,
+                                kind.as_deref(),
+                                status.as_deref(),
+                                Some((&local_uuid, &scope.project_uuid)),
+                            )?;
+                            global::record_child_checkout_path(
+                                backend,
+                                &scope.project_uuid,
+                                &root.join(".git"),
+                            )?;
+                        }
+                    }
+                    TaskCommand::Done { name, time } => {
+                        task::done_task(backend, &scope, &name, time.as_deref())?;
+                    }
                 }
             }
         }

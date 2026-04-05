@@ -1802,6 +1802,229 @@ fn task_done_unknown_task_fails() {
 }
 
 #[test]
+fn task_add_creates_shadow_task_in_global() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    // Install global, then install locally in a fresh repo.
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out.status.success());
+    let root = make_test_repo();
+    let out = subcontext_with_global(&root, &global_path, &["install"]);
+    assert!(out.status.success());
+
+    // Read the project UUID for the local install.
+    let yaml = fs::read_to_string(root.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    let project_uuid = yaml
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("project_uuid:")
+                .map(|s| s.trim().to_string())
+        })
+        .expect("project_uuid missing");
+
+    // Add a task locally — a shadow should be created in global.
+    let out = subcontext_with_global(&root, &global_path, &["task", "add", "plan-feature"]);
+    assert!(
+        out.status.success(),
+        "task add failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("shadow task"),
+        "expected shadow task message, got: {stderr}"
+    );
+
+    // Verify the shadow row in the global tasks.db.
+    let global_state_db = global_path.join("global/state/tasks.db");
+    let conn = rusqlite::Connection::open(&global_state_db).unwrap();
+    let (source_uuid, source_context): (String, String) = conn
+        .query_row(
+            "SELECT source_uuid, source_context FROM tasks WHERE task_name = 'plan-feature' \
+             AND source_uuid IS NOT NULL",
+            [],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .expect("shadow task row missing");
+    assert_eq!(source_context, project_uuid);
+    assert!(!source_uuid.is_empty());
+
+    // The shadow lives under the origin project UUID as its task_names
+    // namespace, so the name doesn't collide with global-only tasks.
+    let branch_name: String = conn
+        .query_row(
+            "SELECT branch_name FROM task_names WHERE task_name = 'plan-feature'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(branch_name, project_uuid);
+    drop(conn);
+
+    // child.json now has the checkout_path pointing to the child's .git.
+    let global_repo = global_path.join("global/repo");
+    let json = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "show",
+            &format!("children/{project_uuid}:child.json"),
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    assert!(json.status.success());
+    let text = String::from_utf8_lossy(&json.stdout);
+    let expected = root.join(".git").to_string_lossy().to_string();
+    assert!(
+        text.contains(&expected) && text.contains("checkout_path"),
+        "expected checkout_path {expected} in child.json: {text}"
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_local_skips_shadow() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out.status.success());
+    let root = make_test_repo();
+    let out = subcontext_with_global(&root, &global_path, &["install"]);
+    assert!(out.status.success());
+
+    // --local skips the shadow task.
+    let out = subcontext_with_global(
+        &root,
+        &global_path,
+        &["task", "--local", "add", "private-task"],
+    );
+    assert!(out.status.success());
+
+    let global_state_db = global_path.join("global/state/tasks.db");
+    let conn = rusqlite::Connection::open(&global_state_db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_name = 'private-task'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(count, 0, "--local should not create shadow task");
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_shadow_promotes_checkout_path_to_list() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    let out = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
+    assert!(out.status.success());
+
+    // Two local clones of the same project (forced by copying the config
+    // branch UUID). Simulate by creating two repos, installing, and
+    // overwriting the second's project_uuid with the first's.
+    let root_a = make_test_repo();
+    let out = subcontext_with_global(&root_a, &global_path, &["install"]);
+    assert!(out.status.success());
+    let yaml_a =
+        fs::read_to_string(root_a.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    let project_uuid = yaml_a
+        .lines()
+        .find_map(|l| {
+            l.strip_prefix("project_uuid:")
+                .map(|s| s.trim().to_string())
+        })
+        .unwrap();
+
+    // Add first task → checkout_path becomes a string.
+    let out = subcontext_with_global(&root_a, &global_path, &["task", "add", "t1"]);
+    assert!(out.status.success());
+
+    let root_b = make_test_repo();
+    let out = subcontext_with_global(&root_b, &global_path, &["install"]);
+    assert!(out.status.success());
+    // Force repo B to share the same project_uuid (simulating a clone).
+    let yaml_b =
+        fs::read_to_string(root_b.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    let new_yaml = yaml_b
+        .lines()
+        .map(|l| {
+            if l.starts_with("project_uuid:") {
+                format!("project_uuid: {project_uuid}")
+            } else {
+                l.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+        + "\n";
+    fs::write(
+        root_b.join(".git/.subcontext/config/subcontext.yaml"),
+        new_yaml,
+    )
+    .unwrap();
+
+    // Add another task from repo B → should promote checkout_path to a list.
+    let out = subcontext_with_global(&root_b, &global_path, &["task", "add", "t2"]);
+    assert!(
+        out.status.success(),
+        "task add from second checkout failed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let global_repo = global_path.join("global/repo");
+    let json = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "show",
+            &format!("children/{project_uuid}:child.json"),
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    let text = String::from_utf8_lossy(&json.stdout);
+    let path_a = root_a.join(".git").to_string_lossy().to_string();
+    let path_b = root_b.join(".git").to_string_lossy().to_string();
+    assert!(
+        text.contains(&path_a) && text.contains(&path_b),
+        "both paths should appear in child.json: {text}"
+    );
+    assert!(
+        text.contains("checkout_path") && text.contains('['),
+        "checkout_path should now be an array: {text}"
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root_a);
+    cleanup(&root_b);
+}
+
+#[test]
 fn uninstall_removes_state_worktree() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
