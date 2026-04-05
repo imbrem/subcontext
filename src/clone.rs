@@ -3,8 +3,8 @@ use std::path::Path;
 
 use crate::backend::Backend;
 use crate::git::{
-    CheckoutContext, current_branch, repo_dir, run_git, run_subcontext_git, sanitize_branch_name,
-    state_dir, subcontext_dir, work_dir,
+    CheckoutContext, current_branch, repo_dir, run_subcontext_git, sanitize_branch_name, state_dir,
+    subcontext_dir, work_dir,
 };
 use crate::install::install_from_hooks;
 use crate::overlay;
@@ -24,12 +24,9 @@ pub fn clone(backend: &dyn Backend, root: &Path, url: &str) -> Result<()> {
 
     // Clone as bare repo
     eprintln!("[subcontext] Cloning context repo from {url}...");
-    run_git(
-        backend,
-        &["clone", "--bare", url, &repo.to_string_lossy()],
-        root,
-    )
-    .context("failed to clone context repo")?;
+    backend
+        .clone_bare(root, url, &repo)
+        .context("failed to clone context repo")?;
 
     // Set up config worktree
     let cfg = sc_dir.join("config");
