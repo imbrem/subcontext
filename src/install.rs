@@ -6,6 +6,7 @@ use crate::git::{
     CheckoutContext, config_dir, current_branch, repo_dir, run_git, run_subcontext_git,
     sanitize_branch_name, subcontext_dir, work_dir,
 };
+use crate::mcp_config::merge_mcp_config;
 use crate::overlay;
 use crate::settings::merge_claude_settings;
 
@@ -60,6 +61,9 @@ pub fn install_from_hooks(root: &Path, repair: bool) -> Result<()> {
 
     // Merge Claude settings
     merge_claude_settings(root)?;
+
+    // Register MCP server in .mcp.json
+    merge_mcp_config(root)?;
 
     // Commit config branch
     commit_config_branch(root)?;

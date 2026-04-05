@@ -139,6 +139,12 @@ fn install_creates_expected_structure() {
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(settings.contains("git subcontext startup"));
 
+    // MCP server registered in .mcp.json
+    let mcp = fs::read_to_string(root.join(".mcp.json")).unwrap();
+    assert!(mcp.contains("subcontext"));
+    assert!(mcp.contains("mcpServers"));
+    assert!(mcp.contains("mcp"));
+
     // Hook dispatchers installed
     let pc_hook = fs::read_to_string(root.join(".git/hooks/post-checkout")).unwrap();
     assert!(pc_hook.contains("git subcontext _hook post-checkout"));
@@ -302,9 +308,12 @@ fn new_branch_from_empty_overlay_starts_empty() {
         "new branch from empty overlay should be empty"
     );
 
-    // No overlay files should be in root (ignore .claude/ which is created by install)
+    // No overlay files should be in root (ignore .claude/ and .mcp.json created by install)
     let status = git(&root, &["status", "--porcelain"]);
-    let non_claude: Vec<&str> = status.lines().filter(|l| !l.contains(".claude/")).collect();
+    let non_claude: Vec<&str> = status
+        .lines()
+        .filter(|l| !l.contains(".claude/") && !l.contains(".mcp.json"))
+        .collect();
     assert!(
         non_claude.is_empty(),
         "should have no untracked overlay files, got: {status}"
@@ -519,6 +528,77 @@ fn uninstall_cleans_up() {
     // Settings should no longer contain subcontext
     let settings = fs::read_to_string(root.join(".claude/settings.local.json")).unwrap();
     assert!(!settings.contains("git subcontext startup"));
+
+    // .mcp.json should be removed (was only subcontext)
+    assert!(!root.join(".mcp.json").exists());
+
+    cleanup(&root);
+}
+
+#[test]
+fn uninstall_preserves_other_mcp_servers() {
+    let root = make_test_repo();
+    fs::write(
+        root.join(".mcp.json"),
+        r#"{"mcpServers":{"other":{"command":"echo","args":["hi"]}}}"#,
+    )
+    .unwrap();
+
+    subcontext_ok(&root, &["install"]);
+
+    let after_install = fs::read_to_string(root.join(".mcp.json")).unwrap();
+    assert!(after_install.contains("subcontext"));
+    assert!(after_install.contains("other"));
+
+    subcontext_ok(&root, &["uninstall"]);
+
+    let after_uninstall = fs::read_to_string(root.join(".mcp.json")).unwrap();
+    assert!(!after_uninstall.contains("subcontext"));
+    assert!(after_uninstall.contains("other"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn mcp_status_tool_returns_text() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Send init + tools/list + tools/call over stdin
+    use std::io::Write;
+    use std::process::Stdio;
+    let bin = test_bin_dir().join("subcontext");
+    let mut child = Command::new(bin)
+        .arg("mcp")
+        .envs(test_env())
+        .current_dir(&root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+
+    let stdin = child.stdin.as_mut().unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":1,"method":"initialize","params":{{}}}}"#).unwrap();
+    writeln!(stdin, r#"{{"jsonrpc":"2.0","id":2,"method":"tools/list","params":{{}}}}"#).unwrap();
+    writeln!(
+        stdin,
+        r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"subcontext_status","arguments":{{}}}}}}"#
+    )
+    .unwrap();
+    drop(child.stdin.take());
+
+    let out = child.wait_with_output().unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Three responses, one per line
+    let lines: Vec<&str> = stdout.lines().collect();
+    assert_eq!(lines.len(), 3, "expected 3 responses, got: {stdout}");
+    assert!(lines[0].contains("protocolVersion"));
+    assert!(lines[1].contains("subcontext_status"));
+    assert!(lines[2].contains("Main repo:"));
+    assert!(lines[2].contains("installed"));
 
     cleanup(&root);
 }

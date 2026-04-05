@@ -2,6 +2,8 @@ mod clone;
 mod git;
 mod hook;
 mod install;
+mod mcp;
+mod mcp_config;
 mod overlay;
 mod settings;
 mod startup;
@@ -74,6 +76,9 @@ enum Commands {
     /// Show current repo, worktree, and subcontext status
     Status,
 
+    /// Run the subcontext MCP server over stdio
+    Mcp,
+
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
     Hook {
@@ -141,6 +146,9 @@ fn main() -> Result<()> {
         }
         Commands::Status => {
             status::status(&cwd)?;
+        }
+        Commands::Mcp => {
+            mcp::run()?;
         }
         Commands::Hook {
             hook:

@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::fmt::Write;
 use std::path::{Path, PathBuf};
 
 use crate::git;
@@ -42,42 +43,39 @@ fn find_git_roots(start: &Path) -> Result<(PathBuf, PathBuf)> {
 }
 
 pub fn status(cwd: &Path) -> Result<()> {
+    let text = status_text(cwd)?;
+    print!("{text}");
+    Ok(())
+}
+
+/// Build the status report as a string. Used by both the CLI and the MCP server.
+pub fn status_text(cwd: &Path) -> Result<String> {
     let (current_root, main_root) = find_git_roots(cwd)?;
     let is_worktree = current_root != main_root;
 
+    let mut out = String::new();
+
     if is_worktree {
-        println!("Worktree:    {}", current_root.display());
-        println!("Main repo:   {}", main_root.display());
+        writeln!(out, "Worktree:    {}", current_root.display())?;
+        writeln!(out, "Main repo:   {}", main_root.display())?;
     } else {
-        println!("Main repo:   {}", current_root.display());
-        println!("Worktree:    no (this is the main checkout)");
+        writeln!(out, "Main repo:   {}", current_root.display())?;
+        writeln!(out, "Worktree:    no (this is the main checkout)")?;
     }
 
     match git::current_branch(&current_root) {
-        Ok(branch) => println!("Branch:      {}", branch),
-        Err(_) => println!("Branch:      (detached HEAD)"),
+        Ok(branch) => writeln!(out, "Branch:      {}", branch)?,
+        Err(_) => writeln!(out, "Branch:      (detached HEAD)")?,
     }
 
     let sc_dir = main_root.join(".git").join(".subcontext");
-    if is_worktree {
-        println!(
-            "Subcontext:  {}",
-            if sc_dir.is_dir() {
-                "installed (in main repo)"
-            } else {
-                "not installed"
-            }
-        );
-    } else {
-        println!(
-            "Subcontext:  {}",
-            if sc_dir.is_dir() {
-                "installed"
-            } else {
-                "not installed"
-            }
-        );
-    }
+    let state = match (is_worktree, sc_dir.is_dir()) {
+        (true, true) => "installed (in main repo)",
+        (true, false) => "not installed",
+        (false, true) => "installed",
+        (false, false) => "not installed",
+    };
+    writeln!(out, "Subcontext:  {}", state)?;
 
-    Ok(())
+    Ok(out)
 }
