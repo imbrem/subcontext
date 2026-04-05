@@ -803,21 +803,21 @@ fn local_install_registers_child_in_global() {
         })
         .expect("project_uuid missing");
 
-    // Verify the global bare repo now has a children/<uuid> branch.
+    // Verify the global bare repo now has an object/<uuid> branch.
     let global_repo = global_path.join("global/repo");
     let out = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show-ref",
             "--verify",
-            &format!("refs/heads/children/{project_uuid}"),
+            &format!("refs/heads/object/{project_uuid}"),
         ])
         .envs(test_env())
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "children branch missing: stderr={}",
+        "object branch missing: stderr={}",
         String::from_utf8_lossy(&out.stderr)
     );
 
@@ -826,7 +826,7 @@ fn local_install_registers_child_in_global() {
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
-            &format!("children/{project_uuid}:child.json"),
+            &format!("object/{project_uuid}:child.json"),
         ])
         .envs(test_env())
         .output()
@@ -835,6 +835,23 @@ fn local_install_registers_child_in_global() {
     let text = String::from_utf8_lossy(&json.stdout);
     assert!(text.contains(&project_uuid));
     assert!(text.contains("\"kind\": \"project\""), "json: {text}");
+
+    // object.json should also exist with type "child".
+    let obj_json = Command::new("git")
+        .args([
+            &format!("--git-dir={}", global_repo.display()),
+            "show",
+            &format!("object/{project_uuid}:object.json"),
+        ])
+        .envs(test_env())
+        .output()
+        .unwrap();
+    assert!(obj_json.status.success());
+    let obj_text = String::from_utf8_lossy(&obj_json.stdout);
+    assert!(
+        obj_text.contains("\"type\": \"child\""),
+        "object.json: {obj_text}"
+    );
 
     cleanup(&fake_home);
     cleanup(&global_path);
@@ -863,14 +880,14 @@ fn task_add_global_uses_global_subcontext() {
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // A tasks/<uuid> branch should exist in the global bare repo.
+    // An object/<uuid> branch should exist in the global bare repo.
     let global_repo = global_path.join("global/repo");
     let branches = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "branch",
             "--list",
-            "tasks/*",
+            "object/*",
         ])
         .envs(test_env())
         .output()
@@ -878,8 +895,8 @@ fn task_add_global_uses_global_subcontext() {
     assert!(branches.status.success());
     let text = String::from_utf8_lossy(&branches.stdout);
     assert!(
-        text.contains("tasks/"),
-        "expected tasks/* branch, got: {text}"
+        text.contains("object/"),
+        "expected object/* branch, got: {text}"
     );
 
     // --global flag works from inside a git repo too.
@@ -1674,11 +1691,11 @@ fn task_add_creates_task_branch_and_updates_db() {
 
     subcontext_ok(&root, &["task", "add", "write-docs", "--kind", "todo"]);
 
-    // A tasks/<uuid> branch was created
-    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    // An object/<uuid> branch was created
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
     assert!(
-        branches.contains("tasks/"),
-        "expected a tasks/<uuid> branch, got: {branches}"
+        branches.contains("object/"),
+        "expected an object/<uuid> branch, got: {branches}"
     );
 
     // Extract the UUID from the branch name
@@ -1688,16 +1705,23 @@ fn task_add_creates_task_branch_and_updates_db() {
         .unwrap()
         .trim()
         .trim_start_matches("* ")
-        .trim_start_matches("tasks/")
+        .trim_start_matches("object/")
         .to_string();
 
     // TASK.md on the task branch has expected YAML
-    let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
     assert!(task_md.contains("name: write-docs"));
     assert!(task_md.contains(&format!("uuid: {uuid}")));
     assert!(task_md.contains("kind: todo"));
     assert!(task_md.contains("status: created"));
     assert!(task_md.contains("project_uuid:"));
+
+    // object.json should exist with type "task"
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(
+        obj_json.contains("\"type\": \"task\""),
+        "object.json: {obj_json}"
+    );
 
     // State branch has a commit for the task add
     let log = git_in_repo(&root, &["log", "--oneline", "state"]);
@@ -1717,17 +1741,17 @@ fn task_done_marks_task_and_adds_completed_at() {
         &["task", "done", "ship-it", "--time", "2026-01-02T03:04:05Z"],
     );
 
-    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
     let uuid = branches
         .lines()
         .next()
         .unwrap()
         .trim()
         .trim_start_matches("* ")
-        .trim_start_matches("tasks/")
+        .trim_start_matches("object/")
         .to_string();
 
-    let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
     assert!(task_md.contains("status: done"));
     assert!(task_md.contains("completed_at: 2026-01-02T03:04:05Z"));
 
@@ -1757,13 +1781,13 @@ fn task_done_accepts_now_and_rejects_local_time() {
     assert!(stderr.contains("ending with 'Z'"), "stderr: {stderr}");
 
     // Find the task branch for "a" and confirm completed_at ends with Z
-    let branches = git_in_repo(&root, &["branch", "--list", "tasks/*"]);
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
     for line in branches.lines() {
         let uuid = line
             .trim()
             .trim_start_matches("* ")
-            .trim_start_matches("tasks/");
-        let task_md = git_in_repo(&root, &["show", &format!("tasks/{uuid}:TASK.md")]);
+            .trim_start_matches("object/");
+        let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
         if task_md.contains("name: a\n") {
             assert!(task_md.contains("status: done"));
             // completed_at line ends with Z
@@ -1841,30 +1865,32 @@ fn task_add_creates_shadow_task_in_global() {
         "expected shadow task message, got: {stderr}"
     );
 
-    // Verify the shadow row in the global tasks.db.
+    // Verify the shadow row in the global tasks.db via the objects table.
     let global_state_db = global_path.join("global/state/tasks.db");
     let conn = rusqlite::Connection::open(&global_state_db).unwrap();
-    let (source_uuid, source_context): (String, String) = conn
-        .query_row(
-            "SELECT source_uuid, source_context FROM tasks WHERE task_name = 'plan-feature' \
-             AND source_uuid IS NOT NULL",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .expect("shadow task row missing");
-    assert_eq!(source_context, project_uuid);
-    assert!(!source_uuid.is_empty());
 
     // The shadow lives under the origin project UUID as its task_names
     // namespace, so the name doesn't collide with global-only tasks.
-    let branch_name: String = conn
+    let (branch_name, task_uuid): (String, String) = conn
         .query_row(
-            "SELECT branch_name FROM task_names WHERE task_name = 'plan-feature'",
+            "SELECT branch_name, task_uuid FROM task_names WHERE task_name = 'plan-feature'",
             [],
-            |r| r.get(0),
+            |r| Ok((r.get(0)?, r.get(1)?)),
         )
         .unwrap();
     assert_eq!(branch_name, project_uuid);
+
+    // Check the objects table has source info for the shadow task.
+    let (obj_type, source_context_uuid, source_object_uuid): (String, String, String) = conn
+        .query_row(
+            "SELECT type, source_context_uuid, source_object_uuid FROM objects WHERE uuid = ?1",
+            [&task_uuid],
+            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+        )
+        .expect("shadow task object row missing");
+    assert_eq!(obj_type, "task");
+    assert_eq!(source_context_uuid, project_uuid);
+    assert!(!source_object_uuid.is_empty());
     drop(conn);
 
     // child.json now has the checkout_path pointing to the child's .git.
@@ -1873,7 +1899,7 @@ fn task_add_creates_shadow_task_in_global() {
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
-            &format!("children/{project_uuid}:child.json"),
+            &format!("object/{project_uuid}:child.json"),
         ])
         .envs(test_env())
         .output()
@@ -2001,7 +2027,7 @@ fn task_add_shadow_promotes_checkout_path_to_list() {
         .args([
             &format!("--git-dir={}", global_repo.display()),
             "show",
-            &format!("children/{project_uuid}:child.json"),
+            &format!("object/{project_uuid}:child.json"),
         ])
         .envs(test_env())
         .output()

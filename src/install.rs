@@ -71,9 +71,21 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
     commit_config_branch(backend, root)?;
 
     // If a global subcontext exists on this machine, register this project
-    // as a child of it (creates a children/<uuid> branch in the global bare
-    // repo with a small JSON metadata blob).
-    global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)?;
+    // as a child of it (creates an object/<uuid> branch in the global bare
+    // repo with child.json + object.json).
+    if let Some(commit) = global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)? {
+        // Record the child in the global objects table.
+        if let Ok(global_scope) = global::global_task_scope(backend) {
+            let conn = task::open_db(&global_scope)?;
+            task::insert_object(&conn, &project_uuid, "child", &commit, None)?;
+            drop(conn);
+            task::commit_state_in(
+                backend,
+                &global_scope.state_dir,
+                &format!("object add: {project_uuid}"),
+            )?;
+        }
+    }
 
     Ok(())
 }

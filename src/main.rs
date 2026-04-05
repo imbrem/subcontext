@@ -269,7 +269,8 @@ fn main() -> Result<()> {
                             kind.as_deref(),
                             status.as_deref(),
                             None,
-                        )?;
+                        )
+                        .map(|_| ())?;
                     }
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
@@ -280,7 +281,7 @@ fn main() -> Result<()> {
                 let scope = task::TaskScope::for_local(backend, &root)?;
                 match command {
                     TaskCommand::Add { name, kind, status } => {
-                        let local_uuid = task::add_task(
+                        let (local_uuid, local_commit) = task::add_task(
                             backend,
                             &scope,
                             &name,
@@ -299,13 +300,25 @@ fn main() -> Result<()> {
                                 &name,
                                 kind.as_deref(),
                                 status.as_deref(),
-                                Some((&local_uuid, &scope.project_uuid)),
+                                Some((&scope.project_uuid, &local_uuid, &local_commit)),
                             )?;
-                            global::record_child_checkout_path(
+                            if let Some(commit) = global::record_child_checkout_path(
                                 backend,
                                 &scope.project_uuid,
                                 &root.join(".git"),
-                            )?;
+                            )? {
+                                let conn = task::open_db(&global_scope)?;
+                                conn.execute(
+                                    "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+                                    rusqlite::params![commit, scope.project_uuid],
+                                )?;
+                                drop(conn);
+                                task::commit_state_in(
+                                    backend,
+                                    &global_scope.state_dir,
+                                    &format!("object update: {}", scope.project_uuid),
+                                )?;
+                            }
                         }
                     }
                     TaskCommand::Done { name, time } => {
