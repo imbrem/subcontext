@@ -6,10 +6,12 @@ mod install;
 mod mcp;
 mod mcp_config;
 mod overlay;
+mod project;
 mod settings;
 mod startup;
 mod status;
 mod submodule;
+mod task;
 mod uninstall;
 
 use anyhow::{Result, bail};
@@ -92,6 +94,12 @@ enum Commands {
         command: SubmoduleCommand,
     },
 
+    /// Manage tasks
+    Task {
+        #[command(subcommand)]
+        command: TaskCommand,
+    },
+
     /// Run the subcontext MCP server over stdio
     Mcp,
 
@@ -100,6 +108,29 @@ enum Commands {
     Hook {
         #[command(subcommand)]
         hook: HookCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum TaskCommand {
+    /// Create a task with the given name and a fresh UUID
+    Add {
+        /// Task name
+        name: String,
+        /// Task kind (e.g. goal, todo, step, task)
+        #[arg(long)]
+        kind: Option<String>,
+        /// Task status (e.g. created, active, inactive, done)
+        #[arg(long)]
+        status: Option<String>,
+    },
+    /// Mark a task as done
+    Done {
+        /// Task name
+        name: String,
+        /// Completion timestamp (ISO8601). Defaults to now.
+        #[arg(long)]
+        time: Option<String>,
     },
 }
 
@@ -203,6 +234,17 @@ fn main() -> Result<()> {
                 SubmoduleCommand::Remove { path } => {
                     let resolved = resolve_new_path(backend, &cwd, &root, &path)?;
                     submodule::remove(backend, &ctx, &resolved)?;
+                }
+            }
+        }
+        Commands::Task { command } => {
+            let root = git::find_main_git_root(backend, &cwd)?;
+            match command {
+                TaskCommand::Add { name, kind, status } => {
+                    task::add_task(backend, &root, &name, kind.as_deref(), status.as_deref())?;
+                }
+                TaskCommand::Done { name, time } => {
+                    task::done_task(backend, &root, &name, time.as_deref())?;
                 }
             }
         }

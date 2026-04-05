@@ -38,11 +38,15 @@ pub fn uninstall(backend: &dyn Backend, root: &Path) -> Result<()> {
     // First remove worktrees, then the directory
     let work = sc_dir.join("work");
     let config = sc_dir.join("config");
+    let state = sc_dir.join("state");
     if backend.exists(&work) {
         backend.remove_dir_all(&work).ok();
     }
     if backend.exists(&config) {
         backend.remove_dir_all(&config).ok();
+    }
+    if backend.exists(&state) {
+        backend.remove_dir_all(&state).ok();
     }
     backend.remove_dir_all(&sc_dir).ok();
 

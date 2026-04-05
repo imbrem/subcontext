@@ -7,7 +7,9 @@ use crate::git::{
     sanitize_branch_name, subcontext_dir, work_dir,
 };
 use crate::overlay;
+use crate::project::ensure_project_config;
 use crate::settings::merge_claude_settings;
+use crate::task;
 
 /// Run `subcontext install` from the given repo root.
 pub fn install(backend: &dyn Backend, root: &Path, repair: bool) -> Result<()> {
@@ -60,6 +62,9 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
 
     // Merge Claude settings
     merge_claude_settings(backend, root)?;
+
+    // Ensure project config (UUID, kind, version) is present on config branch
+    ensure_project_config(backend, root)?;
 
     // Commit config branch
     commit_config_branch(backend, root)?;
@@ -123,6 +128,9 @@ fn init_context_repo(backend: &dyn Backend, root: &Path, host_branch: &str) -> R
         &["worktree", "add", &work.to_string_lossy(), &overlay_branch],
         root,
     )?;
+
+    // 6. Initialize state branch (tasks.db)
+    task::init_state_branch(backend, root)?;
 
     Ok(())
 }

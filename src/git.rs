@@ -74,6 +74,11 @@ pub fn repo_dir(root: &Path) -> PathBuf {
     subcontext_dir(root).join("repo")
 }
 
+/// .git/.subcontext/state
+pub fn state_dir(root: &Path) -> PathBuf {
+    subcontext_dir(root).join("state")
+}
+
 // ─── Checkout context ────────────────────────────────────────────────
 
 /// Identifies a checkout location. For the main checkout, main_root == checkout_root.
