@@ -747,20 +747,20 @@ fn install_global_creates_subcontext_directory_with_user_kind() {
 
     // Nested dir structure mirrors .git/.subcontext
     assert!(
-        global_path.join("subcontext/repo/HEAD").exists(),
+        global_path.join("global/repo/HEAD").exists(),
         "bare repo should be present"
     );
-    assert!(global_path.join("subcontext/config").is_dir());
-    assert!(global_path.join("subcontext/work").is_dir());
-    assert!(global_path.join("subcontext/state").is_dir());
+    assert!(global_path.join("global/config").is_dir());
+    assert!(global_path.join("global/work").is_dir());
+    assert!(global_path.join("global/state").is_dir());
 
     // subcontext.yaml has kind: user
-    let yaml = fs::read_to_string(global_path.join("subcontext/config/subcontext.yaml")).unwrap();
+    let yaml = fs::read_to_string(global_path.join("global/config/subcontext.yaml")).unwrap();
     assert!(yaml.contains("kind: user"), "yaml: {yaml}");
     assert!(yaml.contains("project_uuid:"));
 
     // state/tasks.db exists
-    assert!(global_path.join("subcontext/state/tasks.db").exists());
+    assert!(global_path.join("global/state/tasks.db").exists());
 
     // Re-running is idempotent.
     let out2 = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
@@ -804,7 +804,7 @@ fn local_install_registers_child_in_global() {
         .expect("project_uuid missing");
 
     // Verify the global bare repo now has a children/<uuid> branch.
-    let global_repo = global_path.join("subcontext/repo");
+    let global_repo = global_path.join("global/repo");
     let out = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),
@@ -864,7 +864,7 @@ fn task_add_global_uses_global_subcontext() {
     );
 
     // A tasks/<uuid> branch should exist in the global bare repo.
-    let global_repo = global_path.join("subcontext/repo");
+    let global_repo = global_path.join("global/repo");
     let branches = Command::new("git")
         .args([
             &format!("--git-dir={}", global_repo.display()),

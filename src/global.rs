@@ -5,13 +5,13 @@
 //! a self-contained bare repo + worktrees with `kind: user` rather than
 //! `kind: project`.
 //!
-//! The layout mirrors `.git/.subcontext/` but is nested one level deeper so
-//! the user-level directory can also host unrelated data (other worktrees,
-//! databases, ...).
+//! The layout mirrors `.git/.subcontext/` but is nested under a `global/`
+//! directory so the user-level root can also host unrelated data (other
+//! worktrees, databases, ...).
 //!
 //! ```text
 //! ~/.subcontext/
-//! └── subcontext/         ← this nested dir is the subcontext base
+//! └── global/              ← this nested dir is the subcontext base
 //!     ├── repo/
 //!     ├── work/
 //!     ├── config/
@@ -28,7 +28,7 @@ use crate::task::{TaskScope, init_state_branch_in};
 
 pub const GLOBAL_ENV: &str = "GIT_SUBCONTEXT_PATH";
 /// Name of the nested subdirectory holding the bare repo + worktrees.
-const NESTED_DIR: &str = "subcontext";
+const NESTED_DIR: &str = "global";
 /// Default overlay branch used by the global subcontext (no host branch to
 /// mirror).
 pub const DEFAULT_OVERLAY_BRANCH: &str = "overlay/main";
@@ -95,12 +95,7 @@ pub fn install(backend: &dyn Backend) -> Result<()> {
     let state = global_state_dir()?;
 
     // 1. Init bare repo.
-    backend.create_dir_all(&repo)?;
-    // Run git init on the bare repo directory directly.
-    backend.git(&crate::backend::GitInvocation::new(
-        &["init", "--bare", &repo.to_string_lossy()],
-        &sc_dir,
-    ))?;
+    backend.init_bare(&sc_dir, &repo)?;
 
     // 2. Create config branch via plumbing.
     let empty_tree = run_git_in_bare(
@@ -123,34 +118,19 @@ pub fn install(backend: &dyn Backend) -> Result<()> {
     )?;
 
     // 3. Add config worktree.
-    run_git_in_bare(
-        backend,
-        &["worktree", "add", &cfg.to_string_lossy(), "config"],
-        &repo,
-        &repo,
-    )?;
+    backend.worktree_add(&repo, &cfg, "config")?;
 
     // 4. Write the user subcontext.yaml (kind: user).
     ensure_config_in(backend, &cfg, USER_KIND)?;
 
     // 5. Commit the config tree.
-    crate::git::run_git(backend, &["add", "-A"], &cfg)?;
-    let status = crate::git::run_git(backend, &["status", "--porcelain"], &cfg)?;
+    backend.add_all(&cfg)?;
+    let status = backend.status_porcelain(&cfg)?;
     if !status.is_empty() {
-        crate::git::run_git(
-            backend,
-            &["commit", "-m", "subcontext: init user config"],
-            &cfg,
-        )?;
+        backend.commit(&cfg, "subcontext: init user config")?;
     }
 
     // 6. Create the default overlay branch and its worktree.
-    let empty_tree = run_git_in_bare(
-        backend,
-        &["hash-object", "-t", "tree", "/dev/null"],
-        &repo,
-        &repo,
-    )?;
     let overlay_commit = run_git_in_bare(
         backend,
         &[
@@ -172,17 +152,7 @@ pub fn install(backend: &dyn Backend) -> Result<()> {
         &repo,
         &repo,
     )?;
-    run_git_in_bare(
-        backend,
-        &[
-            "worktree",
-            "add",
-            &work.to_string_lossy(),
-            DEFAULT_OVERLAY_BRANCH,
-        ],
-        &repo,
-        &repo,
-    )?;
+    backend.worktree_add(&repo, &work, DEFAULT_OVERLAY_BRANCH)?;
 
     // 7. Initialize state branch + tasks.db.
     init_state_branch_in(backend, &repo, &state)?;
