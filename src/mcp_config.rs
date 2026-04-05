@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 use serde_json::{Value, json};
-use std::fs;
 use std::path::PathBuf;
+
+use crate::backend::Backend;
 
 const SERVER_NAME: &str = "subcontext";
 
@@ -15,9 +16,8 @@ fn user_config_path() -> Result<PathBuf> {
 /// subcontext binary. We resolve an absolute path because the `git
 /// subcontext` alias is only set locally in each installed repo — a
 /// *globally*-registered MCP server needs a path that works from anywhere.
-fn server_entry() -> Result<Value> {
-    let exe =
-        std::env::current_exe().context("failed to resolve subcontext binary path")?;
+fn server_entry(backend: &dyn Backend) -> Result<Value> {
+    let exe = backend.current_exe()?;
     let exe_str = exe.to_string_lossy().to_string();
     Ok(json!({
         "type": "stdio",
@@ -40,11 +40,12 @@ fn server_entry() -> Result<Value> {
 /// moves the entry from `_disabled_mcpServers` to `mcpServers` by hand.
 ///
 /// Idempotent: if an entry under either key already exists, it is left alone.
-pub fn install_global() -> Result<()> {
+pub fn install_global(backend: &dyn Backend) -> Result<()> {
     let path = user_config_path()?;
 
-    let mut config: Value = if path.exists() {
-        let content = fs::read_to_string(&path)
+    let mut config: Value = if backend.exists(&path) {
+        let content = backend
+            .read_to_string(&path)
             .with_context(|| format!("failed to read {}", path.display()))?;
         if content.trim().is_empty() {
             json!({})
@@ -87,10 +88,11 @@ pub fn install_global() -> Result<()> {
         return Ok(());
     }
 
-    disabled.insert(SERVER_NAME.to_string(), server_entry()?);
+    disabled.insert(SERVER_NAME.to_string(), server_entry(backend)?);
 
     let formatted = serde_json::to_string_pretty(&config)?;
-    fs::write(&path, format!("{formatted}\n"))
+    backend
+        .write(&path, format!("{formatted}\n").as_bytes())
         .with_context(|| format!("failed to write {}", path.display()))?;
 
     eprintln!(

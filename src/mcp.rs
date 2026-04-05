@@ -2,6 +2,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
+use crate::backend::Backend;
 use crate::status;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
@@ -11,7 +12,7 @@ const PROTOCOL_VERSION: &str = "2024-11-05";
 /// Speaks JSON-RPC 2.0 (one message per line) and exposes a single tool,
 /// `subcontext_status`, which returns the output of `subcontext status` for
 /// the server's current working directory.
-pub fn run() -> Result<()> {
+pub fn run(backend: &dyn Backend) -> Result<()> {
     let stdin = io::stdin();
     let stdout = io::stdout();
     let mut out = stdout.lock();
@@ -31,7 +32,7 @@ pub fn run() -> Result<()> {
         let is_notification = id.is_none();
         let method = req.get("method").and_then(|m| m.as_str()).unwrap_or("");
 
-        let result = handle_method(method, &req);
+        let result = handle_method(backend, method, &req);
 
         if is_notification {
             continue;
@@ -58,7 +59,11 @@ pub fn run() -> Result<()> {
     Ok(())
 }
 
-fn handle_method(method: &str, req: &Value) -> Result<Option<Value>, String> {
+fn handle_method(
+    backend: &dyn Backend,
+    method: &str,
+    req: &Value,
+) -> Result<Option<Value>, String> {
     match method {
         "initialize" => Ok(Some(json!({
             "protocolVersion": PROTOCOL_VERSION,
@@ -87,7 +92,7 @@ fn handle_method(method: &str, req: &Value) -> Result<Option<Value>, String> {
             match name {
                 "subcontext_status" => {
                     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-                    let text = match status::status_text(&cwd) {
+                    let text = match status::status_text(backend, &cwd) {
                         Ok(s) => s,
                         Err(e) => format!("Error: {e:#}"),
                     };
