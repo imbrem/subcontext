@@ -1,6 +1,7 @@
 mod backend;
 mod clone;
 mod git;
+mod global;
 mod hook;
 mod install;
 mod mcp;
@@ -96,6 +97,10 @@ enum Commands {
 
     /// Manage tasks
     Task {
+        /// Operate on the global (user-level) subcontext instead of the
+        /// current repo's subcontext. Implied when run outside a git repo.
+        #[arg(long, global = true)]
+        global: bool,
         #[command(subcommand)]
         command: TaskCommand,
     },
@@ -172,6 +177,7 @@ fn main() -> Result<()> {
     match cli.command {
         Commands::Install { repair, global } => {
             if global {
+                global::install(backend)?;
                 mcp_config::install_global(backend)?;
             } else {
                 let root = git::find_main_git_root(backend, &cwd)?;
@@ -237,14 +243,25 @@ fn main() -> Result<()> {
                 }
             }
         }
-        Commands::Task { command } => {
-            let root = git::find_main_git_root(backend, &cwd)?;
+        Commands::Task {
+            global: global_flag,
+            command,
+        } => {
+            // Use the global scope when --global is passed OR when we're
+            // outside a git repo. Otherwise fall back to the local scope.
+            let use_global = global_flag || git::find_main_git_root(backend, &cwd).is_err();
+            let scope = if use_global {
+                global::global_task_scope(backend)?
+            } else {
+                let root = git::find_main_git_root(backend, &cwd)?;
+                task::TaskScope::for_local(backend, &root)?
+            };
             match command {
                 TaskCommand::Add { name, kind, status } => {
-                    task::add_task(backend, &root, &name, kind.as_deref(), status.as_deref())?;
+                    task::add_task(backend, &scope, &name, kind.as_deref(), status.as_deref())?;
                 }
                 TaskCommand::Done { name, time } => {
-                    task::done_task(backend, &root, &name, time.as_deref())?;
+                    task::done_task(backend, &scope, &name, time.as_deref())?;
                 }
             }
         }

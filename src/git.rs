@@ -12,10 +12,21 @@ pub fn run_git(backend: &dyn Backend, args: &[&str], cwd: &Path) -> Result<Strin
 
 /// Run a git command in the subcontext bare repo.
 pub fn run_subcontext_git(backend: &dyn Backend, args: &[&str], root: &Path) -> Result<String> {
-    let git_dir_flag = format!("--git-dir={}", repo_dir(root).display());
+    run_git_in_bare(backend, args, &repo_dir(root), root)
+}
+
+/// Run a git command against an arbitrary bare repo (by explicit git-dir).
+/// Used by both the per-repo subcontext bare repo and the global one.
+pub fn run_git_in_bare(
+    backend: &dyn Backend,
+    args: &[&str],
+    git_dir: &Path,
+    cwd: &Path,
+) -> Result<String> {
+    let git_dir_flag = format!("--git-dir={}", git_dir.display());
     let mut full_args: Vec<&str> = vec![&git_dir_flag];
     full_args.extend_from_slice(args);
-    backend.git(&GitInvocation::new(&full_args, root))
+    backend.git(&GitInvocation::new(&full_args, cwd))
 }
 
 /// Run a git command in an overlay work directory.

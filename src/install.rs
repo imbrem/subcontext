@@ -6,8 +6,9 @@ use crate::git::{
     CheckoutContext, config_dir, current_branch, repo_dir, run_git, run_subcontext_git,
     sanitize_branch_name, subcontext_dir, work_dir,
 };
+use crate::global;
 use crate::overlay;
-use crate::project::ensure_project_config;
+use crate::project::{SUBCONTEXT_KIND, ensure_project_config};
 use crate::settings::merge_claude_settings;
 use crate::task;
 
@@ -64,10 +65,15 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
     merge_claude_settings(backend, root)?;
 
     // Ensure project config (UUID, kind, version) is present on config branch
-    ensure_project_config(backend, root)?;
+    let project_uuid = ensure_project_config(backend, root)?;
 
     // Commit config branch
     commit_config_branch(backend, root)?;
+
+    // If a global subcontext exists on this machine, register this project
+    // as a child of it (creates a children/<uuid> branch in the global bare
+    // repo with a small JSON metadata blob).
+    global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)?;
 
     Ok(())
 }
