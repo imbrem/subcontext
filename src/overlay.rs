@@ -119,6 +119,7 @@ pub fn create_overlay_work_dir(
 }
 
 /// List files tracked by the overlay (work directory).
+/// Excludes submodule entries (gitlinks); use `list_overlay_submodule_paths` for those.
 pub fn list_overlay_files(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<Vec<String>> {
     let work = ctx.overlay_work_dir();
     if !backend.exists(&work) {
@@ -126,19 +127,75 @@ pub fn list_overlay_files(backend: &dyn Backend, ctx: &CheckoutContext) -> Resul
     }
 
     let output = run_work_git(backend, &["ls-files"], &work)?;
-    Ok(output
+    let all: Vec<String> = output
         .lines()
         .filter(|l| !l.is_empty())
         .map(|l| l.to_string())
+        .collect();
+
+    // Filter out submodule entries if .gitmodules exists
+    if backend.exists(&work.join(".gitmodules")) {
+        let submodules = list_overlay_submodule_paths(backend, ctx)?;
+        if !submodules.is_empty() {
+            return Ok(all
+                .into_iter()
+                .filter(|f| !submodules.contains(f))
+                .collect());
+        }
+    }
+
+    Ok(all)
+}
+
+/// List submodule paths in the overlay work directory.
+/// Detects gitlink entries (mode 160000) in the index.
+pub fn list_overlay_submodule_paths(
+    backend: &dyn Backend,
+    ctx: &CheckoutContext,
+) -> Result<Vec<String>> {
+    let work = ctx.overlay_work_dir();
+    if !backend.exists(&work) || !backend.exists(&work.join(".gitmodules")) {
+        return Ok(vec![]);
+    }
+    let output = run_work_git(backend, &["ls-files", "--stage"], &work)?;
+    Ok(output
+        .lines()
+        .filter(|l| l.starts_with("160000"))
+        .filter_map(|l| l.split('\t').nth(1).map(|s| s.to_string()))
         .collect())
+}
+
+/// Initialize submodules in the overlay work directory (non-fatal).
+pub fn init_overlay_submodules(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<()> {
+    let work = ctx.overlay_work_dir();
+    if !backend.exists(&work) || !backend.exists(&work.join(".gitmodules")) {
+        return Ok(());
+    }
+    match run_work_git(
+        backend,
+        &["submodule", "update", "--init", "--recursive"],
+        &work,
+    ) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            eprintln!("[subcontext] warning: failed to initialize submodules: {e:#}");
+            eprintln!("[subcontext] hint: run `git subcontext submodule update` to retry");
+            Ok(())
+        }
+    }
 }
 
 // ─── Apply / unapply / save ─────────────────────────────────────────
 
 /// Apply overlay: copy all files from the work dir into the checkout root.
 /// Sets skip-worktree on files tracked by both repos.
+/// Also initializes and copies submodule contents.
 pub fn apply_overlay(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<()> {
     let work = ctx.overlay_work_dir();
+
+    // Initialize submodules if any
+    init_overlay_submodules(backend, ctx)?;
+
     let files = list_overlay_files(backend, ctx)?;
 
     for file in &files {
@@ -163,11 +220,22 @@ pub fn apply_overlay(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<()>
         }
     }
 
+    // Copy submodule contents
+    let submodules = list_overlay_submodule_paths(backend, ctx)?;
+    for submodule in &submodules {
+        let src = work.join(submodule);
+        let dest = ctx.checkout_root.join(submodule);
+        if backend.is_dir(&src) {
+            copy_dir_recursive(backend, &src, &dest)?;
+        }
+    }
+
     sync_excludes(backend, ctx)?;
     Ok(())
 }
 
 /// Save overlay: copy tracked overlay files from checkout root back to work dir, then commit.
+/// Also saves submodule contents.
 pub fn save_overlay(backend: &dyn Backend, ctx: &CheckoutContext, message: &str) -> Result<()> {
     let work = ctx.overlay_work_dir();
     if !backend.exists(&work) {
@@ -188,6 +256,32 @@ pub fn save_overlay(backend: &dyn Backend, ctx: &CheckoutContext, message: &str)
         }
     }
 
+    // Copy submodule contents back and stage+commit inside each submodule.
+    // We must commit inside each submodule so the parent overlay sees an updated
+    // gitlink. Using `submodule foreach` avoids GIT_DIR inheritance issues that
+    // occur in hook context (where GIT_DIR points to the host repo).
+    let submodules = list_overlay_submodule_paths(backend, ctx)?;
+    if !submodules.is_empty() {
+        for submodule in &submodules {
+            let src = ctx.checkout_root.join(submodule);
+            let dest = work.join(submodule);
+            if backend.exists(&src) && backend.is_dir(&src) {
+                copy_dir_recursive(backend, &src, &dest)?;
+            }
+        }
+        run_work_git(
+            backend,
+            &[
+                "submodule",
+                "foreach",
+                "--quiet",
+                "git add -A && git diff --cached --quiet || git commit -m 'auto-save (submodule)'",
+            ],
+            &work,
+        )
+        .ok();
+    }
+
     // Stage and commit in work/
     run_work_git(backend, &["add", "-A"], &work)?;
     let status = run_work_git(backend, &["status", "--porcelain"], &work)?;
@@ -200,6 +294,7 @@ pub fn save_overlay(backend: &dyn Backend, ctx: &CheckoutContext, message: &str)
 }
 
 /// Unapply overlay: remove overlay-only files from checkout root, restore host-tracked files.
+/// Also removes submodule directories.
 pub fn unapply_overlay(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<()> {
     let files = list_overlay_files(backend, ctx)?;
 
@@ -225,6 +320,18 @@ pub fn unapply_overlay(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<(
             if let Some(parent) = path.parent() {
                 remove_empty_parents(backend, parent, &ctx.checkout_root);
             }
+        }
+    }
+
+    // Remove submodule directories from checkout root
+    let submodules = list_overlay_submodule_paths(backend, ctx)?;
+    for submodule in &submodules {
+        let path = ctx.checkout_root.join(submodule);
+        if backend.exists(&path) {
+            backend.remove_dir_all(&path).ok();
+        }
+        if let Some(parent) = path.parent() {
+            remove_empty_parents(backend, parent, &ctx.checkout_root);
         }
     }
 
@@ -358,6 +465,12 @@ pub fn sync_excludes(backend: &dyn Backend, ctx: &CheckoutContext) -> Result<()>
         }
     }
 
+    // Also exclude submodule directories
+    let submodules = list_overlay_submodule_paths(backend, ctx)?;
+    for submodule in &submodules {
+        exclude_files.push(submodule.clone());
+    }
+
     // Build new content
     let mut content = lines.join("\n");
     if !content.is_empty() && !content.ends_with('\n') {
@@ -434,6 +547,33 @@ fn exclude_markers(worktree_name: &Option<String>) -> (String, String) {
             format!("# subcontext-overlay-end:{name}"),
         ),
     }
+}
+
+/// Recursively copy a directory's contents, skipping `.git` entries.
+/// Used to copy submodule contents between work dir and checkout root.
+pub(crate) fn copy_dir_recursive(backend: &dyn Backend, src: &Path, dest: &Path) -> Result<()> {
+    if !backend.is_dir(src) {
+        return Ok(());
+    }
+    backend.create_dir_all(dest)?;
+    for entry_path in backend.read_dir(src)? {
+        let name = match entry_path.file_name() {
+            Some(n) => n.to_owned(),
+            None => continue,
+        };
+        if name == ".git" {
+            continue;
+        }
+        let dest_path = dest.join(&name);
+        if backend.is_dir(&entry_path) {
+            copy_dir_recursive(backend, &entry_path, &dest_path)?;
+        } else {
+            backend
+                .copy(&entry_path, &dest_path)
+                .with_context(|| format!("failed to copy {}", entry_path.display()))?;
+        }
+    }
+    Ok(())
 }
 
 /// Remove empty parent directories up to (but not including) stop_at.
