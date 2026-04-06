@@ -53,94 +53,52 @@ after switching. You never need to manage overlay branches manually.
 
 ## Task management
 
-### Standalone tasks
+Tasks are stored in a **pool** -- a flat collection with sequential integer
+IDs. The pool lives at `.git/.subcontext/pool/` and is created automatically
+on `subcontext install`.
+
+### Adding tasks
 
 ```bash
-subcontext task add my-task --kind task --description "Do the thing"
-subcontext task show my-task
-subcontext task done my-task
-subcontext task list
+subcontext task add "Write documentation"
+subcontext task add "Deploy v2" --list work --topic infra --deadline 2026-06-01T00:00:00Z
+subcontext task add "Fix auth bug" --important --parents 3
 ```
 
-### Boards (task trees)
-
-Boards store related tasks as a directory tree on a single branch:
+### Viewing tasks
 
 ```bash
-# Create a board
-subcontext board create sprint-1 --kind goal --description "Sprint 1"
-
-# Pull into overlay
-subcontext board pull <uuid> --path tasks/
-
-# Edit tasks as files
-echo '---
-kind: task
-status: created
-description: Implement feature X
----' > tasks/feature-x/TASK.md
-
-# Push back
-subcontext board push --path tasks/
+subcontext task show <id>
 ```
 
-### Task paths
-
-Tasks can be referenced by hierarchical paths:
-- `.` -- current task
-- `..` -- parent
-- `name` -- child of current
-- `name/child` -- nested
-- `/name` -- absolute (via namespace)
-
-### Task tree visualization
-
-View the full task hierarchy as JSON or Mermaid:
+### Updating tasks
 
 ```bash
-# JSON output (default), active tasks only
-subcontext task tree
-
-# Mermaid flowchart
-subcontext task tree --format mermaid
-
-# Include all tasks (done/failed too)
-subcontext task tree --filter all
-
-# Only show tasks with a specific status
-subcontext task tree --filter created
-
-# Limit tree size
-subcontext task tree --max-depth 3 --max-breadth 5 --max-size 50
-
-# Tree rooted at a specific task
-subcontext task tree my-task
-
-# Combine options
-subcontext task tree --format mermaid --filter all --max-depth 2 sprint-1
+subcontext task update <id> --status active --topic infra
+subcontext task update <id> --title "New title" --deadline 2026-07-01T00:00:00Z
 ```
 
-**Formats:**
-- `json` -- structured JSON array of tree nodes (default)
-- `mermaid` -- Mermaid `graph TD` flowchart with status-colored nodes
+### Completing tasks
 
-**Filters:**
-- `active` -- exclude done/failed tasks (default)
-- `all` -- include everything
-- Any status name (e.g. `created`, `done`, `failed`) -- only that status
+```bash
+subcontext task done <id>
+subcontext task fail <id>
+subcontext task done <id> --time 2026-04-06T12:00:00Z
+```
 
-**Limits:**
-- `--max-depth N` -- stop descending after N levels
-- `--max-breadth N` -- show at most N children per node
-- `--max-size N` -- cap total nodes in the output
+### Deadlines
 
-Works with `--global`, `--user`, and `--local` scope flags.
+```bash
+subcontext task deadlines
+subcontext task deadlines --important
+subcontext task deadlines --horizon 2w
+```
 
 ### Scope flags
 
 - `--global` -- system-level subcontext
 - `--user` -- user subcontext
-- `--local` -- skip propagating shadow tasks to parents
+- `--local` -- only act on the local (per-repo) subcontext
 
 ## Submodules
 
@@ -190,23 +148,16 @@ Runs a JSON-RPC 2.0 MCP server over stdio exposing `subcontext_status` and
 1. **Let auto-save work for you.** The hooks save overlay changes on every
    branch switch and commit. You rarely need explicit `subcontext save`.
 
-2. **Use boards for agent workflows.** Boards let agents create and manage
-   tasks as plain files. `board pull` / `board push` syncs the file tree with
-   the database.
+2. **Use the pool for task tracking.** Tasks are stored in a flat pool with
+   sequential IDs. Use `task add`, `task done`, and `task update` to manage
+   them.
 
-3. **One overlay directory per board.** Convention is `tasks/` but any path
-   works. The board config is stored in `<path>/.board.json`.
-
-4. **Overlay wins.** If you need to override a file from the host repo, just
+3. **Overlay wins.** If you need to override a file from the host repo, just
    `subcontext add` it. The overlay version takes precedence.
 
-5. **Per-branch isolation.** Each branch has its own overlay space. Use this
+4. **Per-branch isolation.** Each branch has its own overlay space. Use this
    to keep feature-specific tasks and notes separate.
 
-6. **Propagation.** When you add a task locally, it automatically propagates
-   as a shadow task to parent contexts (user, then global) unless you pass
-   `--local`.
-
-7. **Dump docs into your overlay.** Run `subcontext docs <path>` to get
+5. **Dump docs into your overlay.** Run `subcontext docs <path>` to get
    setup guides and sample skills. Claude Code can read these and create
    project-specific skills.

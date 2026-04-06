@@ -20,7 +20,7 @@
 
 use anyhow::{Context, Result, bail};
 use std::fmt::Write as FmtWrite;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 use crate::backend::{Backend, GitInvocation};
 use crate::git::run_git_in_bare;
@@ -35,8 +35,6 @@ const NESTED_DIR: &str = "global";
 /// Default overlay branch used by the global subcontext (no host branch to
 /// mirror).
 pub const DEFAULT_OVERLAY_BRANCH: &str = "overlay/main";
-/// Pseudo-branch recorded in task_names for global tasks.
-pub const GLOBAL_HOST_BRANCH: &str = "global";
 
 /// Resolve the global subcontext root directory.
 /// Honours `$GIT_SUBCONTEXT_PATH`, otherwise `$HOME/.subcontext`.
@@ -165,6 +163,10 @@ pub fn install(backend: &dyn Backend) -> Result<()> {
     // 7. Initialize state branch + tasks.db.
     init_state_branch_in(backend, &repo, &state)?;
 
+    // 8. Initialize pool.
+    let pool = sc_dir.join("pool");
+    crate::task::init_pool(backend, &repo, &pool, &state)?;
+
     eprintln!("[subcontext] Global subcontext installed.");
     Ok(())
 }
@@ -176,12 +178,18 @@ pub fn global_task_scope(backend: &dyn Backend) -> Result<TaskScope> {
     let sc_dir = global_subcontext_dir()?;
     let cfg = global_config_dir()?;
     let project_uuid = crate::project::read_project_uuid_at(backend, &cfg)?;
+    let pool = sc_dir.join("pool");
+    let pool_dir = if backend.exists(&pool) {
+        Some(pool)
+    } else {
+        None
+    };
     Ok(TaskScope {
         repo_dir: repo,
         state_dir: state,
         scratch_base: sc_dir,
-        host_branch: GLOBAL_HOST_BRANCH.to_string(),
         project_uuid,
+        pool_dir,
     })
 }
 
@@ -279,138 +287,6 @@ pub fn register_child(
     Ok(Some(commit))
 }
 
-/// Record a checkout path (path to the child's `.git` *folder*) in the
-/// `object/<child_uuid>` branch's `object.json` (under `data.checkout_path`).
-/// If the file already lists a different path, promote `checkout_path` to an
-/// array; adding a path that is already present is a no-op.
-///
-/// Returns `Some(commit_sha)` if the branch was updated, `None` if no update
-/// was needed. No-op if no global subcontext is installed or the object
-/// branch doesn't exist yet.
-pub fn record_child_checkout_path(
-    backend: &dyn Backend,
-    child_uuid: &str,
-    git_dir: &Path,
-) -> Result<Option<String>> {
-    if !global_exists(backend)? {
-        return Ok(None);
-    }
-    let repo = global_repo_dir()?;
-    let ref_name = format!("refs/heads/object/{child_uuid}");
-
-    // No object branch → nothing to update.
-    if run_git_in_bare(
-        backend,
-        &["show-ref", "--verify", "--quiet", &ref_name],
-        &repo,
-        &repo,
-    )
-    .is_err()
-    {
-        return Ok(None);
-    }
-
-    let current = run_git_in_bare(
-        backend,
-        &["show", &format!("object/{child_uuid}:object.json")],
-        &repo,
-        &repo,
-    )?;
-    let mut val: serde_json::Value = serde_json::from_str(&current)
-        .with_context(|| format!("invalid object.json on object/{child_uuid}"))?;
-
-    let data = val
-        .get_mut("data")
-        .context("missing 'data' key in object.json")?;
-
-    let new_path = git_dir.to_string_lossy().to_string();
-    match data.get("checkout_path").cloned() {
-        None | Some(serde_json::Value::Null) => {
-            data["checkout_path"] = serde_json::Value::String(new_path);
-        }
-        Some(serde_json::Value::String(existing)) => {
-            if existing == new_path {
-                return Ok(None);
-            }
-            data["checkout_path"] = serde_json::json!([existing, new_path]);
-        }
-        Some(serde_json::Value::Array(mut arr)) => {
-            if arr
-                .iter()
-                .any(|v| v.as_str().is_some_and(|s| s == new_path))
-            {
-                return Ok(None);
-            }
-            arr.push(serde_json::Value::String(new_path));
-            data["checkout_path"] = serde_json::Value::Array(arr);
-        }
-        Some(_) => {
-            data["checkout_path"] = serde_json::Value::String(new_path);
-        }
-    }
-
-    let new_json = serde_json::to_string_pretty(&val)? + "\n";
-
-    // Write new blob, build tree, commit with the current tip as parent.
-    let sc_dir = global_subcontext_dir()?;
-    backend.create_dir_all(&sc_dir)?;
-
-    let tmp = sc_dir.join(format!(".child-update-{child_uuid}.tmp"));
-    backend.write(&tmp, new_json.as_bytes())?;
-    let blob = run_git_in_bare(
-        backend,
-        &["hash-object", "-w", &tmp.to_string_lossy()],
-        &repo,
-        &repo,
-    )?;
-    backend.remove_file(&tmp).ok();
-
-    let idx = sc_dir.join(format!(".child-update-index-{child_uuid}.tmp"));
-    if backend.exists(&idx) {
-        backend.remove_file(&idx).ok();
-    }
-    let git_dir_flag = format!("--git-dir={}", repo.display());
-    let cacheinfo = format!("100644,{blob},object.json");
-    let idx_os: &std::ffi::OsStr = idx.as_os_str();
-
-    backend.git(&GitInvocation {
-        args: &[
-            git_dir_flag.as_str(),
-            "update-index",
-            "--add",
-            "--cacheinfo",
-            &cacheinfo,
-        ],
-        cwd: &repo,
-        env_set: &[("GIT_INDEX_FILE", idx_os)],
-        env_remove: &[],
-    })?;
-    let tree = backend.git(&GitInvocation {
-        args: &[git_dir_flag.as_str(), "write-tree"],
-        cwd: &repo,
-        env_set: &[("GIT_INDEX_FILE", idx_os)],
-        env_remove: &[],
-    })?;
-    backend.remove_file(&idx).ok();
-
-    let parent = run_git_in_bare(backend, &["rev-parse", &ref_name], &repo, &repo)?;
-    let commit = run_git_in_bare(
-        backend,
-        &[
-            "commit-tree",
-            &tree,
-            "-p",
-            &parent,
-            "-m",
-            &format!("update child {child_uuid} checkout_path"),
-        ],
-        &repo,
-        &repo,
-    )?;
-    run_git_in_bare(backend, &["update-ref", &ref_name, &commit], &repo, &repo)?;
-    Ok(Some(commit))
-}
-
 // ─── User subcontexts ───────────────────────────────────────────────
 
 /// Install a user subcontext as a managed child of the global (system)
@@ -502,11 +378,15 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
     // 7. Initialize state branch + tasks.db.
     init_state_branch_in(backend, &repo, &state)?;
 
-    // 8. Register as managed child of the system subcontext.
-    if let Some(commit) = register_child(backend, &user_uuid, USER_KIND)? {
+    // 8. Initialize pool.
+    let pool = user_dir.join("pool");
+    crate::task::init_pool(backend, &repo, &pool, &state)?;
+
+    // 9. Register as managed child of the system subcontext.
+    if let Some(_commit) = register_child(backend, &user_uuid, USER_KIND)? {
         let global_scope = global_task_scope(backend)?;
-        let conn = crate::task::open_db(&global_scope)?;
-        crate::task::insert_object(&conn, &user_uuid, "managed", &commit, None)?;
+        let conn = crate::task::open_state_db(&global_scope.state_dir)?;
+        crate::task::insert_object(&conn, &user_uuid, &global_scope.project_uuid, "child")?;
         drop(conn);
         crate::task::commit_state_in(
             backend,
@@ -517,7 +397,7 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
 
     // 9. Set as current user if none exists.
     let global_scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&global_scope)?;
+    let conn = crate::task::open_state_db(&global_scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
     let existing: Option<String> = conn
         .query_row(
@@ -557,12 +437,18 @@ pub fn user_task_scope(backend: &dyn Backend) -> Result<TaskScope> {
         bail!("no user subcontext installed — run `subcontext install --user` first");
     }
     let project_uuid = read_project_uuid_at(backend, &cfg)?;
+    let pool = user_dir.join("pool");
+    let pool_dir = if backend.exists(&pool) {
+        Some(pool)
+    } else {
+        None
+    };
     Ok(TaskScope {
         repo_dir: repo,
         state_dir: state,
         scratch_base: user_dir,
-        host_branch: GLOBAL_HOST_BRANCH.to_string(),
         project_uuid,
+        pool_dir,
     })
 }
 
@@ -590,7 +476,7 @@ pub fn get_current_user(backend: &dyn Backend) -> Result<Option<String>> {
         return Ok(None);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
     let val: Option<String> = conn
         .query_row(
@@ -609,7 +495,7 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
         bail!("no global (system) subcontext installed");
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
 
     // Verify it's a managed user subcontext by checking the object branch.
@@ -661,7 +547,7 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
 /// A child can only have one parent; re-setting is an error unless the same.
 pub fn set_parent(backend: &dyn Backend, child_uuid: &str, parent_uuid: &str) -> Result<()> {
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
 
     let existing: Option<String> = conn
@@ -697,7 +583,7 @@ pub fn get_parent(backend: &dyn Backend, child_uuid: &str) -> Result<Option<Stri
         return Ok(None);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
     let val: Option<String> = conn
         .query_row(
@@ -715,7 +601,7 @@ pub fn get_children(backend: &dyn Backend, parent_uuid: &str) -> Result<Vec<Stri
         return Ok(vec![]);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
     let mut stmt = conn.prepare("SELECT child_uuid FROM parents WHERE parent_uuid = ?1")?;
     let rows = stmt.query_map(rusqlite::params![parent_uuid], |r| r.get(0))?;
@@ -753,11 +639,12 @@ pub fn tree_text(backend: &dyn Backend) -> Result<String> {
     let scope = global_task_scope(backend)?;
     let system_uuid = scope.project_uuid.clone();
 
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
 
-    // Collect all managed objects.
-    let mut stmt = conn.prepare("SELECT uuid, type FROM objects WHERE type = 'managed'")?;
+    // Collect all child objects (registered subcontexts).
+    let mut stmt =
+        conn.prepare("SELECT uuid, owner_type FROM objects WHERE owner_type = 'child'")?;
     let managed: Vec<(String, String)> = stmt
         .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
         .filter_map(|r| r.ok())
@@ -866,7 +753,7 @@ pub fn ancestry_chain(backend: &dyn Backend, uuid: &str) -> Result<Vec<(String, 
     }
     let scope = global_task_scope(backend)?;
     let system_uuid = scope.project_uuid.clone();
-    let conn = crate::task::open_db(&scope)?;
+    let conn = crate::task::open_state_db(&scope.state_dir)?;
     ensure_global_extra_schema(&conn)?;
 
     let mut chain = vec![];
