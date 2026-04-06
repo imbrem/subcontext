@@ -2,6 +2,7 @@ use anyhow::Result;
 use std::path::Path;
 
 use crate::backend::Backend;
+use crate::dolt;
 use crate::git::{
     CheckoutContext, config_dir, current_branch, repo_dir, run_git, run_git_in_bare,
     run_subcontext_git, sanitize_branch_name, subcontext_dir, work_dir,
@@ -17,6 +18,9 @@ pub fn install(backend: &dyn Backend, root: &Path, repair: bool) -> Result<()> {
     let sc_dir = subcontext_dir(root);
     let branch = current_branch(backend, root)?;
 
+    // Ensure dolt is available (download if needed)
+    ensure_dolt(backend)?;
+
     if backend.exists(&sc_dir) {
         eprintln!("[subcontext] .git/.subcontext/ exists — re-installing hooks and settings...");
     } else {
@@ -29,6 +33,20 @@ pub fn install(backend: &dyn Backend, root: &Path, repair: bool) -> Result<()> {
 
     print_summary(&branch);
     Ok(())
+}
+
+/// Ensure the dolt binary is available. Downloads it if not found.
+fn ensure_dolt(backend: &dyn Backend) -> Result<()> {
+    match dolt::find_dolt_bin() {
+        Ok(path) => {
+            eprintln!("[subcontext] Found dolt at {}", path.display());
+            Ok(())
+        }
+        Err(_) => {
+            dolt::download_dolt(backend)?;
+            Ok(())
+        }
+    }
 }
 
 /// Shared steps: hooks, excludes, settings, config commit. Used by install and clone.
@@ -78,10 +96,9 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
         if let Ok(global_scope) = global::global_task_scope(backend) {
             let conn = task::open_db(&global_scope)?;
             task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-            drop(conn);
-            task::commit_state_in(
+            task::dolt_commit_and_track(
                 backend,
-                &global_scope.state_dir,
+                &global_scope,
                 &format!("object add: {project_uuid}"),
             )?;
         }
@@ -120,10 +137,9 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
                 )?;
                 let conn = task::open_db(&user_scope)?;
                 task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-                drop(conn);
-                task::commit_state_in(
+                task::dolt_commit_and_track(
                     backend,
-                    &user_scope.state_dir,
+                    &user_scope,
                     &format!("object add: {project_uuid}"),
                 )?;
             }
@@ -192,7 +208,7 @@ fn init_context_repo(backend: &dyn Backend, root: &Path, host_branch: &str) -> R
         root,
     )?;
 
-    // 6. Initialize state branch (tasks.db)
+    // 6. Initialize state branch + Dolt database
     task::init_state_branch(backend, root)?;
 
     Ok(())
@@ -346,8 +362,10 @@ fn print_summary(branch: &str) {
     eprintln!("  Context repo:  .git/.subcontext/repo/");
     eprintln!("  Config mount:  .git/.subcontext/config/");
     eprintln!("  Work mount:    .git/.subcontext/work/");
+    eprintln!("  Dolt database: .git/.subcontext/dolt/");
     eprintln!("  Overlay branch: overlay/{safe}");
     eprintln!("  Hooks:         .git/hooks/post-checkout, .git/hooks/post-commit");
     eprintln!();
     eprintln!("  Use `git subcontext add <file>` to add files to the overlay.");
+    eprintln!("  Use `git subcontext dolt sql` to query the task database.");
 }

@@ -2,6 +2,7 @@ pub use subcontext::backend;
 
 mod clone;
 mod docs;
+mod dolt;
 mod git;
 mod global;
 mod hook;
@@ -140,6 +141,13 @@ enum Commands {
 
     /// Run the subcontext MCP server over stdio
     Mcp,
+
+    /// Run dolt commands against the subcontext database
+    Dolt {
+        /// Arguments to pass to the dolt binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Set the current user context (by UUID)
     SetUser {
@@ -696,12 +704,11 @@ fn main() -> Result<()> {
                             let conn = task::open_db(&global_scope)?;
                             conn.execute(
                                 "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-                                rusqlite::params![commit, scope.project_uuid],
+                                &[commit.as_str(), scope.project_uuid.as_str()],
                             )?;
-                            drop(conn);
-                            task::commit_state_in(
+                            task::dolt_commit_and_track(
                                 backend,
-                                &global_scope.state_dir,
+                                &global_scope,
                                 &format!("object update: {}", scope.project_uuid),
                             )?;
                         }
@@ -1129,6 +1136,33 @@ fn main() -> Result<()> {
         }
         Commands::Mcp => {
             mcp::run(backend)?;
+        }
+        Commands::Dolt { args } => {
+            let dolt_bin = dolt::find_dolt_bin()?;
+            // Determine the dolt repo path: use local project if available,
+            // otherwise global.
+            let dolt_repo = if let Ok(root) = git::find_main_git_root(backend, &cwd) {
+                git::dolt_dir(&root)
+            } else if let Ok(scope) = global::global_task_scope(backend) {
+                scope.dolt_dir.clone()
+            } else {
+                anyhow::bail!("no subcontext found; run `subcontext install` first");
+            };
+            if !backend.is_dir(&dolt_repo) {
+                anyhow::bail!(
+                    "dolt repo not found at {}; run `subcontext install` to initialize",
+                    dolt_repo.display()
+                );
+            }
+            let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let status = std::process::Command::new(&dolt_bin)
+                .args(&str_args)
+                .current_dir(&dolt_repo)
+                .status()
+                .with_context(|| format!("failed to run dolt"))?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
         }
         Commands::Hook {
             hook:

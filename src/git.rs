@@ -99,6 +99,11 @@ pub fn state_dir(root: &Path) -> PathBuf {
     subcontext_dir(root).join("state")
 }
 
+/// .git/.subcontext/dolt (Dolt database directory)
+pub fn dolt_dir(root: &Path) -> PathBuf {
+    subcontext_dir(root).join("dolt")
+}
+
 // ─── Checkout context ────────────────────────────────────────────────
 
 /// Identifies a checkout location. For the main checkout, main_root == checkout_root.
