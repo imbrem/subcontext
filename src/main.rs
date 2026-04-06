@@ -10,13 +10,14 @@ mod mcp_config;
 mod overlay;
 mod project;
 mod settings;
+mod skills;
 mod startup;
 mod status;
 mod submodule;
 mod task;
 mod uninstall;
 
-use anyhow::{Result, bail};
+use anyhow::{Context, Result, bail};
 use clap::{Parser, Subcommand};
 use std::env;
 use std::path::Path;
@@ -44,12 +45,17 @@ enum Commands {
 
         /// Install the global (system) subcontext and MCP server into the
         /// user's Claude Code config (`~/.claude.json`).
-        #[arg(long, conflicts_with_all = ["repair", "user"])]
+        #[arg(long, conflicts_with_all = ["repair", "user", "skills"])]
         global: bool,
 
         /// Install a user subcontext under the global (system) subcontext.
-        #[arg(long, conflicts_with_all = ["repair", "global"])]
+        #[arg(long, conflicts_with_all = ["repair", "global", "skills"])]
         user: bool,
+
+        /// Install bundled Claude Code skills globally (~/.claude/skills/).
+        /// Skips skills that already exist.
+        #[arg(long, conflicts_with_all = ["repair", "global", "user"])]
+        skills: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
@@ -113,6 +119,12 @@ enum Commands {
         command: TaskCommand,
     },
 
+    /// Sync TASK.md and object.json on an object branch
+    ObjectCommit {
+        /// Object UUID
+        uuid: String,
+    },
+
     /// Run the subcontext MCP server over stdio
     Mcp,
 
@@ -149,8 +161,11 @@ enum Commands {
 enum TaskCommand {
     /// Create a task with the given name and a fresh UUID
     Add {
-        /// Task name
-        name: String,
+        /// Task name (optional if --file is provided; taken from TASK.md frontmatter)
+        name: Option<String>,
+        /// Path to a TASK.md file (YAML frontmatter + markdown body)
+        #[arg(long)]
+        file: Option<String>,
         /// Task kind (e.g. goal, todo, tick, task)
         #[arg(long)]
         kind: Option<String>,
@@ -166,6 +181,37 @@ enum TaskCommand {
         /// Mark as important. Without a value sets importance to 1.0.
         #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
         important: Option<f64>,
+    },
+    /// Update an existing task (by UUID or name)
+    Update {
+        /// Task name or UUID to update
+        name_or_uuid: String,
+        /// Path to an updated TASK.md file
+        #[arg(long)]
+        file: Option<String>,
+        /// Updated task name
+        #[arg(long)]
+        name: Option<String>,
+        /// Updated task kind
+        #[arg(long)]
+        kind: Option<String>,
+        /// Updated task status
+        #[arg(long)]
+        status: Option<String>,
+        /// Updated description
+        #[arg(long)]
+        description: Option<String>,
+        /// Updated deadline
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Updated importance
+        #[arg(long)]
+        important: Option<f64>,
+    },
+    /// Show a task's TASK.md (by name or UUID)
+    Show {
+        /// Task name or UUID
+        name_or_uuid: String,
     },
     /// Mark a task as done
     Done {
@@ -225,6 +271,32 @@ enum SubmoduleCommand {
     },
 }
 
+fn handle_task_show(
+    backend: &dyn backend::Backend,
+    scope: &task::TaskScope,
+    name_or_uuid: &str,
+) -> Result<()> {
+    use task::ShowTaskResult;
+    match task::show_task(backend, scope, name_or_uuid)? {
+        ShowTaskResult::Single(uuid, content) => {
+            eprintln!("[subcontext] Task UUID: {uuid}");
+            print!("{content}");
+        }
+        ShowTaskResult::Ambiguous(matches) => {
+            println!(
+                "Multiple tasks match '{}' ({} matches):",
+                name_or_uuid,
+                matches.len()
+            );
+            for m in &matches {
+                let desc = m.description.as_deref().unwrap_or("(no description)");
+                println!("  {} (branch: {}) — {}", m.uuid, m.branch, desc);
+            }
+        }
+    }
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cwd = env::current_dir()?;
@@ -235,8 +307,11 @@ fn main() -> Result<()> {
             repair,
             global,
             user,
+            skills,
         } => {
-            if global {
+            if skills {
+                skills::install_skills(backend)?;
+            } else if global {
                 global::install(backend)?;
                 mcp_config::install_global(backend)?;
             } else if user {
@@ -314,10 +389,77 @@ fn main() -> Result<()> {
             // outside a git repo. Otherwise fall back to the local scope.
             let local_root = git::find_main_git_root(backend, &cwd).ok();
             let use_global = global_flag || local_root.is_none();
+
+            // Helper: run the task add logic for a given scope, handling
+            // both --file and positional-name modes.
+            let handle_task_add = |backend: &dyn Backend,
+                                   scope: &task::TaskScope,
+                                   name: Option<String>,
+                                   file: Option<String>,
+                                   kind: Option<String>,
+                                   status: Option<String>,
+                                   description: Option<String>,
+                                   deadline: Option<String>,
+                                   important: Option<f64>|
+             -> Result<(String, String, String)> {
+                let importance = important.unwrap_or(0.0);
+                if let Some(file_path) = file {
+                    let md = std::fs::read_to_string(&file_path)
+                        .with_context(|| format!("cannot read {file_path}"))?;
+                    let (uuid, commit) = task::add_task_from_md(backend, scope, &md, None)?;
+                    // Extract name from frontmatter for propagation.
+                    let (pairs, _) = task::parse_frontmatter(&md);
+                    let task_name = pairs
+                        .iter()
+                        .find(|(k, _)| k == "name")
+                        .map(|(_, v)| v.clone())
+                        .unwrap_or_default();
+                    Ok((uuid, commit, task_name))
+                } else {
+                    let name = name
+                        .ok_or_else(|| anyhow::anyhow!("task name is required (or use --file)"))?;
+                    let (uuid, commit) = task::add_task(
+                        backend,
+                        scope,
+                        &name,
+                        kind.as_deref(),
+                        status.as_deref(),
+                        description.as_deref(),
+                        deadline.as_deref(),
+                        importance,
+                        None,
+                    )?;
+                    Ok((uuid, commit, name))
+                }
+            };
+
             if use_global {
                 let scope = global::global_task_scope(backend)?;
                 match command {
                     TaskCommand::Add {
+                        name,
+                        file,
+                        kind,
+                        status,
+                        description,
+                        deadline,
+                        important,
+                    } => {
+                        handle_task_add(
+                            backend,
+                            &scope,
+                            name,
+                            file,
+                            kind,
+                            status,
+                            description,
+                            deadline,
+                            important,
+                        )?;
+                    }
+                    TaskCommand::Update {
+                        name_or_uuid,
+                        file,
                         name,
                         kind,
                         status,
@@ -325,19 +467,23 @@ fn main() -> Result<()> {
                         deadline,
                         important,
                     } => {
-                        let importance = important.unwrap_or(0.0);
-                        task::add_task(
+                        let uuid = task::resolve_task_uuid(backend, &scope, &name_or_uuid)?;
+                        let md = file.map(|p| std::fs::read_to_string(&p)).transpose()?;
+                        task::update_task(
                             backend,
                             &scope,
-                            &name,
+                            &uuid,
+                            md.as_deref(),
+                            name.as_deref(),
                             kind.as_deref(),
                             status.as_deref(),
                             description.as_deref(),
                             deadline.as_deref(),
-                            importance,
-                            None,
-                        )
-                        .map(|_| ())?;
+                            important,
+                        )?;
+                    }
+                    TaskCommand::Show { name_or_uuid } => {
+                        handle_task_show(backend, &scope, &name_or_uuid)?;
                     }
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
@@ -356,32 +502,33 @@ fn main() -> Result<()> {
                 match command {
                     TaskCommand::Add {
                         name,
+                        file,
                         kind,
                         status,
                         description,
                         deadline,
                         important,
                     } => {
-                        let importance = important.unwrap_or(0.0);
-                        let (local_uuid, local_commit) = task::add_task(
+                        let (local_uuid, local_commit, task_name) = handle_task_add(
                             backend,
                             &scope,
-                            &name,
-                            kind.as_deref(),
-                            status.as_deref(),
-                            description.as_deref(),
-                            deadline.as_deref(),
-                            importance,
-                            None,
+                            name,
+                            file.clone(),
+                            kind.clone(),
+                            status.clone(),
+                            description.clone(),
+                            deadline.clone(),
+                            important,
                         )?;
                         // Propagate task up the parent chain unless --local.
                         if !local_flag && global::global_exists(backend)? {
+                            let importance = important.unwrap_or(0.0);
                             propagate_task_up(
                                 backend,
                                 &scope.project_uuid,
                                 &local_uuid,
                                 &local_commit,
-                                &name,
+                                &task_name,
                                 kind.as_deref(),
                                 status.as_deref(),
                                 description.as_deref(),
@@ -408,6 +555,34 @@ fn main() -> Result<()> {
                             }
                         }
                     }
+                    TaskCommand::Update {
+                        name_or_uuid,
+                        file,
+                        name,
+                        kind,
+                        status,
+                        description,
+                        deadline,
+                        important,
+                    } => {
+                        let uuid = task::resolve_task_uuid(backend, &scope, &name_or_uuid)?;
+                        let md = file.map(|p| std::fs::read_to_string(&p)).transpose()?;
+                        task::update_task(
+                            backend,
+                            &scope,
+                            &uuid,
+                            md.as_deref(),
+                            name.as_deref(),
+                            kind.as_deref(),
+                            status.as_deref(),
+                            description.as_deref(),
+                            deadline.as_deref(),
+                            important,
+                        )?;
+                    }
+                    TaskCommand::Show { name_or_uuid } => {
+                        handle_task_show(backend, &scope, &name_or_uuid)?;
+                    }
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
                     }
@@ -420,6 +595,15 @@ fn main() -> Result<()> {
                     }
                 }
             }
+        }
+        Commands::ObjectCommit { uuid } => {
+            let local_root = git::find_main_git_root(backend, &cwd).ok();
+            let scope = if let Some(root) = local_root {
+                task::TaskScope::for_local(backend, &root)?
+            } else {
+                global::global_task_scope(backend)?
+            };
+            task::object_commit(backend, &scope, &uuid)?;
         }
         Commands::SetUser { uuid } => {
             global::set_current_user(backend, &uuid)?;
