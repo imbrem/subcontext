@@ -104,7 +104,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
              task_status     TEXT NOT NULL,
              task_kind       TEXT NOT NULL,
              task_description TEXT DEFAULT NULL,
-             project_uuid    TEXT NOT NULL
+             project_uuid    TEXT NOT NULL,
+             task_deadline   TEXT DEFAULT NULL,
+             task_importance REAL NOT NULL DEFAULT 0.0
          );
          CREATE TABLE IF NOT EXISTS task_names (
              branch_name   TEXT NOT NULL,
@@ -121,6 +123,11 @@ fn create_schema(conn: &Connection) -> Result<()> {
              source_context_commit TEXT DEFAULT NULL
          );",
     )?;
+    // Migrate existing databases that lack the new columns.
+    let _ = conn.execute_batch(
+        "ALTER TABLE tasks ADD COLUMN task_deadline TEXT DEFAULT NULL;
+         ALTER TABLE tasks ADD COLUMN task_importance REAL NOT NULL DEFAULT 0.0;",
+    );
     Ok(())
 }
 
@@ -152,8 +159,17 @@ pub fn add_task(
     kind: Option<&str>,
     status: Option<&str>,
     description: Option<&str>,
+    deadline: Option<&str>,
+    importance: f64,
     source: Option<(&str, &str, &str)>,
 ) -> Result<(String, String)> {
+    // Validate deadline if provided.
+    if let Some(d) = deadline {
+        if !d.ends_with('Z') {
+            bail!("--deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
+        }
+    }
+
     // Shadow tasks live under their origin's project UUID as the branch
     // namespace; native tasks live under the scope's host_branch.
     let branch: String = match source {
@@ -176,9 +192,9 @@ pub fn add_task(
         bail!("task '{name}' already exists on branch '{branch}'");
     }
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![task_uuid, name, status, kind, description, scope.project_uuid],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -202,6 +218,8 @@ pub fn add_task(
             project_uuid: scope.project_uuid.clone(),
             completed_at: None,
             description: description.map(|s| s.to_string()),
+            deadline: deadline.map(|s| s.to_string()),
+            importance,
         },
         source,
     );
@@ -289,6 +307,208 @@ pub fn done_task(
     Ok(())
 }
 
+/// Mark an existing task as failed.
+pub fn fail_task(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    name: &str,
+    time: Option<&str>,
+) -> Result<()> {
+    let branch = &scope.host_branch;
+
+    let conn = open_db(scope)?;
+    let row: (String, String) = conn
+        .query_row(
+            "SELECT t.task_uuid, t.task_name \
+             FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid
+             WHERE n.branch_name = ?1 AND n.task_name = ?2",
+            params![branch, name],
+            |r| Ok((r.get(0)?, r.get(1)?)),
+        )
+        .with_context(|| format!("task '{name}' not found on branch '{branch}'"))?;
+    let (task_uuid, _task_name) = row;
+
+    conn.execute(
+        "UPDATE tasks SET task_status = 'failed' WHERE task_uuid = ?1",
+        params![task_uuid],
+    )?;
+    drop(conn);
+
+    let completed_at = resolve_timestamp(time)?;
+
+    commit_state_in(backend, &scope.state_dir, &format!("task fail: {name}"))?;
+
+    let obj_branch = format!("object/{task_uuid}");
+    let existing = run_git_in_bare(
+        backend,
+        &["show", &format!("{obj_branch}:object.json")],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )?;
+    let mut val: serde_json::Value = serde_json::from_str(&existing)
+        .with_context(|| format!("invalid object.json on {obj_branch}"))?;
+    val["data"]["status"] = serde_json::Value::String("failed".to_string());
+    val["data"]["completed_at"] = serde_json::Value::String(completed_at);
+
+    let new_json = serde_json::to_string_pretty(&val)? + "\n";
+    let new_commit = update_object_branch(backend, scope, &task_uuid, &new_json)?;
+
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![new_commit, task_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object update: {task_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Marked task '{name}' as failed");
+    Ok(())
+}
+
+/// A deadline entry returned by `list_deadlines`.
+#[allow(dead_code)]
+pub struct DeadlineEntry {
+    pub name: String,
+    pub uuid: String,
+    pub status: String,
+    pub kind: String,
+    pub deadline: String,
+    pub importance: f64,
+    pub description: Option<String>,
+}
+
+/// List tasks with deadlines that are not "done" or "failed".
+///
+/// - `important_only`: if true, only return tasks with importance > 0.
+/// - `horizon_secs`: if `Some(n)`, only return tasks whose deadline is at most
+///   `n` seconds in the future from now. If `n == 0`, only past deadlines.
+///   If `None`, return all matching tasks regardless of deadline time.
+pub fn list_deadlines(
+    scope: &TaskScope,
+    important_only: bool,
+    horizon_secs: Option<f64>,
+) -> Result<Vec<DeadlineEntry>> {
+    let conn = open_db(scope)?;
+
+    let mut sql = String::from(
+        "SELECT t.task_name, t.task_uuid, t.task_status, t.task_kind, \
+                t.task_deadline, t.task_importance, t.task_description \
+         FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid \
+         WHERE n.branch_name = ?1 \
+           AND t.task_status NOT IN ('done', 'failed') \
+           AND t.task_deadline IS NOT NULL",
+    );
+    if important_only {
+        sql.push_str(" AND t.task_importance > 0.0");
+    }
+    sql.push_str(" ORDER BY t.task_deadline ASC");
+
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map(params![scope.host_branch], |r| {
+        Ok(DeadlineEntry {
+            name: r.get(0)?,
+            uuid: r.get(1)?,
+            status: r.get(2)?,
+            kind: r.get(3)?,
+            deadline: r.get(4)?,
+            importance: r.get(5)?,
+            description: r.get(6)?,
+        })
+    })?;
+
+    let now_secs = current_unix_secs();
+    let mut entries = Vec::new();
+    for row in rows {
+        let entry = row?;
+        if let Some(horizon) = horizon_secs {
+            if let Some(deadline_secs) = parse_iso8601_to_unix(&entry.deadline) {
+                let cutoff = now_secs as f64 + horizon;
+                if (deadline_secs as f64) > cutoff {
+                    continue;
+                }
+            }
+        }
+        entries.push(entry);
+    }
+
+    Ok(entries)
+}
+
+/// Format deadline entries as human-readable text.
+pub fn format_deadlines(entries: &[DeadlineEntry]) -> String {
+    if entries.is_empty() {
+        return "No upcoming deadlines.".to_string();
+    }
+    let now_secs = current_unix_secs();
+    let mut out = String::new();
+    for e in entries {
+        let overdue = parse_iso8601_to_unix(&e.deadline)
+            .map(|d| d < now_secs)
+            .unwrap_or(false);
+        let marker = if overdue { " [OVERDUE]" } else { "" };
+        let imp = if e.importance > 0.0 {
+            format!(" (importance: {:.1})", e.importance)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "- {name} [{status}] deadline: {deadline}{marker}{imp}\n",
+            name = e.name,
+            status = e.status,
+            deadline = e.deadline,
+        ));
+        if let Some(desc) = &e.description {
+            out.push_str(&format!("  {desc}\n"));
+        }
+    }
+    out
+}
+
+fn current_unix_secs() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// Parse an ISO8601 UTC timestamp (ending in 'Z') to Unix seconds.
+/// Returns `None` if the format is not recognized.
+fn parse_iso8601_to_unix(s: &str) -> Option<i64> {
+    // Expected: YYYY-MM-DDTHH:MM:SSZ
+    let s = s.strip_suffix('Z')?;
+    let (date, time) = s.split_once('T')?;
+    let mut date_parts = date.split('-');
+    let year: i64 = date_parts.next()?.parse().ok()?;
+    let month: u32 = date_parts.next()?.parse().ok()?;
+    let day: u32 = date_parts.next()?.parse().ok()?;
+    let mut time_parts = time.split(':');
+    let h: i64 = time_parts.next()?.parse().ok()?;
+    let m: i64 = time_parts.next()?.parse().ok()?;
+    let s: i64 = time_parts.next()?.parse().ok()?;
+    Some(days_from_civil(year, month, day) * 86400 + h * 3600 + m * 60 + s)
+}
+
+/// Convert (year, month, day) to days since Unix epoch. Inverse of
+/// `civil_from_days`. Based on Howard Hinnant's algorithm.
+fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let m = if month <= 2 {
+        month as i64 + 9
+    } else {
+        month as i64 - 3
+    };
+    let era = y.div_euclid(400);
+    let yoe = (y - era * 400) as u64;
+    let doy = (153 * m as u64 + 2) / 5 + day as u64 - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146097 + doe as i64 - 719468
+}
+
 struct TaskData {
     name: String,
     uuid: String,
@@ -297,6 +517,8 @@ struct TaskData {
     project_uuid: String,
     completed_at: Option<String>,
     description: Option<String>,
+    deadline: Option<String>,
+    importance: f64,
 }
 
 /// Build a complete `object.json` for a task, with all data inlined under
@@ -308,12 +530,18 @@ fn build_task_object_json(t: &TaskData, source: Option<(&str, &str, &str)>) -> S
         "status": t.status,
         "kind": t.kind,
         "project_uuid": t.project_uuid,
+        "importance": t.importance,
     });
     if let Some(ts) = &t.completed_at {
         data["completed_at"] = serde_json::Value::String(ts.clone());
     }
     // Always include description (null when absent).
     data["description"] = match &t.description {
+        Some(d) => serde_json::Value::String(d.clone()),
+        None => serde_json::Value::Null,
+    };
+    // Always include deadline (null when absent).
+    data["deadline"] = match &t.deadline {
         Some(d) => serde_json::Value::String(d.clone()),
         None => serde_json::Value::Null,
     };
@@ -613,5 +841,34 @@ mod tests {
         let out = resolve_timestamp(None).unwrap();
         assert!(out.ends_with('Z'));
         assert_eq!(out.len(), 20); // YYYY-MM-DDTHH:MM:SSZ
+    }
+
+    #[test]
+    fn parse_iso8601_roundtrip() {
+        assert_eq!(parse_iso8601_to_unix("1970-01-01T00:00:00Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_to_unix("2000-01-01T00:00:00Z"),
+            Some(946_684_800)
+        );
+        assert_eq!(
+            parse_iso8601_to_unix("2026-04-12T12:34:56Z"),
+            Some(1_775_997_296)
+        );
+    }
+
+    #[test]
+    fn parse_iso8601_rejects_bad_input() {
+        assert_eq!(parse_iso8601_to_unix("not a date"), None);
+        assert_eq!(parse_iso8601_to_unix("2026-04-12T12:34:56"), None); // no Z
+    }
+
+    #[test]
+    fn days_from_civil_roundtrip() {
+        // Verify days_from_civil is inverse of civil_from_days
+        for secs in [0i64, 946_684_800, 1_775_997_296, -86400] {
+            let days = secs.div_euclid(86400);
+            let (y, m, d) = civil_from_days(days);
+            assert_eq!(days_from_civil(y, m, d), days);
+        }
     }
 }

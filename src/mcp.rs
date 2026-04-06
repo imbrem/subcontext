@@ -3,7 +3,9 @@ use serde_json::{Value, json};
 use std::io::{self, BufRead, Write};
 
 use crate::backend::Backend;
+use crate::git;
 use crate::status;
+use crate::task;
 
 const PROTOCOL_VERSION: &str = "2024-11-05";
 
@@ -82,6 +84,24 @@ fn handle_method(
                     "properties": {},
                     "additionalProperties": false
                 }
+            }, {
+                "name": "subcontext_deadlines",
+                "description": "List deadlines for tasks not marked done or failed. Returns task names, statuses, deadlines, and importance values sorted by deadline.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "important_only": {
+                            "type": "boolean",
+                            "description": "If true, only show tasks with importance > 0. Default: false.",
+                            "default": false
+                        },
+                        "horizon_seconds": {
+                            "type": "number",
+                            "description": "How far into the future (in seconds) to look for deadlines. If 0, only shows overdue deadlines. If omitted, shows all deadlines regardless of time."
+                        }
+                    },
+                    "additionalProperties": false
+                }
             }]
         }))),
         "tools/call" => {
@@ -101,6 +121,26 @@ fn handle_method(
                         "isError": false
                     })))
                 }
+                "subcontext_deadlines" => {
+                    let params = req.get("params").and_then(|p| p.get("arguments"));
+                    let important_only = params
+                        .and_then(|p| p.get("important_only"))
+                        .and_then(|v| v.as_bool())
+                        .unwrap_or(false);
+                    let horizon_secs: Option<f64> = params
+                        .and_then(|p| p.get("horizon_seconds"))
+                        .and_then(|v| v.as_f64());
+
+                    let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+                    let text = match deadlines_text(backend, &cwd, important_only, horizon_secs) {
+                        Ok(s) => s,
+                        Err(e) => format!("Error: {e:#}"),
+                    };
+                    Ok(Some(json!({
+                        "content": [{"type": "text", "text": text}],
+                        "isError": false
+                    })))
+                }
                 other => Ok(Some(json!({
                     "content": [{"type": "text", "text": format!("unknown tool: {other}")}],
                     "isError": true
@@ -109,4 +149,16 @@ fn handle_method(
         }
         _ => Ok(None),
     }
+}
+
+fn deadlines_text(
+    backend: &dyn Backend,
+    cwd: &std::path::Path,
+    important_only: bool,
+    horizon_secs: Option<f64>,
+) -> anyhow::Result<String> {
+    let root = git::find_main_git_root(backend, cwd)?;
+    let scope = task::TaskScope::for_local(backend, &root)?;
+    let entries = task::list_deadlines(&scope, important_only, horizon_secs)?;
+    Ok(task::format_deadlines(&entries))
 }
