@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crate::backend::Backend;
 use crate::git;
+use crate::global;
+use crate::project;
 
 /// Find the nearest git root and the main repo root.
 fn find_git_roots(backend: &dyn Backend, start: &Path) -> Result<(PathBuf, PathBuf)> {
@@ -79,6 +81,41 @@ pub fn status_text(backend: &dyn Backend, cwd: &Path) -> Result<String> {
         (false, false) => "not installed",
     };
     writeln!(out, "Subcontext:  {}", state)?;
+
+    // Show the current subcontext's UUID and kind if installed.
+    if backend.is_dir(&sc_dir) {
+        if let Ok(uuid) = project::read_project_uuid(backend, &main_root) {
+            let kind =
+                project::read_kind(backend, &main_root).unwrap_or_else(|_| "unknown".to_string());
+            writeln!(out, "UUID:        {} ({})", uuid, kind)?;
+        }
+    }
+
+    // Show global (system) subcontext info.
+    if let Ok(true) = global::global_exists(backend) {
+        if let Ok(sys_uuid) = global::system_uuid(backend) {
+            let sys_kind = global::system_kind(backend).unwrap_or_else(|_| "system".to_string());
+            writeln!(out, "Global:      {} ({})", sys_uuid, sys_kind)?;
+        }
+    }
+
+    // Show ancestry chain (does not include system subcontext).
+    if backend.is_dir(&sc_dir) {
+        if let Ok(uuid) = project::read_project_uuid(backend, &main_root) {
+            if let Ok(chain) = global::ancestry_chain(backend, &uuid) {
+                if !chain.is_empty() {
+                    write!(out, "Ancestry:    ")?;
+                    for (i, (ancestor_uuid, ancestor_kind)) in chain.iter().enumerate() {
+                        if i > 0 {
+                            write!(out, " -> ")?;
+                        }
+                        write!(out, "{} ({})", ancestor_uuid, ancestor_kind)?;
+                    }
+                    writeln!(out)?;
+                }
+            }
+        }
+    }
 
     Ok(out)
 }

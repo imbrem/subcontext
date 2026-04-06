@@ -42,12 +42,14 @@ enum Commands {
         #[arg(long)]
         repair: bool,
 
-        /// Install the subcontext MCP server into the user's Claude Code config
-        /// (`~/.claude.json`) instead of setting up a repo-local install.
-        /// The server is registered as inactive; activate it by editing the
-        /// file and moving the entry into `mcpServers`.
-        #[arg(long, conflicts_with = "repair")]
+        /// Install the global (system) subcontext and MCP server into the
+        /// user's Claude Code config (`~/.claude.json`).
+        #[arg(long, conflicts_with_all = ["repair", "user"])]
         global: bool,
+
+        /// Install a user subcontext under the global (system) subcontext.
+        #[arg(long, conflicts_with_all = ["repair", "global"])]
+        user: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
@@ -113,6 +115,27 @@ enum Commands {
 
     /// Run the subcontext MCP server over stdio
     Mcp,
+
+    /// Set the current user context (by UUID)
+    SetUser {
+        /// UUID of the user subcontext
+        uuid: String,
+    },
+
+    /// Print the current user context's UUID
+    CurrentUser,
+
+    /// Print the current subcontext's UUID
+    Uuid,
+
+    /// View the tree of all subcontexts managed by the global subcontext
+    Tree,
+
+    /// View the current subcontext's parent
+    Parent,
+
+    /// View the current subcontext's children
+    Children,
 
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
@@ -184,10 +207,16 @@ fn main() -> Result<()> {
     let backend: &dyn Backend = &SystemBackend;
 
     match cli.command {
-        Commands::Install { repair, global } => {
+        Commands::Install {
+            repair,
+            global,
+            user,
+        } => {
             if global {
                 global::install(backend)?;
                 mcp_config::install_global(backend)?;
+            } else if user {
+                global::install_user(backend)?;
             } else {
                 let root = git::find_main_git_root(backend, &cwd)?;
                 install::install(backend, &root, repair)?;
@@ -304,25 +333,24 @@ fn main() -> Result<()> {
                             description.as_deref(),
                             None,
                         )?;
-                        // Also add a shadow task to the global subcontext,
-                        // unless the user asked to stay local or no global
-                        // subcontext exists.
+                        // Propagate task up the parent chain unless --local.
                         if !local_flag && global::global_exists(backend)? {
-                            let global_scope = global::global_task_scope(backend)?;
-                            task::add_task(
+                            propagate_task_up(
                                 backend,
-                                &global_scope,
+                                &scope.project_uuid,
+                                &local_uuid,
+                                &local_commit,
                                 &name,
                                 kind.as_deref(),
                                 status.as_deref(),
                                 description.as_deref(),
-                                Some((&scope.project_uuid, &local_uuid, &local_commit)),
                             )?;
                             if let Some(commit) = global::record_child_checkout_path(
                                 backend,
                                 &scope.project_uuid,
                                 &root.join(".git"),
                             )? {
+                                let global_scope = global::global_task_scope(backend)?;
                                 let conn = task::open_db(&global_scope)?;
                                 conn.execute(
                                     "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
@@ -340,6 +368,61 @@ fn main() -> Result<()> {
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
                     }
+                }
+            }
+        }
+        Commands::SetUser { uuid } => {
+            global::set_current_user(backend, &uuid)?;
+        }
+        Commands::CurrentUser => match global::get_current_user(backend)? {
+            Some(uuid) => println!("{uuid}"),
+            None => {
+                eprintln!("[subcontext] No current user set.");
+                std::process::exit(1);
+            }
+        },
+        Commands::Uuid => {
+            let root = git::find_main_git_root(backend, &cwd).ok();
+            if let Some(root) = root {
+                let uuid = project::read_project_uuid(backend, &root)?;
+                println!("{uuid}");
+            } else if global::global_exists(backend)? {
+                let scope = global::global_task_scope(backend)?;
+                println!("{}", scope.project_uuid);
+            } else {
+                bail!("not inside a git repo and no global subcontext installed");
+            }
+        }
+        Commands::Tree => {
+            let text = global::tree_text(backend)?;
+            print!("{text}");
+        }
+        Commands::Parent => {
+            let root = git::find_main_git_root(backend, &cwd)?;
+            let uuid = project::read_project_uuid(backend, &root)?;
+            match global::get_parent(backend, &uuid)? {
+                Some(parent) => {
+                    let kind = global::get_managed_kind(backend, &parent)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    println!("{parent} ({kind})");
+                }
+                None => {
+                    eprintln!("[subcontext] No parent set for this subcontext.");
+                    std::process::exit(1);
+                }
+            }
+        }
+        Commands::Children => {
+            let root = git::find_main_git_root(backend, &cwd)?;
+            let uuid = project::read_project_uuid(backend, &root)?;
+            let children = global::get_children(backend, &uuid)?;
+            if children.is_empty() {
+                eprintln!("[subcontext] No children for this subcontext.");
+            } else {
+                for child in children {
+                    let kind = global::get_managed_kind(backend, &child)
+                        .unwrap_or_else(|_| "unknown".to_string());
+                    println!("{child} ({kind})");
                 }
             }
         }
@@ -378,6 +461,85 @@ fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Recursively propagate a task from a child context up through its parent
+/// chain. Each parent gets a shadow task whose source points to the original
+/// child task.
+fn propagate_task_up(
+    backend: &dyn Backend,
+    child_uuid: &str,
+    task_uuid: &str,
+    task_commit: &str,
+    name: &str,
+    kind: Option<&str>,
+    status: Option<&str>,
+    description: Option<&str>,
+) -> Result<()> {
+    // Find the parent of this child via the system DB.
+    let parent_uuid = match global::get_parent(backend, child_uuid)? {
+        Some(p) => p,
+        None => {
+            // No parent — fall back to legacy behavior: propagate to global
+            // (system) context directly.
+            let global_scope = global::global_task_scope(backend)?;
+            task::add_task(
+                backend,
+                &global_scope,
+                name,
+                kind,
+                status,
+                description,
+                Some((child_uuid, task_uuid, task_commit)),
+            )?;
+            return Ok(());
+        }
+    };
+
+    // Find the TaskScope for the parent. The parent may be the user
+    // subcontext or another project — we need to resolve its scope.
+    let parent_scope = resolve_scope_for_uuid(backend, &parent_uuid)?;
+    let (shadow_uuid, shadow_commit) = task::add_task(
+        backend,
+        &parent_scope,
+        name,
+        kind,
+        status,
+        description,
+        Some((child_uuid, task_uuid, task_commit)),
+    )?;
+
+    // Recurse: propagate from parent to grandparent.
+    propagate_task_up(
+        backend,
+        &parent_uuid,
+        &shadow_uuid,
+        &shadow_commit,
+        name,
+        kind,
+        status,
+        description,
+    )
+}
+
+/// Resolve a TaskScope for a given UUID. Checks if it's the user subcontext
+/// or the system subcontext.
+fn resolve_scope_for_uuid(backend: &dyn Backend, uuid: &str) -> Result<task::TaskScope> {
+    // Check if it's the system (global) subcontext.
+    if let Ok(scope) = global::global_task_scope(backend) {
+        if scope.project_uuid == uuid {
+            return Ok(scope);
+        }
+    }
+    // Check if it's the user subcontext.
+    if let Ok(scope) = global::user_task_scope(backend) {
+        if scope.project_uuid == uuid {
+            return Ok(scope);
+        }
+    }
+    bail!(
+        "cannot resolve TaskScope for UUID {uuid} — only system and user subcontexts support receiving propagated tasks"
+    )
 }
 
 /// Resolve a path that may not exist yet (e.g., submodule destination) to be relative to root.
