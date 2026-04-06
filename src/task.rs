@@ -539,6 +539,292 @@ pub fn format_subtasks(tasks: &[TaskInfo], parent_name: Option<&str>) -> String 
     out
 }
 
+// ─── Task tree visualization ──────────────────────────────────────
+
+/// Filter mode for which tasks to include in a tree.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TreeFilter {
+    /// Only active tasks (not done/failed).
+    Active,
+    /// All tasks regardless of status.
+    All,
+    /// Only tasks matching a specific status.
+    Status(String),
+}
+
+/// Options controlling tree output size.
+#[derive(Debug, Clone)]
+pub struct TreeOptions {
+    pub filter: TreeFilter,
+    pub max_depth: Option<usize>,
+    pub max_breadth: Option<usize>,
+    pub max_size: Option<usize>,
+}
+
+impl Default for TreeOptions {
+    fn default() -> Self {
+        Self {
+            filter: TreeFilter::Active,
+            max_depth: None,
+            max_breadth: None,
+            max_size: None,
+        }
+    }
+}
+
+/// A node in the task tree, used for serialization.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct TaskTreeNode {
+    pub uuid: String,
+    pub name: String,
+    pub status: String,
+    pub kind: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<TaskTreeNode>,
+    #[serde(skip)]
+    truncated_children: usize,
+}
+
+/// Build a task tree starting from a given root (or all roots if None).
+pub fn build_task_tree(
+    scope: &TaskScope,
+    root_uuid: Option<&str>,
+    opts: &TreeOptions,
+) -> Result<Vec<TaskTreeNode>> {
+    let conn = open_db(scope)?;
+
+    // Load all tasks into memory for efficient tree building.
+    let all_tasks: Vec<(
+        String,
+        String,
+        String,
+        String,
+        Option<String>,
+        Option<String>,
+    )> = {
+        let mut stmt = conn.prepare(
+            "SELECT task_uuid, task_name, task_status, task_kind, task_description, parent_task_uuid \
+             FROM tasks ORDER BY task_name",
+        )?;
+        stmt.query_map([], |r| {
+            Ok((
+                r.get(0)?,
+                r.get(1)?,
+                r.get(2)?,
+                r.get(3)?,
+                r.get(4)?,
+                r.get(5)?,
+            ))
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
+
+    // Build parent -> children map.
+    let mut children_map: std::collections::HashMap<Option<String>, Vec<usize>> =
+        std::collections::HashMap::new();
+    for (i, (_uuid, _name, _status, _kind, _desc, parent)) in all_tasks.iter().enumerate() {
+        children_map.entry(parent.clone()).or_default().push(i);
+    }
+
+    let mut total_size: usize = 0;
+
+    fn build_node(
+        all_tasks: &[(
+            String,
+            String,
+            String,
+            String,
+            Option<String>,
+            Option<String>,
+        )],
+        children_map: &std::collections::HashMap<Option<String>, Vec<usize>>,
+        idx: usize,
+        opts: &TreeOptions,
+        depth: usize,
+        total_size: &mut usize,
+    ) -> Option<TaskTreeNode> {
+        let (ref uuid, ref name, ref status, ref kind, ref desc, _) = all_tasks[idx];
+
+        // Apply filter.
+        let included = match opts.filter {
+            TreeFilter::Active => status != "done" && status != "failed",
+            TreeFilter::All => true,
+            TreeFilter::Status(ref s) => status == s,
+        };
+        if !included {
+            return None;
+        }
+
+        // Check max_size.
+        if let Some(max) = opts.max_size {
+            if *total_size >= max {
+                return None;
+            }
+        }
+        *total_size += 1;
+
+        let mut children = Vec::new();
+        let mut truncated_children = 0;
+
+        // Recurse if depth allows.
+        let at_depth_limit = opts.max_depth.is_some_and(|d| depth >= d);
+        if !at_depth_limit {
+            if let Some(child_indices) = children_map.get(&Some(uuid.clone())) {
+                let mut count = 0;
+                for &ci in child_indices {
+                    if let Some(max_b) = opts.max_breadth {
+                        if count >= max_b {
+                            truncated_children = child_indices.len() - count;
+                            break;
+                        }
+                    }
+                    if let Some(max_s) = opts.max_size {
+                        if *total_size >= max_s {
+                            truncated_children = child_indices.len() - count;
+                            break;
+                        }
+                    }
+                    if let Some(child_node) =
+                        build_node(all_tasks, children_map, ci, opts, depth + 1, total_size)
+                    {
+                        children.push(child_node);
+                        count += 1;
+                    }
+                }
+            }
+        } else if let Some(child_indices) = children_map.get(&Some(uuid.clone())) {
+            // Count filtered children we're not showing due to depth.
+            truncated_children = child_indices
+                .iter()
+                .filter(|&&ci| {
+                    let ref st = all_tasks[ci].2;
+                    match opts.filter {
+                        TreeFilter::Active => st != "done" && st != "failed",
+                        TreeFilter::All => true,
+                        TreeFilter::Status(ref s) => st == s,
+                    }
+                })
+                .count();
+        }
+
+        Some(TaskTreeNode {
+            uuid: uuid.clone(),
+            name: name.clone(),
+            status: status.clone(),
+            kind: kind.clone(),
+            description: desc.clone(),
+            children,
+            truncated_children,
+        })
+    }
+
+    let mut roots = Vec::new();
+
+    match root_uuid {
+        Some(root) => {
+            // Find the specific root task index.
+            if let Some(idx) = all_tasks.iter().position(|(u, ..)| u == root) {
+                if let Some(node) =
+                    build_node(&all_tasks, &children_map, idx, opts, 0, &mut total_size)
+                {
+                    roots.push(node);
+                }
+            } else {
+                bail!("task '{root}' not found");
+            }
+        }
+        None => {
+            // All root tasks (no parent).
+            let root_indices: Vec<usize> = children_map.get(&None).cloned().unwrap_or_default();
+            for idx in root_indices {
+                if let Some(max_s) = opts.max_size {
+                    if total_size >= max_s {
+                        break;
+                    }
+                }
+                if let Some(node) =
+                    build_node(&all_tasks, &children_map, idx, opts, 0, &mut total_size)
+                {
+                    roots.push(node);
+                }
+            }
+        }
+    }
+
+    Ok(roots)
+}
+
+/// Render a task tree as JSON.
+pub fn tree_to_json(nodes: &[TaskTreeNode]) -> Result<String> {
+    Ok(serde_json::to_string_pretty(nodes)?)
+}
+
+/// Render a task tree as a Mermaid flowchart.
+pub fn tree_to_mermaid(nodes: &[TaskTreeNode]) -> String {
+    let mut out = String::from("graph TD\n");
+    let mut counter: usize = 0;
+
+    fn mermaid_id(counter: &mut usize) -> String {
+        let id = format!("n{counter}");
+        *counter += 1;
+        id
+    }
+
+    fn status_class(status: &str) -> &str {
+        match status {
+            "done" => ":::done",
+            "failed" => ":::failed",
+            "active" => ":::active",
+            "created" => ":::created",
+            "inactive" => ":::inactive",
+            _ => "",
+        }
+    }
+
+    fn emit_node(out: &mut String, node: &TaskTreeNode, counter: &mut usize) -> String {
+        let id = mermaid_id(counter);
+        let label = node.name.replace('"', "'");
+        let cls = status_class(&node.status);
+        out.push_str(&format!(
+            "    {id}[\"{label} [{status}]\"]{cls}\n",
+            status = node.status
+        ));
+
+        for child in &node.children {
+            let child_id = emit_node(out, child, counter);
+            out.push_str(&format!("    {id} --> {child_id}\n"));
+        }
+
+        if node.truncated_children > 0 {
+            let trunc_id = mermaid_id(counter);
+            out.push_str(&format!(
+                "    {trunc_id}[\"... +{} more\"]:::truncated\n",
+                node.truncated_children
+            ));
+            out.push_str(&format!("    {id} --> {trunc_id}\n"));
+        }
+
+        id
+    }
+
+    for node in nodes {
+        emit_node(&mut out, node, &mut counter);
+    }
+
+    // Add class definitions.
+    out.push_str("    classDef done fill:#90EE90,stroke:#228B22\n");
+    out.push_str("    classDef failed fill:#FFB6C1,stroke:#DC143C\n");
+    out.push_str("    classDef active fill:#87CEEB,stroke:#4682B4\n");
+    out.push_str("    classDef created fill:#FFFACD,stroke:#DAA520\n");
+    out.push_str("    classDef inactive fill:#D3D3D3,stroke:#808080\n");
+    out.push_str("    classDef truncated fill:#F5F5F5,stroke:#C0C0C0,stroke-dasharray: 5 5\n");
+
+    out
+}
+
 pub fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
     run_work_git(backend, &["add", "-A"], state)?;
     let status = run_work_git(backend, &["status", "--porcelain"], state)?;

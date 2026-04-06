@@ -282,6 +282,27 @@ enum TaskCommand {
     },
     /// List root task UUIDs (tasks with no parent)
     Roots,
+    /// Visualize the task tree as JSON or Mermaid
+    #[command(name = "tree")]
+    Tree {
+        /// Output format: json or mermaid (default: json)
+        #[arg(long, default_value = "json")]
+        format: String,
+        /// Filter: active (default, excludes done/failed), all, or a specific status
+        #[arg(long, default_value = "active")]
+        filter: String,
+        /// Maximum tree depth
+        #[arg(long)]
+        max_depth: Option<usize>,
+        /// Maximum children per node
+        #[arg(long)]
+        max_breadth: Option<usize>,
+        /// Maximum total nodes in output
+        #[arg(long)]
+        max_size: Option<usize>,
+        /// Root task (name/path or UUID). Omit for all roots.
+        root: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -777,6 +798,42 @@ fn main() -> Result<()> {
                     } else {
                         for uuid in &uuids {
                             println!("{uuid}");
+                        }
+                    }
+                }
+                TaskCommand::Tree {
+                    format,
+                    filter,
+                    max_depth,
+                    max_breadth,
+                    max_size,
+                    root,
+                } => {
+                    let tree_filter = match filter.as_str() {
+                        "active" => task::TreeFilter::Active,
+                        "all" => task::TreeFilter::All,
+                        other => task::TreeFilter::Status(other.to_string()),
+                    };
+                    let opts = task::TreeOptions {
+                        filter: tree_filter,
+                        max_depth,
+                        max_breadth,
+                        max_size,
+                    };
+                    let root_uuid = match root {
+                        Some(ref r) => Some(task::resolve_task_uuid(backend, &scope, r)?),
+                        None => None,
+                    };
+                    let tree = task::build_task_tree(&scope, root_uuid.as_deref(), &opts)?;
+                    match format.as_str() {
+                        "json" => {
+                            println!("{}", task::tree_to_json(&tree)?);
+                        }
+                        "mermaid" => {
+                            print!("{}", task::tree_to_mermaid(&tree));
+                        }
+                        other => {
+                            bail!("unknown format '{other}': expected 'json' or 'mermaid'");
                         }
                     }
                 }

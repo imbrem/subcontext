@@ -93,6 +93,49 @@ Tasks can be referenced by hierarchical paths:
 - `name/child` -- nested
 - `/name` -- absolute (via namespace)
 
+### Task tree visualization
+
+View the full task hierarchy as JSON or Mermaid:
+
+```bash
+# JSON output (default), active tasks only
+subcontext task tree
+
+# Mermaid flowchart
+subcontext task tree --format mermaid
+
+# Include all tasks (done/failed too)
+subcontext task tree --filter all
+
+# Only show tasks with a specific status
+subcontext task tree --filter created
+
+# Limit tree size
+subcontext task tree --max-depth 3 --max-breadth 5 --max-size 50
+
+# Tree rooted at a specific task
+subcontext task tree my-task
+
+# Combine options
+subcontext task tree --format mermaid --filter all --max-depth 2 sprint-1
+```
+
+**Formats:**
+- `json` -- structured JSON array of tree nodes (default)
+- `mermaid` -- Mermaid `graph TD` flowchart with status-colored nodes
+
+**Filters:**
+- `active` -- exclude done/failed tasks (default)
+- `all` -- include everything
+- Any status name (e.g. `created`, `done`, `failed`) -- only that status
+
+**Limits:**
+- `--max-depth N` -- stop descending after N levels
+- `--max-breadth N` -- show at most N children per node
+- `--max-size N` -- cap total nodes in the output
+
+Works with `--global`, `--user`, and `--local` scope flags.
+
 ### Scope flags
 
 - `--global` -- system-level subcontext
