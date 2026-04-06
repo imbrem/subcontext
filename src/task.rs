@@ -1766,7 +1766,7 @@ pub fn add_task_from_md(
         Some((ctx, _, _)) => ctx.to_string(),
         None => scope.host_branch.clone(),
     };
-    let task_uuid = Uuid::new_v4().to_string();
+    let task_uuid = fm.get("uuid").unwrap_or_else(|| Uuid::new_v4().to_string());
     let kind_str = kind.as_deref().unwrap_or(DEFAULT_KIND);
     let status_str = status.as_deref().unwrap_or(DEFAULT_STATUS);
 
@@ -1845,6 +1845,9 @@ pub fn add_task_from_md(
         let mut regenerated_lines = vec!["---".to_string()];
         regenerated_lines.push(format!("uuid: {}", task_uuid));
         for (k, v) in &pairs {
+            if k == "uuid" {
+                continue;
+            }
             regenerated_lines.push(format!("{}: {}", k, v));
         }
         if !task_data.subtasks.is_empty() {

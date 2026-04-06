@@ -14,6 +14,7 @@ and running the appropriate subcontext command.
 
 ```markdown
 ---
+uuid: <optional UUID; if provided, the task uses this UUID instead of generating a new one>
 title: <optional display title>
 kind: <task|goal|todo|tick>
 status: <created|active|inactive>
