@@ -30,17 +30,24 @@ impl<'a> GitInvocation<'a> {
     }
 }
 
-/// Abstraction over all git + filesystem side effects.
+/// Abstraction over all git + dolt + filesystem side effects.
 ///
 /// Keep the surface narrow and close to the underlying primitives — higher
-/// level helpers live in `git.rs` / `overlay.rs` and are built on top of this
-/// trait.
+/// level helpers live in `git.rs` / `overlay.rs` / `dolt.rs` and are built
+/// on top of this trait.
 pub trait Backend {
     // ─── Git ─────────────────────────────────────────────────────────
 
     /// Run `git` with the given invocation. Returns stdout trimmed.
     /// Returns an error if git exits with a non-zero status.
     fn git(&self, inv: &GitInvocation<'_>) -> Result<String>;
+
+    // ─── Dolt ────────────────────────────────────────────────────────
+
+    /// Run `dolt <args>` in the given directory. Returns stdout trimmed.
+    /// The default implementation looks for a `dolt` binary at
+    /// `~/.subcontext/bin/dolt`, then falls back to `dolt` on PATH.
+    fn dolt(&self, args: &[&str], cwd: &Path) -> Result<String>;
 
     // ─── High-level git helpers ──────────────────────────────────────
     //
@@ -160,6 +167,28 @@ pub trait Backend {
 /// Real backend: shells out to `git` and uses `std::fs` / `std::process`.
 pub struct SystemBackend;
 
+impl SystemBackend {
+    /// Find the dolt binary: check `~/.subcontext/bin/dolt` first, then PATH.
+    fn find_dolt_bin() -> Result<PathBuf> {
+        if let Ok(home) = std::env::var("HOME") {
+            let p = PathBuf::from(home).join(".subcontext/bin/dolt");
+            if p.is_file() {
+                return Ok(p);
+            }
+        }
+        // Fall back to PATH
+        if let Ok(output) = Command::new("which").arg("dolt").output() {
+            if output.status.success() {
+                let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+                if !s.is_empty() {
+                    return Ok(PathBuf::from(s));
+                }
+            }
+        }
+        bail!("dolt binary not found")
+    }
+}
+
 impl Backend for SystemBackend {
     fn git(&self, inv: &GitInvocation<'_>) -> Result<String> {
         let mut cmd = Command::new("git");
@@ -180,6 +209,27 @@ impl Backend for SystemBackend {
             bail!(
                 "git {} failed (exit {}): {}",
                 inv.args.join(" "),
+                output.status,
+                stderr.trim()
+            );
+        }
+
+        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    fn dolt(&self, args: &[&str], cwd: &Path) -> Result<String> {
+        let dolt_bin = Self::find_dolt_bin()?;
+        let output = Command::new(&dolt_bin)
+            .args(args)
+            .current_dir(cwd)
+            .output()
+            .with_context(|| format!("failed to execute dolt {}", args.join(" ")))?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            bail!(
+                "dolt {} failed (exit {}): {}",
+                args.join(" "),
                 output.status,
                 stderr.trim()
             );

@@ -706,9 +706,10 @@ fn main() -> Result<()> {
                                 "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
                                 &[commit.as_str(), scope.project_uuid.as_str()],
                             )?;
-                            task::dolt_commit_and_track(
+                            task::dolt_commit_and_track_with(
                                 backend,
                                 &global_scope,
+                                &conn,
                                 &format!("object update: {}", scope.project_uuid),
                             )?;
                         }

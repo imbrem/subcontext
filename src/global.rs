@@ -522,9 +522,10 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
         let global_scope = global_task_scope(backend)?;
         let conn = crate::task::open_db(&global_scope)?;
         crate::task::insert_object(&conn, &user_uuid, "managed", &commit, None)?;
-        crate::task::dolt_commit_and_track(
+        crate::task::dolt_commit_and_track_with(
             backend,
             &global_scope,
+            &conn,
             &format!("object add: {user_uuid}"),
         )?;
     }
@@ -535,19 +536,20 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
     ensure_global_extra_schema(&conn)?;
     let existing: Option<String> = conn
         .query_row(
-            "SELECT value FROM config WHERE `key` = 'current_user'",
+            "SELECT value FROM config WHERE `key_name` = 'current_user'",
             &[],
             |row| row.get::<Option<String>>(0),
         )?
         .flatten();
     if existing.is_none() {
         conn.execute(
-            "REPLACE INTO config (`key`, value) VALUES (?1, ?2)",
+            "REPLACE INTO config (`key_name`, value) VALUES (?1, ?2)",
             &[&"current_user", &user_uuid.as_str()],
         )?;
-        crate::task::dolt_commit_and_track(
+        crate::task::dolt_commit_and_track_with(
             backend,
             &global_scope,
+            &conn,
             &format!("set current user: {user_uuid}"),
         )?;
         eprintln!("[subcontext] Set current user to {user_uuid}.");
@@ -598,7 +600,7 @@ pub fn get_current_user(backend: &dyn Backend) -> Result<Option<String>> {
     ensure_global_extra_schema(&conn)?;
     let val: Option<String> = conn
         .query_row(
-            "SELECT value FROM config WHERE `key` = 'current_user'",
+            "SELECT value FROM config WHERE `key_name` = 'current_user'",
             &[],
             |row| row.get::<Option<String>>(0),
         )?
@@ -646,10 +648,15 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
     }
 
     conn.execute(
-        "REPLACE INTO config (`key`, value) VALUES (?1, ?2)",
+        "REPLACE INTO config (`key_name`, value) VALUES (?1, ?2)",
         &[&"current_user", uuid],
     )?;
-    crate::task::dolt_commit_and_track(backend, &scope, &format!("set current user: {uuid}"))?;
+    crate::task::dolt_commit_and_track_with(
+        backend,
+        &scope,
+        &conn,
+        &format!("set current user: {uuid}"),
+    )?;
     eprintln!("[subcontext] Current user set to {uuid}.");
     Ok(())
 }
@@ -681,9 +688,10 @@ pub fn set_parent(backend: &dyn Backend, child_uuid: &str, parent_uuid: &str) ->
         "INSERT INTO parents (child_uuid, parent_uuid) VALUES (?1, ?2)",
         &[child_uuid, parent_uuid],
     )?;
-    crate::task::dolt_commit_and_track(
+    crate::task::dolt_commit_and_track_with(
         backend,
         &scope,
+        &conn,
         &format!("set parent of {child_uuid} to {parent_uuid}"),
     )?;
     Ok(())

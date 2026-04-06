@@ -96,9 +96,10 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
         if let Ok(global_scope) = global::global_task_scope(backend) {
             let conn = task::open_db(&global_scope)?;
             task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-            task::dolt_commit_and_track(
+            task::dolt_commit_and_track_with(
                 backend,
                 &global_scope,
+                &conn,
                 &format!("object add: {project_uuid}"),
             )?;
         }
@@ -137,9 +138,10 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
                 )?;
                 let conn = task::open_db(&user_scope)?;
                 task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-                task::dolt_commit_and_track(
+                task::dolt_commit_and_track_with(
                     backend,
                     &user_scope,
+                    &conn,
                     &format!("object add: {project_uuid}"),
                 )?;
             }
