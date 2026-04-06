@@ -3156,3 +3156,443 @@ fn board_task_done_updates_board_tree() {
 
     cleanup(&root);
 }
+
+#[test]
+fn board_move_task_changes_parent() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    // Add two direct subtasks: project-a and project-b.
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "project-a", "--board", &board_uuid],
+    );
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "project-b", "--board", &board_uuid],
+    );
+
+    // Add a child under project-a.
+    let show_out = subcontext(&root, &["task", "show", "project-a"]);
+    let stderr = String::from_utf8_lossy(&show_out.stderr);
+    let project_a_uuid = stderr
+        .split("Task UUID: ")
+        .nth(1)
+        .and_then(|s| s.lines().next())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "child-task",
+            "--board",
+            &board_uuid,
+            "--parent",
+            &project_a_uuid,
+        ],
+    );
+
+    // Verify child-task is under project-a.
+    let child_md = git_in_repo(
+        &root,
+        &[
+            "show",
+            &format!("object/{board_uuid}:project-a/child-task/TASK.md"),
+        ],
+    );
+    assert!(child_md.contains("uuid:"), "child should exist: {child_md}");
+
+    // Get child-task UUID.
+    let show_out2 = subcontext(&root, &["task", "show", "child-task"]);
+    let stderr2 = String::from_utf8_lossy(&show_out2.stderr);
+    let child_uuid = stderr2
+        .split("Task UUID: ")
+        .nth(1)
+        .and_then(|s| s.lines().next())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Get project-b UUID.
+    let show_out3 = subcontext(&root, &["task", "show", "project-b"]);
+    let stderr3 = String::from_utf8_lossy(&show_out3.stderr);
+    let project_b_uuid = stderr3
+        .split("Task UUID: ")
+        .nth(1)
+        .and_then(|s| s.lines().next())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Move child-task from project-a to project-b.
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "move-task",
+            &child_uuid,
+            "--parent",
+            &project_b_uuid,
+            "--board",
+            &board_uuid,
+        ],
+    );
+
+    // child-task should now be under project-b.
+    let moved_md = git_in_repo(
+        &root,
+        &[
+            "show",
+            &format!("object/{board_uuid}:project-b/child-task/TASK.md"),
+        ],
+    );
+    assert!(
+        moved_md.contains("uuid:"),
+        "child should be under project-b: {moved_md}"
+    );
+    // The UUID should be preserved.
+    assert!(
+        moved_md.contains(&child_uuid),
+        "UUID should be preserved after move: {moved_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_delete_task_removes_from_tree() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    // Add a subtask.
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "doomed-task",
+            "--board",
+            &board_uuid,
+            "--description",
+            "This will be deleted",
+        ],
+    );
+
+    // Verify it exists.
+    let task_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:doomed-task/TASK.md")],
+    );
+    assert!(task_md.contains("uuid:"), "task should exist: {task_md}");
+
+    // Get UUID.
+    let show_out = subcontext(&root, &["task", "show", "doomed-task"]);
+    let stderr = String::from_utf8_lossy(&show_out.stderr);
+    let task_uuid = stderr
+        .split("Task UUID: ")
+        .nth(1)
+        .and_then(|s| s.lines().next())
+        .unwrap()
+        .trim()
+        .to_string();
+
+    // Delete it.
+    subcontext_ok(
+        &root,
+        &["board", "delete-task", &task_uuid, "--board", &board_uuid],
+    );
+
+    // The tree should no longer have doomed-task/TASK.md.
+    let ls_out = git_in_repo(
+        &root,
+        &[
+            "ls-tree",
+            "-r",
+            "--name-only",
+            &format!("object/{board_uuid}"),
+        ],
+    );
+    assert!(
+        !ls_out.contains("doomed-task"),
+        "doomed-task should be gone: {ls_out}"
+    );
+
+    // The task should also not be in the DB (task show should fail).
+    let show_after = subcontext(&root, &["task", "show", &task_uuid]);
+    assert!(
+        !show_after.status.success(),
+        "task show should fail after delete"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_pull_push_roundtrip() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    // Add some tasks to the board.
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "task-one",
+            "--board",
+            &board_uuid,
+            "--description",
+            "First task",
+        ],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "task-two",
+            "--board",
+            &board_uuid,
+            "--description",
+            "Second task",
+        ],
+    );
+
+    // Pull the board into the overlay.
+    subcontext_ok(&root, &["board", "pull", &board_uuid, "--path", "tasks/"]);
+
+    // Check that files appeared in the working tree.
+    assert!(
+        root.join("tasks/TASK.md").exists(),
+        "root TASK.md should exist in overlay"
+    );
+    assert!(
+        root.join("tasks/task-one/TASK.md").exists(),
+        "task-one/TASK.md should exist in overlay"
+    );
+    assert!(
+        root.join("tasks/task-two/TASK.md").exists(),
+        "task-two/TASK.md should exist in overlay"
+    );
+    assert!(
+        root.join("tasks/.board.json").exists(),
+        ".board.json config should exist"
+    );
+
+    // Modify a task in the overlay (simulating agent editing).
+    let task_one_path = root.join("tasks/task-one/TASK.md");
+    let original = fs::read_to_string(&task_one_path).unwrap();
+    let modified = original.replace("status: created", "status: active");
+    fs::write(&task_one_path, &modified).unwrap();
+
+    // Push changes back.
+    subcontext_ok(&root, &["board", "push", "--path", "tasks/"]);
+
+    // Verify the board tree was updated.
+    let board_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:task-one/TASK.md")],
+    );
+    assert!(
+        board_md.contains("status: active"),
+        "board should reflect pushed changes: {board_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_pull_filter_done() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "active-task", "--board", &board_uuid],
+    );
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "done-task", "--board", &board_uuid],
+    );
+
+    // Mark done-task as done.
+    subcontext_ok(&root, &["task", "set", "work"]);
+    subcontext_ok(&root, &["task", "done", "done-task"]);
+
+    // Pull with --filter-done.
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "pull",
+            &board_uuid,
+            "--path",
+            "tasks/",
+            "--filter-done",
+        ],
+    );
+
+    // active-task should be present, done-task should NOT be.
+    assert!(
+        root.join("tasks/active-task/TASK.md").exists(),
+        "active-task should be in overlay"
+    );
+    assert!(
+        !root.join("tasks/done-task/TASK.md").exists(),
+        "done-task should be filtered out"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_push_mark_done_on_delete() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "keep-task", "--board", &board_uuid],
+    );
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "finish-task", "--board", &board_uuid],
+    );
+
+    // Pull.
+    subcontext_ok(&root, &["board", "pull", &board_uuid, "--path", "tasks/"]);
+
+    // "Delete" finish-task from overlay by removing its directory.
+    fs::remove_dir_all(root.join("tasks/finish-task")).unwrap();
+    // Also remove from overlay git tracking.
+    let work_dir = root.join(".git/.subcontext/work");
+    if work_dir.exists() {
+        let _ = Command::new("git")
+            .args(["rm", "-rf", "tasks/finish-task"])
+            .envs(test_env())
+            .env("GIT_DIR", work_dir.join(".git"))
+            .env("GIT_WORK_TREE", &work_dir)
+            .current_dir(&work_dir)
+            .output();
+    }
+
+    // Push with --mark-done.
+    subcontext_ok(&root, &["board", "push", "--path", "tasks/", "--mark-done"]);
+
+    // finish-task should still be in the board tree but marked as done.
+    let board_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:finish-task/TASK.md")],
+    );
+    assert!(
+        board_md.contains("status: done"),
+        "deleted task should be marked done: {board_md}"
+    );
+
+    // keep-task should still be created.
+    let keep_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:keep-task/TASK.md")],
+    );
+    assert!(
+        keep_md.contains("status: created"),
+        "kept task should still be created: {keep_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_commit_generates_missing_uuids() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    // Manually inject a TASK.md without a uuid into the board tree via
+    // board pull → create file → board push.
+    subcontext_ok(&root, &["board", "pull", &board_uuid, "--path", "tasks/"]);
+
+    // Create a new subtask directory with a TASK.md that has NO uuid.
+    let new_task_dir = root.join("tasks/no-uuid-task");
+    fs::create_dir_all(&new_task_dir).unwrap();
+    let task_content = "---\nkind: todo\nstatus: created\ndescription: I have no UUID\n---\n";
+    fs::write(new_task_dir.join("TASK.md"), task_content).unwrap();
+
+    // Also write into the overlay work dir and git-add it.
+    let work_dir = root.join(".git/.subcontext/work");
+    let work_task_dir = work_dir.join("tasks/no-uuid-task");
+    fs::create_dir_all(&work_task_dir).unwrap();
+    fs::write(work_task_dir.join("TASK.md"), task_content).unwrap();
+    // Add to overlay git tracking.
+    let git_dir = work_dir.join(".git");
+    Command::new("git")
+        .args(["add", "tasks/no-uuid-task/TASK.md"])
+        .envs(test_env())
+        .env("GIT_DIR", &git_dir)
+        .env("GIT_WORK_TREE", &work_dir)
+        .current_dir(&work_dir)
+        .output()
+        .unwrap();
+
+    // Push to get it into the board tree.
+    subcontext_ok(&root, &["board", "push", "--path", "tasks/"]);
+
+    // After push (which calls board_commit), the TASK.md should now have a uuid.
+    let task_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:no-uuid-task/TASK.md")],
+    );
+    assert!(
+        task_md.contains("uuid:"),
+        "TASK.md should have a generated uuid after commit: {task_md}"
+    );
+
+    // Running board commit again should produce the SAME uuid (stable).
+    subcontext_ok(&root, &["board", "commit", &board_uuid]);
+    let task_md2 = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:no-uuid-task/TASK.md")],
+    );
+    assert_eq!(task_md, task_md2, "uuid should be stable across commits");
+
+    cleanup(&root);
+}

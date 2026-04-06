@@ -341,6 +341,48 @@ enum BoardCommand {
         /// Board UUID
         uuid: String,
     },
+    /// Delete a task from a board
+    DeleteTask {
+        /// Task UUID to delete
+        task: String,
+        /// Board UUID
+        #[arg(long)]
+        board: String,
+    },
+    /// Move a task to a new parent within a board
+    MoveTask {
+        /// Task UUID to move
+        task: String,
+        /// New parent task UUID
+        #[arg(long)]
+        parent: String,
+        /// Board UUID
+        #[arg(long)]
+        board: String,
+    },
+    /// Pull a board's tasks into the overlay (materializes files in working tree)
+    Pull {
+        /// Board UUID (or name/path)
+        board: String,
+        /// Overlay directory prefix (default: "tasks/")
+        #[arg(long, default_value = "tasks/")]
+        path: String,
+        /// Only pull a specific subtask's subtree
+        #[arg(long)]
+        task: Option<String>,
+        /// Exclude done/failed tasks
+        #[arg(long)]
+        filter_done: bool,
+    },
+    /// Push overlay task files back to the board branch
+    Push {
+        /// Overlay directory prefix (default: "tasks/")
+        #[arg(long, default_value = "tasks/")]
+        path: String,
+        /// Mark deleted tasks as done instead of removing them
+        #[arg(long)]
+        mark_done: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -818,6 +860,59 @@ fn main() -> Result<()> {
                 }
                 BoardCommand::Commit { uuid } => {
                     task::board_commit(backend, &scope, &uuid)?;
+                }
+                BoardCommand::DeleteTask { task, board } => {
+                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let task_uuid = task::resolve_task_uuid(backend, &scope, &task)?;
+                    task::delete_task_from_board(backend, &scope, &task_uuid, &board_uuid)?;
+                }
+                BoardCommand::MoveTask {
+                    task,
+                    parent,
+                    board,
+                } => {
+                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let task_uuid = task::resolve_task_uuid(backend, &scope, &task)?;
+                    let parent_uuid = task::resolve_task_uuid(backend, &scope, &parent)?;
+                    task::move_task_in_board(
+                        backend,
+                        &scope,
+                        &task_uuid,
+                        &parent_uuid,
+                        &board_uuid,
+                    )?;
+                }
+                BoardCommand::Pull {
+                    board,
+                    path,
+                    task: task_filter,
+                    filter_done,
+                } => {
+                    let root = local_root
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("board pull requires a local git repo"))?;
+                    let ctx = CheckoutContext::main_only(root);
+                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let root_task = match task_filter {
+                        Some(ref t) => Some(task::resolve_task_uuid(backend, &scope, t)?),
+                        None => None,
+                    };
+                    task::board_pull(
+                        backend,
+                        &scope,
+                        &ctx,
+                        &board_uuid,
+                        &path,
+                        root_task.as_deref(),
+                        filter_done,
+                    )?;
+                }
+                BoardCommand::Push { path, mark_done } => {
+                    let root = local_root
+                        .as_ref()
+                        .ok_or_else(|| anyhow::anyhow!("board push requires a local git repo"))?;
+                    let ctx = CheckoutContext::main_only(root);
+                    task::board_push(backend, &scope, &ctx, &path, mark_done)?;
                 }
             }
         }
