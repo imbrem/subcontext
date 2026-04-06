@@ -37,6 +37,40 @@ fn test_path() -> OsString {
     path
 }
 
+/// Run a dolt SQL query against a dolt repo directory and return stdout.
+fn dolt_sql(dolt_dir: &Path, sql: &str) -> String {
+    // Find dolt binary
+    let home = std::env::var("HOME").unwrap();
+    let dolt_bin = PathBuf::from(&home).join(".subcontext/bin/dolt");
+    let dolt_path = if dolt_bin.exists() {
+        dolt_bin
+    } else {
+        PathBuf::from("dolt")
+    };
+    let output = Command::new(&dolt_path)
+        .args(["sql", "-r", "csv", "-q", sql])
+        .current_dir(dolt_dir)
+        .env("DOLT_ROOT_PATH", dolt_dir)
+        .output()
+        .expect("failed to run dolt sql");
+    assert!(
+        output.status.success(),
+        "dolt sql failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Query a single integer value from a dolt repo (e.g. COUNT(*)).
+fn dolt_count(dolt_dir: &Path, sql: &str) -> i64 {
+    let output = dolt_sql(dolt_dir, sql);
+    let lines: Vec<&str> = output.trim().lines().collect();
+    if lines.len() < 2 {
+        return 0;
+    }
+    lines[1].trim().parse().unwrap_or(0)
+}
+
 fn test_env() -> Vec<(OsString, OsString)> {
     vec![
         (OsString::from("PATH"), test_path()),
@@ -679,8 +713,8 @@ fn install_global_creates_subcontext_directory_with_user_kind() {
     assert!(yaml.contains("kind: system"), "yaml: {yaml}");
     assert!(yaml.contains("project_uuid:"));
 
-    // state/tasks.db exists
-    assert!(global_path.join("global/state/tasks.db").exists());
+    // dolt database exists
+    assert!(global_path.join("global/dolt/.dolt").is_dir());
 
     // Re-running is idempotent.
     let out2 = subcontext_with_global(&fake_home, &global_path, &["install", "--global"]);
@@ -1584,10 +1618,10 @@ fn install_writes_project_config_and_state_branch() {
     assert!(cfg.contains("kind: project"));
     assert!(cfg.contains("version: 0.0.0"));
 
-    // State branch + worktree + tasks.db exist
+    // State branch + worktree + Dolt database exist
     let branches = git_in_repo(&root, &["branch", "--list", "state"]);
     assert!(branches.contains("state"));
-    assert!(root.join(".git/.subcontext/state/tasks.db").exists());
+    assert!(root.join(".git/.subcontext/dolt/.dolt").is_dir());
 
     cleanup(&root);
 }
@@ -1790,33 +1824,38 @@ fn task_add_creates_shadow_task_in_global() {
         "expected shadow task message, got: {stderr}"
     );
 
-    // Verify the shadow row in the global tasks.db via the objects table.
-    let global_state_db = global_path.join("global/state/tasks.db");
-    let conn = rusqlite::Connection::open(&global_state_db).unwrap();
+    // Verify the shadow row in the global dolt database via the objects table.
+    let dolt_repo = global_path.join("global/dolt");
 
     // The shadow lives under the origin project UUID as its task_names
     // namespace, so the name doesn't collide with global-only tasks.
-    let (branch_name, task_uuid): (String, String) = conn
-        .query_row(
-            "SELECT branch_name, task_uuid FROM task_names WHERE task_name = 'plan-feature'",
-            [],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .unwrap();
+    let csv = dolt_sql(
+        &dolt_repo,
+        "SELECT branch_name, task_uuid FROM task_names WHERE task_name = 'plan-feature'",
+    );
+    let lines: Vec<&str> = csv.trim().lines().collect();
+    assert!(lines.len() >= 2, "expected result row, got: {csv}");
+    let fields: Vec<&str> = lines[1].split(',').collect();
+    let branch_name = fields[0].to_string();
+    let task_uuid = fields[1].to_string();
     assert_eq!(branch_name, project_uuid);
 
     // Check the objects table has source info for the shadow task.
-    let (obj_type, source_context_uuid, source_object_uuid): (String, String, String) = conn
-        .query_row(
-            "SELECT type, source_context_uuid, source_object_uuid FROM objects WHERE uuid = ?1",
-            [&task_uuid],
-            |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
-        )
-        .expect("shadow task object row missing");
+    let csv2 = dolt_sql(
+        &dolt_repo,
+        &format!(
+            "SELECT `type`, source_context_uuid, source_object_uuid FROM objects WHERE uuid = '{task_uuid}'"
+        ),
+    );
+    let lines2: Vec<&str> = csv2.trim().lines().collect();
+    assert!(lines2.len() >= 2, "shadow task object row missing: {csv2}");
+    let fields2: Vec<&str> = lines2[1].split(',').collect();
+    let obj_type = fields2[0].to_string();
+    let source_context_uuid = fields2[1].to_string();
+    let source_object_uuid = fields2[2].to_string();
     assert_eq!(obj_type, "task");
     assert_eq!(source_context_uuid, project_uuid);
     assert!(!source_object_uuid.is_empty());
-    drop(conn);
 
     // object.json now has checkout_path in the data pointing to the child's .git.
     let global_repo = global_path.join("global/repo");
@@ -1866,15 +1905,11 @@ fn task_add_local_skips_shadow() {
     );
     assert!(out.status.success());
 
-    let global_state_db = global_path.join("global/state/tasks.db");
-    let conn = rusqlite::Connection::open(&global_state_db).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE task_name = 'private-task'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let dolt_repo = global_path.join("global/dolt");
+    let count = dolt_count(
+        &dolt_repo,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'private-task'",
+    );
     assert_eq!(count, 0, "--local should not create shadow task");
 
     cleanup(&fake_home);
@@ -2067,18 +2102,13 @@ fn task_propagates_to_user_context_not_global() {
     // Add a task in the project.
     subcontext_with_global_ok(&root, &global_path, &["task", "add", "my-task"]);
 
-    // The shadow should appear in the user subcontext's tasks.db.
-    let user_db = global_path.join("user/state/tasks.db");
-    let conn = rusqlite::Connection::open(&user_db).unwrap();
-    let count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE task_name = 'my-task'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    // The shadow should appear in the user subcontext's dolt database.
+    let user_dolt = global_path.join("user/dolt");
+    let count = dolt_count(
+        &user_dolt,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'my-task'",
+    );
     assert!(count > 0, "task should be propagated to user context");
-    drop(conn);
 
     cleanup(&fake_home);
     cleanup(&global_path);
@@ -2111,49 +2141,34 @@ fn task_propagation_is_recursive() {
     subcontext_with_global_ok(&root, &global_path, &["task", "add", "recursive-task"]);
 
     // 5. Verify the task exists in the project's local DB.
-    let local_db = root.join(".git/.subcontext/state/tasks.db");
-    let conn = rusqlite::Connection::open(&local_db).unwrap();
-    let local_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let local_dolt = root.join(".git/.subcontext/dolt");
+    let local_count = dolt_count(
+        &local_dolt,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+    );
     assert_eq!(local_count, 1, "task should exist locally");
-    drop(conn);
 
     // 6. Verify the task propagated to the user context.
-    let user_db = global_path.join("user/state/tasks.db");
-    let conn = rusqlite::Connection::open(&user_db).unwrap();
-    let user_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let user_dolt = global_path.join("user/dolt");
+    let user_count = dolt_count(
+        &user_dolt,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+    );
     assert!(
         user_count > 0,
         "task should propagate to user context (got {user_count})"
     );
-    drop(conn);
 
     // 7. Verify the task propagated to the system (global) context.
-    let global_db = global_path.join("global/state/tasks.db");
-    let conn = rusqlite::Connection::open(&global_db).unwrap();
-    let global_count: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
-            [],
-            |r| r.get(0),
-        )
-        .unwrap();
+    let global_dolt = global_path.join("global/dolt");
+    let global_count = dolt_count(
+        &global_dolt,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+    );
     assert!(
         global_count > 0,
         "task should propagate recursively to global/system context (got {global_count})"
     );
-    drop(conn);
 
     cleanup(&fake_home);
     cleanup(&global_path);
@@ -3824,6 +3839,167 @@ fn task_tree_invalid_format() {
 
     let out = subcontext(&root, &["task", "tree", "--format", "xml"]);
     assert!(!out.status.success());
+
+    cleanup(&root);
+}
+
+// ─── Dolt-specific tests ─────────────────────────────────────────────
+
+#[test]
+fn dolt_mysql_server_creates_schema_tables() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // Verify all expected tables exist by querying them via dolt sql CLI
+    let tables = dolt_sql(&dolt_dir, "SHOW TABLES");
+    assert!(tables.contains("tasks"), "missing tasks table: {tables}");
+    assert!(
+        tables.contains("task_names"),
+        "missing task_names table: {tables}"
+    );
+    assert!(
+        tables.contains("objects"),
+        "missing objects table: {tables}"
+    );
+    assert!(
+        tables.contains("branch_tasks"),
+        "missing branch_tasks table: {tables}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_task_add_persists_via_mysql() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "mysql-test-task", "--kind", "todo"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // Task should be in the database
+    let count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'mysql-test-task'",
+    );
+    assert_eq!(count, 1, "expected 1 task named mysql-test-task");
+
+    // Task should have correct kind
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT task_kind FROM tasks WHERE task_name = 'mysql-test-task'",
+    );
+    assert!(csv.contains("todo"), "expected kind=todo, got: {csv}");
+
+    // task_names entry should exist
+    let names_count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM task_names WHERE task_name = 'mysql-test-task'",
+    );
+    assert_eq!(names_count, 1, "expected 1 task_names entry");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_commit_history_tracks_changes() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Get initial commit count
+    let initial_commits = dolt_count(
+        &root.join(".git/.subcontext/dolt"),
+        "SELECT COUNT(*) FROM dolt_log",
+    );
+
+    subcontext_ok(&root, &["task", "add", "first-task"]);
+
+    let after_add = dolt_count(
+        &root.join(".git/.subcontext/dolt"),
+        "SELECT COUNT(*) FROM dolt_log",
+    );
+
+    // Adding a task should create at least one new dolt commit
+    assert!(
+        after_add > initial_commits,
+        "expected more commits after task add: {initial_commits} -> {after_add}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_multiple_tasks_accumulate() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "task-alpha"]);
+    subcontext_ok(&root, &["task", "add", "task-beta"]);
+    subcontext_ok(&root, &["task", "add", "task-gamma"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    let count = dolt_count(&dolt_dir, "SELECT COUNT(*) FROM tasks");
+    assert_eq!(count, 3, "expected 3 tasks, got {count}");
+
+    let names_count = dolt_count(&dolt_dir, "SELECT COUNT(*) FROM task_names");
+    assert_eq!(names_count, 3, "expected 3 task_names, got {names_count}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_task_done_updates_status_in_db() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "finish-me"]);
+    subcontext_ok(&root, &["task", "done", "finish-me"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT task_status FROM tasks WHERE task_name = 'finish-me'",
+    );
+    assert!(csv.contains("done"), "expected status=done, got: {csv}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_objects_table_tracks_task_branches() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "obj-test"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // An objects row should exist for the task
+    let obj_count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM objects WHERE `type` = 'task'",
+    );
+    assert!(
+        obj_count >= 1,
+        "expected at least 1 object of type task, got {obj_count}"
+    );
+
+    // The object should have a non-empty current_commit
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT current_commit FROM objects WHERE `type` = 'task' LIMIT 1",
+    );
+    let lines: Vec<&str> = csv.trim().lines().collect();
+    assert!(lines.len() >= 2, "expected object row, got: {csv}");
+    assert!(
+        !lines[1].trim().is_empty(),
+        "current_commit should not be empty"
+    );
 
     cleanup(&root);
 }

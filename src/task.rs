@@ -1,19 +1,42 @@
 use anyhow::{Context, Result, bail};
-use rusqlite::{Connection, params};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
 
 use crate::backend::{Backend, GitInvocation};
+use crate::dolt::DoltConnection;
 use crate::git::{
-    CheckoutContext, current_branch, repo_dir, run_git_in_bare, run_work_git, state_dir,
+    CheckoutContext, current_branch, dolt_dir, repo_dir, run_git_in_bare, run_work_git, state_dir,
     subcontext_dir,
 };
 use crate::project::read_project_uuid;
 
-pub const DB_NAME: &str = "tasks.db";
 pub const DEFAULT_KIND: &str = "task";
 pub const DEFAULT_STATUS: &str = "created";
+
+/// Row type returned when loading all tasks for tree building.
+type TaskRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
+/// Convert `Option<&str>` to either a `'quoted'` SQL literal or the bare
+/// keyword `NULL`, for direct interpolation into SQL strings.
+fn sql_nullable(opt: Option<&str>) -> String {
+    match opt {
+        Some(s) => format!("'{}'", s.replace('\'', "''")),
+        None => "NULL".to_string(),
+    }
+}
+
+/// Quote a string for direct interpolation into SQL.
+fn sql_quote(s: &str) -> String {
+    format!("'{}'", s.replace('\'', "''"))
+}
 
 /// Path layout for task operations. Decouples task code from whether we're
 /// running against a local (.git/.subcontext) or global (~/.subcontext)
@@ -23,6 +46,8 @@ pub struct TaskScope {
     pub repo_dir: PathBuf,
     /// State-branch worktree directory.
     pub state_dir: PathBuf,
+    /// Dolt database directory (contains `.dolt/`).
+    pub dolt_dir: PathBuf,
     /// Directory to stash scratch files (blobs, indexes) during git plumbing.
     pub scratch_base: PathBuf,
     /// Branch name under which `task_names` entries are recorded. For local
@@ -39,26 +64,29 @@ impl TaskScope {
         Ok(Self {
             repo_dir: repo_dir(root),
             state_dir: state_dir(root),
+            dolt_dir: dolt_dir(root),
             scratch_base: subcontext_dir(root),
             host_branch: current_branch(backend, root)?,
             project_uuid: read_project_uuid(backend, root)?,
         })
     }
-
-    fn db_path(&self) -> PathBuf {
-        self.state_dir.join(DB_NAME)
-    }
 }
 
-/// Initialize the `state` branch, its worktree, and the tasks.db schema
+/// Initialize the `state` branch, its worktree, and the Dolt database
 /// against the local (per-host-repo) subcontext layout.
 pub fn init_state_branch(backend: &dyn Backend, root: &Path) -> Result<()> {
-    init_state_branch_in(backend, &repo_dir(root), &state_dir(root))
+    init_state_branch_in(backend, &repo_dir(root), &state_dir(root), &dolt_dir(root))
 }
 
-/// Initialize the `state` branch + worktree + tasks.db schema against an
-/// arbitrary bare repo + state dir. Works for both local and global layouts.
-pub fn init_state_branch_in(backend: &dyn Backend, bare: &Path, state: &Path) -> Result<()> {
+/// Initialize the `state` branch + worktree + Dolt database against an
+/// arbitrary bare repo + state dir + dolt dir. Works for both local and
+/// global layouts.
+pub fn init_state_branch_in(
+    backend: &dyn Backend,
+    bare: &Path,
+    state: &Path,
+    dolt_path: &Path,
+) -> Result<()> {
     // Create empty state branch via plumbing
     let empty_tree = run_git_in_bare(
         backend,
@@ -87,82 +115,45 @@ pub fn init_state_branch_in(backend: &dyn Backend, bare: &Path, state: &Path) ->
         bare,
     )?;
 
-    // Create DB + schema
-    let conn = Connection::open(state.join(DB_NAME))?;
-    create_schema(&conn)?;
-    drop(conn);
+    // Initialize Dolt database
+    crate::dolt::init_dolt_repo(backend, dolt_path)?;
+    let mut conn = DoltConnection::open(dolt_path)?;
+    crate::dolt::create_dolt_schema(&mut conn)?;
+    let dolt_commit = conn.commit("init tasks db")?;
 
-    // Commit
+    // Write dolt commit hash to state branch
+    crate::dolt::save_dolt_head(backend, state, &dolt_commit)?;
+
+    // Commit state branch
     commit_state_in(backend, state, "init tasks db")?;
     Ok(())
 }
 
-fn create_schema(conn: &Connection) -> Result<()> {
-    conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS tasks (
-             task_uuid        TEXT PRIMARY KEY,
-             task_name        TEXT NOT NULL,
-             task_status      TEXT NOT NULL,
-             task_kind        TEXT NOT NULL,
-             task_description TEXT DEFAULT NULL,
-             project_uuid     TEXT NOT NULL,
-             task_deadline    TEXT DEFAULT NULL,
-             task_importance  REAL NOT NULL DEFAULT 0.0,
-             parent_task_uuid TEXT DEFAULT NULL,
-             board_uuid       TEXT DEFAULT NULL,
-             subtasks         TEXT NOT NULL DEFAULT '{}'
-         );
-         CREATE TABLE IF NOT EXISTS task_names (
-             branch_name   TEXT NOT NULL,
-             task_name     TEXT NOT NULL,
-             task_uuid     TEXT NOT NULL UNIQUE
-         );
-         CREATE INDEX IF NOT EXISTS idx_task_names_lookup
-             ON task_names (branch_name, task_name);
-         CREATE TABLE IF NOT EXISTS objects (
-             uuid                  TEXT PRIMARY KEY,
-             type                  TEXT NOT NULL,
-             current_commit        TEXT NOT NULL,
-             board_uuid            TEXT DEFAULT NULL,
-             source_context_uuid   TEXT DEFAULT NULL,
-             source_object_uuid    TEXT DEFAULT NULL,
-             source_context_commit TEXT DEFAULT NULL
-         );
-         CREATE TABLE IF NOT EXISTS branch_tasks (
-             scope_branch  TEXT PRIMARY KEY,
-             task_uuid     TEXT NOT NULL
-         );",
-    )?;
-    Ok(())
-}
-
-pub fn open_db(scope: &TaskScope) -> Result<Connection> {
-    Ok(Connection::open(scope.db_path())?)
+pub fn open_db(scope: &TaskScope) -> Result<DoltConnection> {
+    DoltConnection::open(&scope.dolt_dir)
 }
 
 // ─── Branch-task mapping ───────────────────────────────────────────
 
 /// Get the current task UUID for a branch.
-pub fn get_branch_task(conn: &Connection, branch: &str) -> Result<Option<String>> {
-    Ok(conn
-        .query_row(
-            "SELECT task_uuid FROM branch_tasks WHERE scope_branch = ?1",
-            params![branch],
-            |r| r.get(0),
-        )
-        .ok())
+pub fn get_branch_task(conn: &mut DoltConnection, branch: &str) -> Result<Option<String>> {
+    conn.query_row(
+        "SELECT task_uuid FROM branch_tasks WHERE scope_branch = ?1",
+        &[branch],
+        |row| row.get::<String>(0),
+    )
 }
 
 /// Set the current task for a branch.
 pub fn set_branch_task(backend: &dyn Backend, scope: &TaskScope, task_uuid: &str) -> Result<()> {
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
-        "INSERT OR REPLACE INTO branch_tasks (scope_branch, task_uuid) VALUES (?1, ?2)",
-        params![scope.host_branch, task_uuid],
+        "REPLACE INTO branch_tasks (scope_branch, task_uuid) VALUES (?1, ?2)",
+        &[scope.host_branch.as_str(), task_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("set branch task: {}", scope.host_branch),
     )?;
@@ -171,14 +162,14 @@ pub fn set_branch_task(backend: &dyn Backend, scope: &TaskScope, task_uuid: &str
 
 /// Unset the current task for a branch.
 pub fn unset_branch_task(backend: &dyn Backend, scope: &TaskScope) -> Result<()> {
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "DELETE FROM branch_tasks WHERE scope_branch = ?1",
-        params![scope.host_branch],
+        &[scope.host_branch.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("unset branch task: {}", scope.host_branch),
     )?;
@@ -189,22 +180,26 @@ pub fn unset_branch_task(backend: &dyn Backend, scope: &TaskScope) -> Result<()>
 
 /// Read the subtasks namespace dict `{name: uuid}` for a task.
 fn read_subtasks_ns(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     task_uuid: &str,
 ) -> Result<serde_json::Map<String, serde_json::Value>> {
     let json_str: String = conn
         .query_row(
             "SELECT subtasks FROM tasks WHERE task_uuid = ?1",
-            params![task_uuid],
-            |r| r.get(0),
-        )
+            &[task_uuid],
+            |row| row.get::<String>(0),
+        )?
         .with_context(|| format!("task '{task_uuid}' not found"))?;
     let val: serde_json::Value = serde_json::from_str(&json_str).unwrap_or(serde_json::json!({}));
     Ok(val.as_object().cloned().unwrap_or_default())
 }
 
 /// Find a child task by name under a given parent (or root if parent is None).
-fn find_child_by_name(conn: &Connection, parent_uuid: Option<&str>, name: &str) -> Result<String> {
+fn find_child_by_name(
+    conn: &mut DoltConnection,
+    parent_uuid: Option<&str>,
+    name: &str,
+) -> Result<String> {
     match parent_uuid {
         Some(p) => {
             // First try the subtasks namespace (legacy per-task branches).
@@ -215,28 +210,28 @@ fn find_child_by_name(conn: &Connection, parent_uuid: Option<&str>, name: &str) 
             // Fall back to querying by parent_task_uuid (board-based tasks).
             conn.query_row(
                 "SELECT task_uuid FROM tasks WHERE task_name = ?1 AND parent_task_uuid = ?2",
-                params![name, p],
-                |r| r.get(0),
-            )
+                &[name, p],
+                |row| row.get::<String>(0),
+            )?
             .with_context(|| format!("task '{name}' not found under parent {p}"))
         }
         None => conn
             .query_row(
                 "SELECT task_uuid FROM tasks WHERE task_name = ?1 AND parent_task_uuid IS NULL",
-                params![name],
-                |r| r.get(0),
-            )
+                &[name],
+                |row| row.get::<String>(0),
+            )?
             .with_context(|| format!("task '{name}' not found at root level")),
     }
 }
 
 /// Verify a task UUID exists and return it.
-fn verify_task_uuid(conn: &Connection, uuid: &str) -> Result<String> {
+fn verify_task_uuid(conn: &mut DoltConnection, uuid: &str) -> Result<String> {
     conn.query_row(
         "SELECT task_uuid FROM tasks WHERE task_uuid = ?1",
-        params![uuid],
-        |r| r.get(0),
-    )
+        &[uuid],
+        |row| row.get::<String>(0),
+    )?
     .with_context(|| format!("task UUID '{uuid}' not found"))
 }
 
@@ -256,7 +251,7 @@ fn verify_task_uuid(conn: &Connection, uuid: &str) -> Result<String> {
 /// When `backend` is `None`, namespace-based resolution (absolute paths
 /// starting with `/`) is unavailable and will return an error.
 pub fn resolve_task_path(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     scope: &TaskScope,
     path: &str,
     backend: Option<&dyn Backend>,
@@ -274,9 +269,9 @@ pub fn resolve_task_path(
         let parent: Option<String> = conn
             .query_row(
                 "SELECT parent_task_uuid FROM tasks WHERE task_uuid = ?1",
-                params![current],
-                |r| r.get(0),
-            )
+                &[current.as_str()],
+                |r| r.get::<Option<String>>(0),
+            )?
             .with_context(|| format!("task '{current}' not found"))?;
         return parent.ok_or_else(|| anyhow::anyhow!("current task has no parent"));
     }
@@ -305,7 +300,7 @@ pub fn resolve_task_path(
 ///
 /// Handles `.uuid`, `.project`, `.user` interpolation and namespace lookup.
 fn resolve_absolute_path(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     scope: &TaskScope,
     segments: &[&str],
     backend: Option<&dyn Backend>,
@@ -384,17 +379,20 @@ fn resolve_absolute_path(
 
 /// List all root task UUIDs (tasks with no parent).
 pub fn list_root_uuids(scope: &TaskScope) -> Result<Vec<String>> {
-    let conn = open_db(scope)?;
-    let mut stmt = conn
-        .prepare("SELECT task_uuid FROM tasks WHERE parent_task_uuid IS NULL ORDER BY task_name")?;
-    let uuids: Vec<String> = stmt
-        .query_map([], |r| r.get(0))?
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut conn = open_db(scope)?;
+    let uuids: Vec<String> = conn.query_map(
+        "SELECT task_uuid FROM tasks WHERE parent_task_uuid IS NULL ORDER BY task_name",
+        &[],
+        |r| r.get::<String>(0),
+    )?;
     Ok(uuids)
 }
 
-fn resolve_segments(conn: &Connection, parent: Option<&str>, segments: &[&str]) -> Result<String> {
+fn resolve_segments(
+    conn: &mut DoltConnection,
+    parent: Option<&str>,
+    segments: &[&str],
+) -> Result<String> {
     let mut current_parent = parent.map(|s| s.to_string());
 
     for (i, seg) in segments.iter().enumerate() {
@@ -416,9 +414,9 @@ fn resolve_segments(conn: &Connection, parent: Option<&str>, segments: &[&str]) 
             let parent_uuid: Option<String> = conn
                 .query_row(
                     "SELECT parent_task_uuid FROM tasks WHERE task_uuid = ?1",
-                    params![current],
-                    |r| r.get(0),
-                )
+                    &[current],
+                    |r| r.get::<Option<String>>(0),
+                )?
                 .with_context(|| format!("task '{current}' not found"))?;
             if is_last {
                 return parent_uuid.ok_or_else(|| anyhow::anyhow!("task has no parent"));
@@ -449,25 +447,23 @@ pub struct TaskInfo {
 
 /// List subtasks of a given parent task (or root tasks if parent is None).
 pub fn list_subtasks(scope: &TaskScope, parent_uuid: Option<&str>) -> Result<Vec<TaskInfo>> {
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     let mut tasks = Vec::new();
 
     match parent_uuid {
         Some(p) => {
             // First try the subtasks namespace (legacy).
-            let subs = read_subtasks_ns(&conn, p)?;
+            let subs = read_subtasks_ns(&mut conn, p)?;
             let mut entries: Vec<(String, String)> = subs
                 .iter()
                 .filter_map(|(name, val)| val.as_str().map(|uuid| (name.clone(), uuid.to_string())))
                 .collect();
             // Also query tasks table for board-based children.
-            let mut stmt = conn.prepare(
+            let db_children: Vec<(String, String)> = conn.query_map(
                 "SELECT task_uuid, task_name FROM tasks WHERE parent_task_uuid = ?1 ORDER BY task_name",
+                &[p],
+                |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
             )?;
-            let db_children: Vec<(String, String)> = stmt
-                .query_map(params![p], |r| Ok((r.get(0)?, r.get(1)?)))?
-                .filter_map(|r| r.ok())
-                .collect();
             for (uuid, name) in db_children {
                 if !entries.iter().any(|(_, u)| *u == uuid) {
                     entries.push((name, uuid));
@@ -475,17 +471,17 @@ pub fn list_subtasks(scope: &TaskScope, parent_uuid: Option<&str>) -> Result<Vec
             }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             for (sub_name, sub_uuid) in &entries {
-                if let Ok(info) = conn.query_row(
+                if let Ok(Some(info)) = conn.query_row(
                     "SELECT task_status, task_kind, task_description \
                      FROM tasks WHERE task_uuid = ?1",
-                    params![sub_uuid],
+                    &[sub_uuid.as_str()],
                     |r| {
                         Ok(TaskInfo {
                             uuid: sub_uuid.clone(),
                             name: sub_name.clone(),
-                            status: r.get(0)?,
-                            kind: r.get(1)?,
-                            description: r.get(2)?,
+                            status: r.get::<String>(0)?,
+                            kind: r.get::<String>(1)?,
+                            description: r.get::<Option<String>>(2)?,
                         })
                     },
                 ) {
@@ -494,22 +490,20 @@ pub fn list_subtasks(scope: &TaskScope, parent_uuid: Option<&str>) -> Result<Vec
             }
         }
         None => {
-            let mut stmt = conn.prepare(
+            tasks = conn.query_map(
                 "SELECT task_uuid, task_name, task_status, task_kind, task_description \
                  FROM tasks WHERE parent_task_uuid IS NULL ORDER BY task_name",
+                &[],
+                |r| {
+                    Ok(TaskInfo {
+                        uuid: r.get::<String>(0)?,
+                        name: r.get::<String>(1)?,
+                        status: r.get::<String>(2)?,
+                        kind: r.get::<String>(3)?,
+                        description: r.get::<Option<String>>(4)?,
+                    })
+                },
             )?;
-            let rows = stmt.query_map([], |r| {
-                Ok(TaskInfo {
-                    uuid: r.get(0)?,
-                    name: r.get(1)?,
-                    status: r.get(2)?,
-                    kind: r.get(3)?,
-                    description: r.get(4)?,
-                })
-            })?;
-            for row in rows {
-                tasks.push(row?);
-            }
         }
     }
     Ok(tasks)
@@ -593,34 +587,24 @@ pub fn build_task_tree(
     root_uuid: Option<&str>,
     opts: &TreeOptions,
 ) -> Result<Vec<TaskTreeNode>> {
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
 
     // Load all tasks into memory for efficient tree building.
-    let all_tasks: Vec<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = {
-        let mut stmt = conn.prepare(
-            "SELECT task_uuid, task_name, task_status, task_kind, task_description, parent_task_uuid \
-             FROM tasks ORDER BY task_name",
-        )?;
-        stmt.query_map([], |r| {
+    let all_tasks: Vec<TaskRow> = conn.query_map(
+        "SELECT task_uuid, task_name, task_status, task_kind, task_description, parent_task_uuid \
+         FROM tasks ORDER BY task_name",
+        &[],
+        |r| {
             Ok((
-                r.get(0)?,
-                r.get(1)?,
-                r.get(2)?,
-                r.get(3)?,
-                r.get(4)?,
-                r.get(5)?,
+                r.get::<String>(0)?,
+                r.get::<String>(1)?,
+                r.get::<String>(2)?,
+                r.get::<String>(3)?,
+                r.get::<Option<String>>(4)?,
+                r.get::<Option<String>>(5)?,
             ))
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
-    };
+        },
+    )?;
 
     // Build parent -> children map.
     let mut children_map: std::collections::HashMap<Option<String>, Vec<usize>> =
@@ -632,14 +616,7 @@ pub fn build_task_tree(
     let mut total_size: usize = 0;
 
     fn build_node(
-        all_tasks: &[(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        )],
+        all_tasks: &[TaskRow],
         children_map: &std::collections::HashMap<Option<String>, Vec<usize>>,
         idx: usize,
         opts: &TreeOptions,
@@ -659,10 +636,10 @@ pub fn build_task_tree(
         }
 
         // Check max_size.
-        if let Some(max) = opts.max_size {
-            if *total_size >= max {
-                return None;
-            }
+        if let Some(max) = opts.max_size
+            && *total_size >= max
+        {
+            return None;
         }
         *total_size += 1;
 
@@ -675,17 +652,17 @@ pub fn build_task_tree(
             if let Some(child_indices) = children_map.get(&Some(uuid.clone())) {
                 let mut count = 0;
                 for &ci in child_indices {
-                    if let Some(max_b) = opts.max_breadth {
-                        if count >= max_b {
-                            truncated_children = child_indices.len() - count;
-                            break;
-                        }
+                    if let Some(max_b) = opts.max_breadth
+                        && count >= max_b
+                    {
+                        truncated_children = child_indices.len() - count;
+                        break;
                     }
-                    if let Some(max_s) = opts.max_size {
-                        if *total_size >= max_s {
-                            truncated_children = child_indices.len() - count;
-                            break;
-                        }
+                    if let Some(max_s) = opts.max_size
+                        && *total_size >= max_s
+                    {
+                        truncated_children = child_indices.len() - count;
+                        break;
                     }
                     if let Some(child_node) =
                         build_node(all_tasks, children_map, ci, opts, depth + 1, total_size)
@@ -700,7 +677,7 @@ pub fn build_task_tree(
             truncated_children = child_indices
                 .iter()
                 .filter(|&&ci| {
-                    let ref st = all_tasks[ci].2;
+                    let st = &all_tasks[ci].2;
                     match opts.filter {
                         TreeFilter::Active => st != "done" && st != "failed",
                         TreeFilter::All => true,
@@ -740,10 +717,10 @@ pub fn build_task_tree(
             // All root tasks (no parent).
             let root_indices: Vec<usize> = children_map.get(&None).cloned().unwrap_or_default();
             for idx in root_indices {
-                if let Some(max_s) = opts.max_size {
-                    if total_size >= max_s {
-                        break;
-                    }
+                if let Some(max_s) = opts.max_size
+                    && total_size >= max_s
+                {
+                    break;
                 }
                 if let Some(node) =
                     build_node(&all_tasks, &children_map, idx, opts, 0, &mut total_size)
@@ -835,6 +812,33 @@ pub fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Re
     Ok(())
 }
 
+/// Commit the Dolt database and record the commit hash in the state branch.
+/// This is the standard way to persist database changes: dolt commit + git
+/// state branch commit. Later, the dolt commit hash enables branching/merging
+/// the database independently.
+#[allow(dead_code)]
+pub fn dolt_commit_and_track(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    message: &str,
+) -> Result<()> {
+    let mut conn = open_db(scope)?;
+    dolt_commit_and_track_with(backend, &mut conn, &scope.state_dir, message)
+}
+
+/// Like `dolt_commit_and_track`, but reuses an existing open connection.
+pub fn dolt_commit_and_track_with(
+    backend: &dyn Backend,
+    conn: &mut DoltConnection,
+    state_dir: &Path,
+    message: &str,
+) -> Result<()> {
+    let dolt_commit = conn.commit(message)?;
+    crate::dolt::save_dolt_head(backend, state_dir, &dolt_commit)?;
+    commit_state_in(backend, state_dir, message)?;
+    Ok(())
+}
+
 /// Add a new task. Returns `(task_uuid, branch_commit)`.
 ///
 /// If `source` is `Some((source_context_uuid, source_object_uuid,
@@ -872,16 +876,12 @@ pub fn add_task(
     let kind = kind.unwrap_or(DEFAULT_KIND);
     let status = status.unwrap_or(DEFAULT_STATUS);
 
-    let conn = open_db(scope)?;
-    let existing: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT task_uuid FROM task_names WHERE branch_name = ?1 AND task_name = ?2")
-            .unwrap();
-        stmt.query_map(params![branch, name], |r| r.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
-    };
+    let mut conn = open_db(scope)?;
+    let existing: Vec<String> = conn.query_map(
+        "SELECT task_uuid FROM task_names WHERE branch_name = ?1 AND task_name = ?2",
+        &[branch.as_str(), name],
+        |r| r.get::<String>(0),
+    )?;
     if !existing.is_empty() {
         // Print to stdout so agent harnesses can see it.
         println!(
@@ -896,32 +896,33 @@ pub fn add_task(
         let exists: bool = conn
             .query_row(
                 "SELECT 1 FROM tasks WHERE task_uuid = ?1",
-                params![parent],
+                &[parent],
                 |_| Ok(true),
-            )
+            )?
             .unwrap_or(false);
         if !exists {
             bail!("parent task '{parent}' not found");
         }
     }
 
-    conn.execute(
+    conn.execute_batch(&format!(
         "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid],
-    )?;
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {})",
+        sql_quote(&task_uuid), sql_quote(name), sql_quote(status), sql_quote(kind),
+        sql_nullable(description), sql_quote(&scope.project_uuid),
+        sql_nullable(deadline), importance, sql_nullable(parent_task_uuid),
+    ))?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-        params![branch, name, task_uuid],
+        &[branch.as_str(), name, task_uuid.as_str()],
     )?;
-    drop(conn);
 
     let commit_msg = if source.is_some() {
         format!("task add (shadow): {name}")
     } else {
         format!("task add: {name}")
     };
-    commit_state_in(backend, &scope.state_dir, &commit_msg)?;
+    dolt_commit_and_track_with(backend, &mut conn, &scope.state_dir, &commit_msg)?;
 
     let task_data = TaskData {
         title: None,
@@ -946,19 +947,19 @@ pub fn add_task(
         &[("object.json", &object_json), ("TASK.md", &task_md)],
     )?;
 
-    // Record in the objects table.
-    let conn = open_db(scope)?;
-    insert_object(&conn, &task_uuid, "task", &commit, source)?;
-    drop(conn);
-    commit_state_in(
+    // Record in the objects table (reuse existing connection).
+    insert_object(&mut conn, &task_uuid, "task", &commit, source)?;
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object add: {task_uuid}"),
     )?;
 
     // If this task has a parent, add it to the parent's subtasks namespace.
     if let Some(parent) = parent_task_uuid {
-        update_parent_subtasks(backend, scope, parent, name, &task_uuid)?;
+        update_parent_subtasks_with(backend, &mut conn, scope, parent, name, &task_uuid)?;
     }
 
     if source.is_some() {
@@ -977,9 +978,27 @@ fn update_parent_subtasks(
     child_name: &str,
     child_uuid: &str,
 ) -> Result<()> {
+    let mut conn = open_db(scope)?;
+    update_parent_subtasks_with(
+        backend,
+        &mut conn,
+        scope,
+        parent_uuid,
+        child_name,
+        child_uuid,
+    )
+}
+
+fn update_parent_subtasks_with(
+    backend: &dyn Backend,
+    conn: &mut DoltConnection,
+    scope: &TaskScope,
+    parent_uuid: &str,
+    child_name: &str,
+    child_uuid: &str,
+) -> Result<()> {
     // 1. Update the DB column.
-    let conn = open_db(scope)?;
-    let mut subs = read_subtasks_ns(&conn, parent_uuid)?;
+    let mut subs = read_subtasks_ns(conn, parent_uuid)?;
     subs.insert(
         child_name.to_string(),
         serde_json::Value::String(child_uuid.to_string()),
@@ -987,11 +1006,11 @@ fn update_parent_subtasks(
     let subs_json = serde_json::to_string(&serde_json::Value::Object(subs.clone()))?;
     conn.execute(
         "UPDATE tasks SET subtasks = ?1 WHERE task_uuid = ?2",
-        params![subs_json, parent_uuid],
+        &[subs_json.as_str(), parent_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+    dolt_commit_and_track_with(
         backend,
+        conn,
         &scope.state_dir,
         &format!("subtask add: {child_name} under {parent_uuid}"),
     )?;
@@ -1055,14 +1074,14 @@ fn update_parent_subtasks(
         &[("object.json", &new_json), ("TASK.md", &new_md)],
     )?;
 
-    let conn = open_db(scope)?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![new_commit, parent_uuid],
+        &[new_commit.as_str(), parent_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        conn,
         &scope.state_dir,
         &format!("object update: {parent_uuid}"),
     )?;
@@ -1076,19 +1095,21 @@ pub fn done_task(
     name: &str,
     time: Option<&str>,
 ) -> Result<()> {
-    let conn = open_db(scope)?;
-    let task_uuid = resolve_task_path(&conn, scope, name, Some(backend))?;
-    drop(conn);
+    let mut conn = open_db(scope)?;
+    let task_uuid = resolve_task_path(&mut conn, scope, name, Some(backend))?;
 
-    let conn = open_db(scope)?;
     conn.execute(
         "UPDATE tasks SET task_status = 'done' WHERE task_uuid = ?1",
-        params![task_uuid],
+        &[task_uuid.as_str()],
     )?;
-    drop(conn);
 
     let completed_at = resolve_timestamp(time)?;
-    commit_state_in(backend, &scope.state_dir, &format!("task done: {name}"))?;
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("task done: {name}"),
+    )?;
 
     // Check if this task is part of a board.
     if let Some(board_uuid) = find_board_for_task(scope, &task_uuid)? {
@@ -1159,14 +1180,14 @@ pub fn done_task(
             &task_uuid,
             &[("object.json", &new_json), ("TASK.md", &new_md)],
         )?;
-        let conn = open_db(scope)?;
+        let mut conn = open_db(scope)?;
         conn.execute(
             "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-            params![new_commit, task_uuid],
+            &[new_commit.as_str(), task_uuid.as_str()],
         )?;
-        drop(conn);
-        commit_state_in(
+        dolt_commit_and_track_with(
             backend,
+            &mut conn,
             &scope.state_dir,
             &format!("object update: {task_uuid}"),
         )?;
@@ -1201,19 +1222,21 @@ pub fn fail_task(
     name: &str,
     time: Option<&str>,
 ) -> Result<()> {
-    let conn = open_db(scope)?;
-    let task_uuid = resolve_task_path(&conn, scope, name, Some(backend))?;
-    drop(conn);
+    let mut conn = open_db(scope)?;
+    let task_uuid = resolve_task_path(&mut conn, scope, name, Some(backend))?;
 
-    let conn = open_db(scope)?;
     conn.execute(
         "UPDATE tasks SET task_status = 'failed' WHERE task_uuid = ?1",
-        params![task_uuid],
+        &[task_uuid.as_str()],
     )?;
-    drop(conn);
 
     let completed_at = resolve_timestamp(time)?;
-    commit_state_in(backend, &scope.state_dir, &format!("task fail: {name}"))?;
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("task fail: {name}"),
+    )?;
 
     // Check if this task is part of a board.
     if let Some(board_uuid) = find_board_for_task(scope, &task_uuid)? {
@@ -1281,14 +1304,14 @@ pub fn fail_task(
             &task_uuid,
             &[("object.json", &new_json), ("TASK.md", &new_md)],
         )?;
-        let conn = open_db(scope)?;
+        let mut conn = open_db(scope)?;
         conn.execute(
             "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-            params![new_commit, task_uuid],
+            &[new_commit.as_str(), task_uuid.as_str()],
         )?;
-        drop(conn);
-        commit_state_in(
+        dolt_commit_and_track_with(
             backend,
+            &mut conn,
             &scope.state_dir,
             &format!("object update: {task_uuid}"),
         )?;
@@ -1355,7 +1378,7 @@ pub fn list_deadlines(
         Some(h) => Some(parse_duration(h)?),
         None => None,
     };
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
 
     let mut sql = String::from(
         "SELECT t.task_name, t.task_uuid, t.task_status, t.task_kind, \
@@ -1373,36 +1396,22 @@ pub fn list_deadlines(
     }
     sql.push_str(" ORDER BY t.task_deadline ASC");
 
-    let mut stmt = conn.prepare(&sql)?;
-    let rows: Vec<DeadlineEntry> = if let Some(board_uuid) = board {
-        stmt.query_map(params![scope.host_branch, board_uuid], |r| {
-            Ok(DeadlineEntry {
-                name: r.get(0)?,
-                uuid: r.get(1)?,
-                status: r.get(2)?,
-                kind: r.get(3)?,
-                deadline: r.get(4)?,
-                importance: r.get(5)?,
-                description: r.get(6)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
+    let params: Vec<&str> = if let Some(board_uuid) = board {
+        vec![&scope.host_branch, board_uuid]
     } else {
-        stmt.query_map(params![scope.host_branch], |r| {
-            Ok(DeadlineEntry {
-                name: r.get(0)?,
-                uuid: r.get(1)?,
-                status: r.get(2)?,
-                kind: r.get(3)?,
-                deadline: r.get(4)?,
-                importance: r.get(5)?,
-                description: r.get(6)?,
-            })
-        })?
-        .filter_map(|r| r.ok())
-        .collect()
+        vec![&scope.host_branch]
     };
+    let rows: Vec<DeadlineEntry> = conn.query_map(&sql, &params, |r| {
+        Ok(DeadlineEntry {
+            name: r.get::<String>(0)?,
+            uuid: r.get::<String>(1)?,
+            status: r.get::<String>(2)?,
+            kind: r.get::<String>(3)?,
+            deadline: r.get::<String>(4)?,
+            importance: r.get::<f64>(5)?,
+            description: r.get::<Option<String>>(6)?,
+        })
+    })?;
 
     let now_secs = current_unix_secs();
     let mut entries = Vec::new();
@@ -1622,7 +1631,7 @@ pub fn parse_task_import(content: &str) -> Option<TaskImport> {
 /// Generate an import TASK.md that references a foreign task.
 #[allow(dead_code)]
 pub fn generate_import_task_md(context_uuid: &str, task_uuid: &str) -> String {
-    let lines = vec![
+    let lines = [
         "---".to_string(),
         format!("import_context: {}", context_uuid),
         format!("import_task: {}", task_uuid),
@@ -1640,6 +1649,7 @@ pub fn generate_import_task_md(context_uuid: &str, task_uuid: &str) -> String {
 ///
 /// The root TASK.md shares the same UUID as the board's object.json.
 /// Returns `(board_uuid, commit)`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_board(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -1666,18 +1676,25 @@ pub fn create_board(
     let status = status.unwrap_or(DEFAULT_STATUS);
 
     // Insert the root task into the tasks table.
-    let conn = open_db(scope)?;
-    conn.execute(
+    let mut conn = open_db(scope)?;
+    conn.execute_batch(&format!(
         "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?1)",
-        params![board_uuid, name, status, kind, description, scope.project_uuid, deadline, importance],
-    )?;
+         VALUES ({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, NULL, {0})",
+        sql_quote(&board_uuid), sql_quote(name), sql_quote(status), sql_quote(kind),
+        sql_nullable(description), sql_quote(&scope.project_uuid),
+        sql_nullable(deadline), importance,
+    ))?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-        params![branch, name, board_uuid],
+        &[branch.as_str(), name, board_uuid.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("board add: {name}"),
+    )?;
 
     // Build the board branch: object.json + TASK.md at root.
     let object_json = build_tree_object_json(&board_uuid);
@@ -1705,16 +1722,17 @@ pub fn create_board(
     )?;
 
     // Record in the objects table: the board itself is a task object.
-    let conn = open_db(scope)?;
-    insert_object(&conn, &board_uuid, "task", &commit, source)?;
+    let mut conn = open_db(scope)?;
+    insert_object(&mut conn, &board_uuid, "task", &commit, source)?;
     // Board_uuid for the root task object entry is itself.
     conn.execute(
         "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
-        params![board_uuid, board_uuid],
+        &[board_uuid.as_str(), board_uuid.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object add: {board_uuid}"),
     )?;
@@ -1761,18 +1779,25 @@ pub fn create_board_from_md(
     let kind_str = kind.as_deref().unwrap_or(DEFAULT_KIND);
     let status_str = status.as_deref().unwrap_or(DEFAULT_STATUS);
 
-    let conn = open_db(scope)?;
-    conn.execute(
+    let mut conn = open_db(scope)?;
+    conn.execute_batch(&format!(
         "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?1)",
-        params![board_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance],
-    )?;
+         VALUES ({0}, {1}, {2}, {3}, {4}, {5}, {6}, {7}, NULL, {0})",
+        sql_quote(&board_uuid), sql_quote(&name), sql_quote(status_str), sql_quote(kind_str),
+        sql_nullable(description.as_deref()), sql_quote(&scope.project_uuid),
+        sql_nullable(deadline.as_deref()), importance,
+    ))?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-        params![branch, name, board_uuid],
+        &[branch.as_str(), name.as_str(), board_uuid.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("board add: {name}"),
+    )?;
 
     let object_json = build_tree_object_json(&board_uuid);
     // Regenerate TASK.md with uuid embedded.
@@ -1804,15 +1829,16 @@ pub fn create_board_from_md(
         &[("object.json", &object_json), ("TASK.md", &task_md)],
     )?;
 
-    let conn = open_db(scope)?;
-    insert_object(&conn, &board_uuid, "task", &commit, source)?;
+    let mut conn = open_db(scope)?;
+    insert_object(&mut conn, &board_uuid, "task", &commit, source)?;
     conn.execute(
         "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
-        params![board_uuid, board_uuid],
+        &[board_uuid.as_str(), board_uuid.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object add: {board_uuid}"),
     )?;
@@ -1826,6 +1852,7 @@ pub fn create_board_from_md(
 /// board's tree at the appropriate path based on the parent hierarchy.
 ///
 /// Returns `(task_uuid, board_commit)`.
+#[allow(clippy::too_many_arguments)]
 pub fn add_task_to_board(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -1849,18 +1876,25 @@ pub fn add_task_to_board(
     let status = status.unwrap_or(DEFAULT_STATUS);
 
     // Insert into tasks table with parent and board.
-    let conn = open_db(scope)?;
-    conn.execute(
+    let mut conn = open_db(scope)?;
+    conn.execute_batch(&format!(
         "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid, board_uuid],
-    )?;
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        sql_quote(&task_uuid), sql_quote(name), sql_quote(status), sql_quote(kind),
+        sql_nullable(description), sql_quote(&scope.project_uuid),
+        sql_nullable(deadline), importance, sql_quote(parent_task_uuid), sql_quote(board_uuid),
+    ))?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-        params![scope.host_branch, name, task_uuid],
+        &[scope.host_branch.as_str(), name, task_uuid.as_str()],
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("task add: {name}"))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("task add: {name}"),
+    )?;
 
     // Compute the path within the board tree for this subtask.
     let dir_path = compute_board_path(scope, parent_task_uuid, board_uuid)?;
@@ -1898,20 +1932,21 @@ pub fn add_task_to_board(
     let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
 
     // Record task in objects table, pointing to board.
-    let conn = open_db(scope)?;
-    insert_object(&conn, &task_uuid, "task", &commit, None)?;
+    let mut conn = open_db(scope)?;
+    insert_object(&mut conn, &task_uuid, "task", &commit, None)?;
     conn.execute(
         "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
-        params![board_uuid, task_uuid],
+        &[board_uuid, task_uuid.as_str()],
     )?;
     // Update the board's commit too.
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, board_uuid],
+        &[commit.as_str(), board_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object add: {task_uuid}"),
     )?;
@@ -1927,7 +1962,7 @@ fn compute_board_path(scope: &TaskScope, task_uuid: &str, board_uuid: &str) -> R
     if task_uuid == board_uuid {
         return Ok(String::new());
     }
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     let mut segments: Vec<String> = Vec::new();
     let mut current = task_uuid.to_string();
     loop {
@@ -1937,9 +1972,9 @@ fn compute_board_path(scope: &TaskScope, task_uuid: &str, board_uuid: &str) -> R
         let (name, parent): (String, Option<String>) = conn
             .query_row(
                 "SELECT task_name, parent_task_uuid FROM tasks WHERE task_uuid = ?1",
-                params![current],
-                |r| Ok((r.get(0)?, r.get(1)?)),
-            )
+                &[current.as_str()],
+                |r| Ok((r.get::<String>(0)?, r.get::<Option<String>>(1)?)),
+            )?
             .with_context(|| format!("task '{current}' not found while computing board path"))?;
         segments.push(name);
         match parent {
@@ -2008,14 +2043,14 @@ fn read_task_md_from_board(
 
 /// Find the board UUID for a given task UUID.
 pub fn find_board_for_task(scope: &TaskScope, task_uuid: &str) -> Result<Option<String>> {
-    let conn = open_db(scope)?;
-    Ok(conn
-        .query_row(
-            "SELECT board_uuid FROM objects WHERE uuid = ?1",
-            params![task_uuid],
-            |r| r.get(0),
-        )
-        .ok())
+    let mut conn = open_db(scope)?;
+    let row = conn.query_row(
+        "SELECT board_uuid FROM objects WHERE uuid = ?1",
+        &[task_uuid],
+        |r| r.get::<Option<String>>(0),
+    )?;
+    // Flatten Option<Option<String>> → Option<String>
+    Ok(row.flatten())
 }
 
 /// Update a task's TASK.md within its board tree. Reads the current board tree,
@@ -2055,18 +2090,19 @@ pub fn update_task_in_board(
     let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
 
     // Update commits for both the task and the board.
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, task_uuid],
+        &[commit.as_str(), task_uuid],
     )?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, board_uuid],
+        &[commit.as_str(), board_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object update: {task_uuid}"),
     )?;
@@ -2114,19 +2150,23 @@ pub fn delete_task_from_board(
     let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
 
     // Clean up DB entries.
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     for uuid in &uuids_to_delete {
-        conn.execute("DELETE FROM tasks WHERE task_uuid = ?1", params![uuid])?;
-        conn.execute("DELETE FROM task_names WHERE task_uuid = ?1", params![uuid])?;
-        conn.execute("DELETE FROM objects WHERE uuid = ?1", params![uuid])?;
+        conn.execute("DELETE FROM tasks WHERE task_uuid = ?1", &[uuid.as_str()])?;
+        conn.execute(
+            "DELETE FROM task_names WHERE task_uuid = ?1",
+            &[uuid.as_str()],
+        )?;
+        conn.execute("DELETE FROM objects WHERE uuid = ?1", &[uuid.as_str()])?;
     }
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, board_uuid],
+        &[commit.as_str(), board_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("board delete task: {task_uuid}"),
     )?;
@@ -2194,22 +2234,23 @@ pub fn move_task_in_board(
     let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
 
     // Update the parent in the DB.
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "UPDATE tasks SET parent_task_uuid = ?1 WHERE task_uuid = ?2",
-        params![new_parent_uuid, task_uuid],
+        &[new_parent_uuid, task_uuid],
     )?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, board_uuid],
+        &[commit.as_str(), board_uuid],
     )?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, task_uuid],
+        &[commit.as_str(), task_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("board move task: {task_uuid} to {new_parent_uuid}"),
     )?;
@@ -2294,10 +2335,10 @@ pub fn board_pull(
         if filter_done && relative.ends_with("TASK.md") {
             let (pairs, _) = parse_frontmatter(content);
             let fm = FrontmatterMap(&pairs);
-            if let Some(status) = fm.get("status") {
-                if status == "done" || status == "failed" {
-                    continue;
-                }
+            if let Some(status) = fm.get("status")
+                && (status == "done" || status == "failed")
+            {
+                continue;
             }
         }
 
@@ -2483,14 +2524,15 @@ pub fn board_push(
     let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
 
     // Update board commit in objects table.
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, board_uuid],
+        &[commit.as_str(), board_uuid],
     )?;
-    drop(conn);
-    commit_state_in(
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("board push: {board_uuid}"),
     )?;
@@ -2527,7 +2569,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
     )?;
 
     let files = read_board_tree(backend, scope, board_uuid)?;
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     let mut count = 0;
     // Track files that need a generated UUID written back.
     let mut uuid_patches: Vec<(String, String, String)> = Vec::new(); // (path, generated_uuid, new_content)
@@ -2537,7 +2579,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
 
         if filename == "TASK.md" {
             // Determine the task's parent by its directory position.
-            let parent_task_uuid = task_parent_from_path(path, board_uuid, &conn)?;
+            let parent_task_uuid = task_parent_from_path(path, board_uuid, &mut conn)?;
             let task_name = task_name_from_path(path);
 
             // Check if this is an import.
@@ -2553,7 +2595,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                 }
 
                 upsert_task_from_board(
-                    &conn,
+                    &mut conn,
                     &task_uuid,
                     &task_name,
                     DEFAULT_STATUS,
@@ -2566,7 +2608,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                     board_uuid,
                 )?;
                 upsert_object_from_board(
-                    &conn,
+                    &mut conn,
                     &task_uuid,
                     "task",
                     &head_commit,
@@ -2608,7 +2650,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                 .unwrap_or(0.0);
 
             upsert_task_from_board(
-                &conn,
+                &mut conn,
                 &task_uuid,
                 &task_name,
                 &status,
@@ -2620,20 +2662,25 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                 parent_task_uuid.as_deref(),
                 board_uuid,
             )?;
-            upsert_object_from_board(&conn, &task_uuid, "task", &head_commit, board_uuid, None)?;
+            upsert_object_from_board(
+                &mut conn,
+                &task_uuid,
+                "task",
+                &head_commit,
+                board_uuid,
+                None,
+            )?;
 
             // Also register in task_names if not already present.
-            let existing: Option<String> = conn
-                .query_row(
-                    "SELECT task_uuid FROM task_names WHERE task_uuid = ?1",
-                    params![task_uuid],
-                    |r| r.get(0),
-                )
-                .ok();
+            let existing: Option<String> = conn.query_row(
+                "SELECT task_uuid FROM task_names WHERE task_uuid = ?1",
+                &[task_uuid.as_str()],
+                |r| r.get::<String>(0),
+            )?;
             if existing.is_none() {
                 conn.execute(
                     "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-                    params![scope.host_branch, task_name, task_uuid],
+                    &[scope.host_branch.as_str(), task_name.as_str(), task_uuid.as_str()],
                 )?;
             }
 
@@ -2643,15 +2690,22 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
             if let Some((sub_uuid, _description)) = parse_link_json(content) {
                 // The linked object in the objects table points to its own
                 // branch; we just record it here for tracking.
-                upsert_object_from_board(&conn, &sub_uuid, "task", &head_commit, board_uuid, None)?;
+                upsert_object_from_board(
+                    &mut conn,
+                    &sub_uuid,
+                    "task",
+                    &head_commit,
+                    board_uuid,
+                    None,
+                )?;
                 count += 1;
             }
         }
     }
 
-    drop(conn);
-    commit_state_in(
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("board commit: {board_uuid}"),
     )?;
@@ -2674,14 +2728,14 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
             .map(|(n, c)| (n.as_str(), c.as_str()))
             .collect();
         let new_commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
-        let conn = open_db(scope)?;
+        let mut conn = open_db(scope)?;
         conn.execute(
             "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-            params![new_commit, board_uuid],
+            &[new_commit.as_str(), board_uuid],
         )?;
-        drop(conn);
-        commit_state_in(
+        dolt_commit_and_track_with(
             backend,
+            &mut conn,
             &scope.state_dir,
             &format!("board uuid backfill: {board_uuid}"),
         )?;
@@ -2732,7 +2786,7 @@ fn task_name_from_path(path: &str) -> String {
 fn task_parent_from_path(
     path: &str,
     board_uuid: &str,
-    conn: &Connection,
+    conn: &mut DoltConnection,
 ) -> Result<Option<String>> {
     let parts: Vec<&str> = path.split('/').collect();
     if parts.len() <= 1 {
@@ -2747,8 +2801,7 @@ fn task_parent_from_path(
     // The parent directory names are parts[0..len-2], parent is parts[0..len-2].
     // We need to find the task UUID for the directory at parts[0..len-2].
     let mut current_uuid = board_uuid.to_string();
-    for i in 0..parts.len() - 2 {
-        let child_name = parts[i];
+    for child_name in parts.iter().take(parts.len() - 2) {
         current_uuid = find_child_by_name(conn, Some(&current_uuid), child_name)?;
     }
     Ok(Some(current_uuid))
@@ -2757,7 +2810,7 @@ fn task_parent_from_path(
 /// Upsert a task into the tasks table from board tree walking.
 #[allow(clippy::too_many_arguments)]
 fn upsert_task_from_board(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     uuid: &str,
     name: &str,
     status: &str,
@@ -2769,17 +2822,19 @@ fn upsert_task_from_board(
     parent_task_uuid: Option<&str>,
     board_uuid: &str,
 ) -> Result<()> {
-    conn.execute(
-        "INSERT OR REPLACE INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![uuid, name, status, kind, description, project_uuid, deadline, importance, parent_task_uuid, board_uuid],
-    )?;
+    conn.execute_batch(&format!(
+        "REPLACE INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        sql_quote(uuid), sql_quote(name), sql_quote(status), sql_quote(kind),
+        sql_nullable(description), sql_quote(project_uuid),
+        sql_nullable(deadline), importance, sql_nullable(parent_task_uuid), sql_quote(board_uuid),
+    ))?;
     Ok(())
 }
 
 /// Upsert an object entry from board tree walking.
 fn upsert_object_from_board(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     uuid: &str,
     obj_type: &str,
     commit: &str,
@@ -2790,17 +2845,18 @@ fn upsert_object_from_board(
         Some((c, o)) => (Some(c), Some(o)),
         None => (None, None),
     };
-    conn.execute(
-        "INSERT OR REPLACE INTO objects (uuid, type, current_commit, board_uuid, source_context_uuid, source_object_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![uuid, obj_type, commit, board_uuid, src_ctx, src_obj],
-    )?;
+    conn.execute_batch(&format!(
+        "REPLACE INTO objects (uuid, `type`, current_commit, board_uuid, source_context_uuid, source_object_uuid) \
+         VALUES ({}, {}, {}, {}, {}, {})",
+        sql_quote(uuid), sql_quote(obj_type), sql_quote(commit), sql_quote(board_uuid),
+        sql_nullable(src_ctx), sql_nullable(src_obj),
+    ))?;
     Ok(())
 }
 
 /// Insert a row into the `objects` table.
 pub fn insert_object(
-    conn: &Connection,
+    conn: &mut DoltConnection,
     uuid: &str,
     obj_type: &str,
     commit: &str,
@@ -2810,12 +2866,17 @@ pub fn insert_object(
         Some((c, o, cc)) => (Some(c), Some(o), Some(cc)),
         None => (None, None, None),
     };
-    conn.execute(
-        "INSERT INTO objects (uuid, type, current_commit, \
+    conn.execute_batch(&format!(
+        "INSERT INTO objects (uuid, `type`, current_commit, \
                               source_context_uuid, source_object_uuid, source_context_commit) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![uuid, obj_type, commit, src_ctx, src_obj, src_commit],
-    )?;
+         VALUES ({}, {}, {}, {}, {}, {})",
+        sql_quote(uuid),
+        sql_quote(obj_type),
+        sql_quote(commit),
+        sql_nullable(src_ctx),
+        sql_nullable(src_obj),
+        sql_nullable(src_commit),
+    ))?;
     Ok(())
 }
 
@@ -3366,29 +3427,25 @@ pub fn add_task_from_md(
 
     // Validate parent.
     if let Some(parent) = parent_task_uuid {
-        let conn = open_db(scope)?;
+        let mut conn = open_db(scope)?;
         let exists: bool = conn
             .query_row(
                 "SELECT 1 FROM tasks WHERE task_uuid = ?1",
-                params![parent],
+                &[parent],
                 |_| Ok(true),
-            )
+            )?
             .unwrap_or(false);
         if !exists {
             bail!("parent task '{parent}' not found");
         }
     }
 
-    let conn = open_db(scope)?;
-    let existing: Vec<String> = {
-        let mut stmt = conn
-            .prepare("SELECT task_uuid FROM task_names WHERE branch_name = ?1 AND task_name = ?2")
-            .unwrap();
-        stmt.query_map(params![branch, name], |r| r.get(0))
-            .unwrap()
-            .filter_map(|r| r.ok())
-            .collect()
-    };
+    let mut conn = open_db(scope)?;
+    let existing: Vec<String> = conn.query_map(
+        "SELECT task_uuid FROM task_names WHERE branch_name = ?1 AND task_name = ?2",
+        &[branch.as_str(), name.as_str()],
+        |r| r.get::<String>(0),
+    )?;
     if !existing.is_empty() {
         println!(
             "WARNING: task name '{}' is not unique on branch '{}'. Existing UUIDs: {}",
@@ -3401,23 +3458,25 @@ pub fn add_task_from_md(
     // Store subtasks namespace as JSON in DB.
     let subs_json = serde_json::to_string(&serde_json::Value::Object(subtask_ns.clone()))?;
 
-    conn.execute(
+    conn.execute_batch(&format!(
         "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, subtasks) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
-        params![task_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance, parent_task_uuid, subs_json],
-    )?;
+         VALUES ({}, {}, {}, {}, {}, {}, {}, {}, {}, {})",
+        sql_quote(&task_uuid), sql_quote(&name), sql_quote(status_str), sql_quote(kind_str),
+        sql_nullable(description.as_deref()), sql_quote(&scope.project_uuid),
+        sql_nullable(deadline.as_deref()), importance,
+        sql_nullable(parent_task_uuid), sql_quote(&subs_json),
+    ))?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
-        params![branch, name, task_uuid],
+        &[branch.as_str(), name.as_str(), task_uuid.as_str()],
     )?;
-    drop(conn);
 
     let commit_msg = if source.is_some() {
         format!("task add (shadow): {name}")
     } else {
         format!("task add: {name}")
     };
-    commit_state_in(backend, &scope.state_dir, &commit_msg)?;
+    dolt_commit_and_track_with(backend, &mut conn, &scope.state_dir, &commit_msg)?;
 
     let task_data = TaskData {
         title,
@@ -3468,11 +3527,12 @@ pub fn add_task_from_md(
         &[("object.json", &object_json), ("TASK.md", &task_md)],
     )?;
 
-    let conn = open_db(scope)?;
-    insert_object(&conn, &task_uuid, "task", &commit, source)?;
-    drop(conn);
-    commit_state_in(
+    let mut conn = open_db(scope)?;
+    insert_object(&mut conn, &task_uuid, "task", &commit, source)?;
+
+    dolt_commit_and_track_with(
         backend,
+        &mut conn,
         &scope.state_dir,
         &format!("object add: {task_uuid}"),
     )?;
@@ -3619,22 +3679,25 @@ pub fn update_task(
     let task_deadline = val["data"]["deadline"].as_str().map(|s| s.to_string());
     let task_imp = val["data"]["importance"].as_f64().unwrap_or(0.0);
 
-    let conn = open_db(scope)?;
-    conn.execute(
-        "UPDATE tasks SET task_status=?1, task_kind=?2, \
-         task_description=?3, task_deadline=?4, task_importance=?5 \
-         WHERE task_uuid=?6",
-        params![
-            task_status,
-            task_kind,
-            task_desc,
-            task_deadline,
-            task_imp,
-            uuid
-        ],
+    let mut conn = open_db(scope)?;
+    conn.execute_batch(&format!(
+        "UPDATE tasks SET task_status={}, task_kind={}, \
+         task_description={}, task_deadline={}, task_importance={} \
+         WHERE task_uuid={}",
+        sql_quote(&task_status),
+        sql_quote(&task_kind),
+        sql_nullable(task_desc.as_deref()),
+        sql_nullable(task_deadline.as_deref()),
+        task_imp,
+        sql_quote(uuid),
+    ))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("task update: {uuid}"),
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("task update: {uuid}"))?;
 
     let new_commit = update_object_branch(
         backend,
@@ -3643,13 +3706,18 @@ pub fn update_task(
         &[("object.json", &updated_json), ("TASK.md", &new_md)],
     )?;
 
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![new_commit, uuid],
+        &[new_commit.as_str(), uuid],
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("object update: {uuid}"))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("object update: {uuid}"),
+    )?;
 
     eprintln!("[subcontext] Updated task ({uuid})");
     Ok(new_commit)
@@ -3696,8 +3764,10 @@ fn update_task_board(
             new_pairs.push((k.clone(), updated.unwrap_or_else(|| v.clone())));
         }
         // Add fields that weren't in the original frontmatter.
-        if name.is_some() && !pairs.iter().any(|(k, _)| k == "title") {
-            new_pairs.push(("title".to_string(), name.unwrap().to_string()));
+        if let Some(n) = name
+            && !pairs.iter().any(|(k, _)| k == "title")
+        {
+            new_pairs.push(("title".to_string(), n.to_string()));
         }
         rebuild_task_md_from_pairs(&new_pairs, &body)
     };
@@ -3714,22 +3784,25 @@ fn update_task_board(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
-    let conn = open_db(scope)?;
-    conn.execute(
-        "UPDATE tasks SET task_status=?1, task_kind=?2, \
-         task_description=?3, task_deadline=?4, task_importance=?5 \
-         WHERE task_uuid=?6",
-        params![
-            task_status,
-            task_kind,
-            task_desc,
-            task_deadline,
-            task_imp,
-            uuid
-        ],
+    let mut conn = open_db(scope)?;
+    conn.execute_batch(&format!(
+        "UPDATE tasks SET task_status={}, task_kind={}, \
+         task_description={}, task_deadline={}, task_importance={} \
+         WHERE task_uuid={}",
+        sql_quote(&task_status),
+        sql_quote(&task_kind),
+        sql_nullable(task_desc.as_deref()),
+        sql_nullable(task_deadline.as_deref()),
+        task_imp,
+        sql_quote(uuid),
+    ))?;
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("task update: {uuid}"),
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("task update: {uuid}"))?;
 
     let commit = update_task_in_board(backend, scope, uuid, board_uuid, &new_md)?;
 
@@ -3764,10 +3837,10 @@ pub fn show_task(
     name_or_uuid: &str,
 ) -> Result<ShowTaskResult> {
     // Try reading from board tree first (for board-based tasks).
-    if let Ok(Some(board_uuid)) = find_board_for_task(scope, name_or_uuid) {
-        if let Ok(md) = read_task_md_from_board(backend, scope, name_or_uuid, &board_uuid) {
-            return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
-        }
+    if let Ok(Some(board_uuid)) = find_board_for_task(scope, name_or_uuid)
+        && let Ok(md) = read_task_md_from_board(backend, scope, name_or_uuid, &board_uuid)
+    {
+        return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
     }
 
     // Try UUID on its own branch (legacy tasks or board root).
@@ -3776,33 +3849,31 @@ pub fn show_task(
     }
 
     // Look up by name across all branches.
-    let conn = open_db(scope)?;
-    let mut stmt = conn.prepare(
+    let mut conn = open_db(scope)?;
+    let matches: Vec<TaskMatch> = conn.query_map(
         "SELECT n.task_uuid, n.task_name, t.task_description, n.branch_name \
          FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid \
          WHERE n.task_name = ?1",
-    )?;
-    let matches: Vec<TaskMatch> = stmt
-        .query_map(params![name_or_uuid], |r| {
+        &[name_or_uuid],
+        |r| {
             Ok(TaskMatch {
-                uuid: r.get(0)?,
-                name: r.get(1)?,
-                description: r.get(2)?,
-                branch: r.get(3)?,
+                uuid: r.get::<String>(0)?,
+                name: r.get::<String>(1)?,
+                description: r.get::<Option<String>>(2)?,
+                branch: r.get::<String>(3)?,
             })
-        })?
-        .filter_map(|r| r.ok())
-        .collect();
+        },
+    )?;
 
     match matches.len() {
         0 => bail!("no task found matching '{name_or_uuid}'"),
         1 => {
             let m = &matches[0];
             // Try board tree first.
-            if let Ok(Some(board_uuid)) = find_board_for_task(scope, &m.uuid) {
-                if let Ok(md) = read_task_md_from_board(backend, scope, &m.uuid, &board_uuid) {
-                    return Ok(ShowTaskResult::Single(m.uuid.clone(), md));
-                }
+            if let Ok(Some(board_uuid)) = find_board_for_task(scope, &m.uuid)
+                && let Ok(md) = read_task_md_from_board(backend, scope, &m.uuid, &board_uuid)
+            {
+                return Ok(ShowTaskResult::Single(m.uuid.clone(), md));
             }
             // Fall back to own object branch (legacy).
             let md = read_object_file(backend, scope, &m.uuid, "TASK.md")?;
@@ -3852,21 +3923,19 @@ pub fn resolve_task_uuid(
             return Ok(name_or_uuid.to_string());
         }
         // Also check the tasks table (for board-based subtasks without own branch).
-        let conn = open_db(scope)?;
-        if verify_task_uuid(&conn, name_or_uuid).is_ok() {
+        let mut conn = open_db(scope)?;
+        if verify_task_uuid(&mut conn, name_or_uuid).is_ok() {
             return Ok(name_or_uuid.to_string());
         }
     }
 
     // Name lookup.
-    let conn = open_db(scope)?;
-    let mut stmt =
-        conn.prepare("SELECT n.task_uuid, n.branch_name FROM task_names n WHERE n.task_name = ?1")?;
-    let matches: Vec<(String, String)> = stmt
-        .query_map(params![name_or_uuid], |r| Ok((r.get(0)?, r.get(1)?)))
-        .unwrap()
-        .filter_map(|r| r.ok())
-        .collect();
+    let mut conn = open_db(scope)?;
+    let matches: Vec<(String, String)> = conn.query_map(
+        "SELECT n.task_uuid, n.branch_name FROM task_names n WHERE n.task_name = ?1",
+        &[name_or_uuid],
+        |r| Ok((r.get::<String>(0)?, r.get::<String>(1)?)),
+    )?;
 
     match matches.len() {
         0 => bail!("no task found matching '{name_or_uuid}'"),
@@ -4011,13 +4080,18 @@ fn update_object_commit(
     uuid: &str,
     commit: &str,
 ) -> Result<()> {
-    let conn = open_db(scope)?;
+    let mut conn = open_db(scope)?;
     conn.execute(
         "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![commit, uuid],
+        &[commit, uuid],
     )?;
-    drop(conn);
-    commit_state_in(backend, &scope.state_dir, &format!("object commit: {uuid}"))
+
+    dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("object commit: {uuid}"),
+    )
 }
 
 #[cfg(test)]

@@ -2,6 +2,7 @@ pub use subcontext::backend;
 
 mod clone;
 mod docs;
+mod dolt;
 mod git;
 mod global;
 mod hook;
@@ -140,6 +141,13 @@ enum Commands {
 
     /// Run the subcontext MCP server over stdio
     Mcp,
+
+    /// Run dolt commands against the subcontext database
+    Dolt {
+        /// Arguments to pass to the dolt binary
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
 
     /// Set the current user context (by UUID)
     SetUser {
@@ -471,8 +479,8 @@ fn handle_task_show(
         || name_or_uuid == ".."
         || name_or_uuid.starts_with('/')
     {
-        let conn = task::open_db(scope)?;
-        task::resolve_task_path(&conn, scope, name_or_uuid, Some(backend)).ok()
+        let mut conn = task::open_db(scope)?;
+        task::resolve_task_path(&mut conn, scope, name_or_uuid, Some(backend)).ok()
     } else {
         None
     };
@@ -608,9 +616,9 @@ fn main() -> Result<()> {
             let resolve_parent = |parent: &Option<String>| -> Result<Option<String>> {
                 match parent {
                     Some(p) => {
-                        let conn = task::open_db(&scope)?;
+                        let mut conn = task::open_db(&scope)?;
                         Ok(Some(task::resolve_task_path(
-                            &conn,
+                            &mut conn,
                             &scope,
                             p,
                             Some(backend),
@@ -693,14 +701,14 @@ fn main() -> Result<()> {
                             &root.join(".git"),
                         )? {
                             let global_scope = global::global_task_scope(backend)?;
-                            let conn = task::open_db(&global_scope)?;
+                            let mut conn = task::open_db(&global_scope)?;
                             conn.execute(
                                 "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-                                rusqlite::params![commit, scope.project_uuid],
+                                &[commit.as_str(), scope.project_uuid.as_str()],
                             )?;
-                            drop(conn);
-                            task::commit_state_in(
+                            task::dolt_commit_and_track_with(
                                 backend,
+                                &mut conn,
                                 &global_scope.state_dir,
                                 &format!("object update: {}", scope.project_uuid),
                             )?;
@@ -760,8 +768,8 @@ fn main() -> Result<()> {
                 }
                 TaskCommand::Set { name } => match name {
                     Some(ref n) => {
-                        let conn = task::open_db(&scope)?;
-                        let uuid = task::resolve_task_path(&conn, &scope, n, Some(backend))?;
+                        let mut conn = task::open_db(&scope)?;
+                        let uuid = task::resolve_task_path(&mut conn, &scope, n, Some(backend))?;
                         drop(conn);
                         task::set_branch_task(backend, &scope, &uuid)?;
                         eprintln!(
@@ -780,12 +788,17 @@ fn main() -> Result<()> {
                 TaskCommand::List { name } => {
                     let parent_uuid = match name {
                         Some(ref n) => {
-                            let conn = task::open_db(&scope)?;
-                            Some(task::resolve_task_path(&conn, &scope, n, Some(backend))?)
+                            let mut conn = task::open_db(&scope)?;
+                            Some(task::resolve_task_path(
+                                &mut conn,
+                                &scope,
+                                n,
+                                Some(backend),
+                            )?)
                         }
                         None => {
-                            let conn = task::open_db(&scope)?;
-                            task::get_branch_task(&conn, &scope.host_branch)?
+                            let mut conn = task::open_db(&scope)?;
+                            task::get_branch_task(&mut conn, &scope.host_branch)?
                         }
                     };
                     let tasks = task::list_subtasks(&scope, parent_uuid.as_deref())?;
@@ -1129,6 +1142,33 @@ fn main() -> Result<()> {
         }
         Commands::Mcp => {
             mcp::run(backend)?;
+        }
+        Commands::Dolt { args } => {
+            let dolt_bin = dolt::find_dolt_bin()?;
+            // Determine the dolt repo path: use local project if available,
+            // otherwise global.
+            let dolt_repo = if let Ok(root) = git::find_main_git_root(backend, &cwd) {
+                git::dolt_dir(&root)
+            } else if let Ok(scope) = global::global_task_scope(backend) {
+                scope.dolt_dir.clone()
+            } else {
+                anyhow::bail!("no subcontext found; run `subcontext install` first");
+            };
+            if !backend.is_dir(&dolt_repo) {
+                anyhow::bail!(
+                    "dolt repo not found at {}; run `subcontext install` to initialize",
+                    dolt_repo.display()
+                );
+            }
+            let str_args: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
+            let status = std::process::Command::new(&dolt_bin)
+                .args(&str_args)
+                .current_dir(&dolt_repo)
+                .status()
+                .with_context(|| "failed to run dolt".to_string())?;
+            if !status.success() {
+                std::process::exit(status.code().unwrap_or(1));
+            }
         }
         Commands::Hook {
             hook:

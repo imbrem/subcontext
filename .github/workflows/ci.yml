@@ -26,6 +26,12 @@ jobs:
 
       - uses: Swatinem/rust-cache@v2
 
+      - name: Install Dolt
+        run: |
+          curl -fsSL https://github.com/dolthub/dolt/releases/download/v1.85.0/dolt-linux-amd64.tar.gz \
+            | sudo tar xz -C /usr/local/bin --strip-components=2 dolt-linux-amd64/bin/dolt
+          dolt version
+
       - run: cargo fmt --check
       - run: cargo clippy -- -D warnings
       - run: cargo test
