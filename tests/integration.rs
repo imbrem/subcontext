@@ -3525,3 +3525,305 @@ fn board_commit_generates_missing_uuids() {
 
     cleanup(&root);
 }
+
+// ─── Task tree visualization ──────────────────────────────────────
+
+#[test]
+fn task_tree_json_empty() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let out = subcontext_ok(&root, &["task", "tree"]);
+    let parsed: serde_json::Value = serde_json::from_str(out.trim()).unwrap();
+    assert!(parsed.as_array().unwrap().is_empty());
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_json_flat_tasks() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "alpha", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "beta", "--status", "created"],
+    );
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "gamma", "--status", "done"],
+    );
+
+    // Default filter (active) should exclude done.
+    let out = subcontext_ok(&root, &["task", "tree"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    let names: Vec<&str> = parsed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"alpha"));
+    assert!(names.contains(&"beta"));
+    assert!(
+        !names.contains(&"gamma"),
+        "done task should be filtered out"
+    );
+
+    // --filter all should include everything.
+    let out = subcontext_ok(&root, &["task", "tree", "--filter", "all"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    let names: Vec<&str> = parsed.iter().map(|n| n["name"].as_str().unwrap()).collect();
+    assert!(names.contains(&"gamma"), "all filter should include done");
+
+    // --filter done should show only done.
+    let out = subcontext_ok(&root, &["task", "tree", "--filter", "done"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["name"].as_str().unwrap(), "gamma");
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_json_hierarchy() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "parent", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "task", "--local", "add", "child1", "--parent", "parent", "--status", "active",
+        ],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "task", "--local", "add", "child2", "--parent", "parent", "--status", "active",
+        ],
+    );
+
+    let out = subcontext_ok(&root, &["task", "tree"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+
+    // Should have one root node.
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["name"].as_str().unwrap(), "parent");
+
+    // With two children.
+    let children = parsed[0]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+    let child_names: Vec<&str> = children
+        .iter()
+        .map(|c| c["name"].as_str().unwrap())
+        .collect();
+    assert!(child_names.contains(&"child1"));
+    assert!(child_names.contains(&"child2"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_json_root_filter() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "parent", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "task", "--local", "add", "child1", "--parent", "parent", "--status", "active",
+        ],
+    );
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "other", "--status", "active"],
+    );
+
+    // Tree rooted at "parent" should only show parent and its children.
+    let out = subcontext_ok(&root, &["task", "tree", "parent"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed.len(), 1);
+    assert_eq!(parsed[0]["name"].as_str().unwrap(), "parent");
+    let children = parsed[0]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 1);
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_max_depth() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "root-task", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "task",
+            "--local",
+            "add",
+            "mid",
+            "--parent",
+            "root-task",
+            "--status",
+            "active",
+        ],
+    );
+    // Set current to root-task so "mid" resolves as its child.
+    subcontext_ok(&root, &["task", "set", "root-task"]);
+    subcontext_ok(
+        &root,
+        &[
+            "task", "--local", "add", "leaf", "--parent", "mid", "--status", "active",
+        ],
+    );
+
+    // max-depth 1: root-task and mid, but not leaf.
+    let out = subcontext_ok(&root, &["task", "tree", "--max-depth", "1"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert_eq!(parsed.len(), 1);
+    let mid = &parsed[0]["children"].as_array().unwrap();
+    assert_eq!(mid.len(), 1);
+    // leaf should not appear (depth 2 > max 1).
+    assert!(mid[0].get("children").is_none() || mid[0]["children"].as_array().unwrap().is_empty());
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_max_breadth() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "parent", "--status", "active"],
+    );
+    for i in 0..5 {
+        subcontext_ok(
+            &root,
+            &[
+                "task",
+                "--local",
+                "add",
+                &format!("child-{i}"),
+                "--parent",
+                "parent",
+                "--status",
+                "active",
+            ],
+        );
+    }
+
+    // max-breadth 2: only 2 children shown.
+    let out = subcontext_ok(&root, &["task", "tree", "--max-breadth", "2"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    let children = parsed[0]["children"].as_array().unwrap();
+    assert_eq!(children.len(), 2);
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_max_size() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    for i in 0..10 {
+        subcontext_ok(
+            &root,
+            &[
+                "task",
+                "--local",
+                "add",
+                &format!("task-{i}"),
+                "--status",
+                "active",
+            ],
+        );
+    }
+
+    let out = subcontext_ok(&root, &["task", "tree", "--max-size", "3"]);
+    let parsed: Vec<serde_json::Value> = serde_json::from_str(out.trim()).unwrap();
+    assert!(parsed.len() <= 3);
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_mermaid_output() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "my-task", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &[
+            "task", "--local", "add", "sub", "--parent", "my-task", "--status", "created",
+        ],
+    );
+
+    let out = subcontext_ok(&root, &["task", "tree", "--format", "mermaid"]);
+    assert!(out.starts_with("graph TD\n"));
+    assert!(out.contains("my-task [active]"));
+    assert!(out.contains("sub [created]"));
+    assert!(out.contains("-->"));
+    assert!(out.contains("classDef done"));
+    assert!(out.contains("classDef active"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_mermaid_filter_all() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "alive", "--status", "active"],
+    );
+    subcontext_ok(
+        &root,
+        &["task", "--local", "add", "dead", "--status", "done"],
+    );
+
+    // Default filter excludes done.
+    let out = subcontext_ok(&root, &["task", "tree", "--format", "mermaid"]);
+    assert!(out.contains("alive"));
+    assert!(!out.contains("dead [done]"));
+
+    // --filter all includes everything.
+    let out = subcontext_ok(
+        &root,
+        &["task", "tree", "--format", "mermaid", "--filter", "all"],
+    );
+    assert!(out.contains("alive"));
+    assert!(out.contains("dead [done]"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_tree_invalid_format() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let out = subcontext(&root, &["task", "tree", "--format", "xml"]);
+    assert!(!out.status.success());
+
+    cleanup(&root);
+}
