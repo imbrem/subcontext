@@ -99,16 +99,17 @@ pub fn init_state_branch_in(backend: &dyn Backend, bare: &Path, state: &Path) ->
 fn create_schema(conn: &Connection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
-             task_uuid       TEXT PRIMARY KEY,
-             task_name       TEXT NOT NULL,
-             task_status     TEXT NOT NULL,
-             task_kind       TEXT NOT NULL,
+             task_uuid        TEXT PRIMARY KEY,
+             task_name        TEXT NOT NULL,
+             task_status      TEXT NOT NULL,
+             task_kind        TEXT NOT NULL,
              task_description TEXT DEFAULT NULL,
-             project_uuid    TEXT NOT NULL,
-             task_deadline   TEXT DEFAULT NULL,
-             task_importance REAL NOT NULL DEFAULT 0.0,
+             project_uuid     TEXT NOT NULL,
+             task_deadline    TEXT DEFAULT NULL,
+             task_importance  REAL NOT NULL DEFAULT 0.0,
              parent_task_uuid TEXT DEFAULT NULL,
-             subtasks        TEXT NOT NULL DEFAULT '{}'
+             board_uuid       TEXT DEFAULT NULL,
+             subtasks         TEXT NOT NULL DEFAULT '{}'
          );
          CREATE TABLE IF NOT EXISTS task_names (
              branch_name   TEXT NOT NULL,
@@ -121,6 +122,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              uuid                  TEXT PRIMARY KEY,
              type                  TEXT NOT NULL,
              current_commit        TEXT NOT NULL,
+             board_uuid            TEXT DEFAULT NULL,
              source_context_uuid   TEXT DEFAULT NULL,
              source_object_uuid    TEXT DEFAULT NULL,
              source_context_commit TEXT DEFAULT NULL
@@ -130,54 +132,7 @@ fn create_schema(conn: &Connection) -> Result<()> {
              task_uuid     TEXT NOT NULL
          );",
     )?;
-    // Migrate existing databases that lack the new columns.
-    let _ = conn.execute_batch(
-        "ALTER TABLE tasks ADD COLUMN task_deadline TEXT DEFAULT NULL;
-         ALTER TABLE tasks ADD COLUMN task_importance REAL NOT NULL DEFAULT 0.0;",
-    );
-    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN parent_task_uuid TEXT DEFAULT NULL;");
-    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN subtasks TEXT NOT NULL DEFAULT '{}';");
-    let _ = conn.execute_batch(
-        "CREATE TABLE IF NOT EXISTS branch_tasks (
-             scope_branch  TEXT PRIMARY KEY,
-             task_uuid     TEXT NOT NULL
-         );",
-    );
-    // Migrate: allow duplicate task names (old schema had PK on branch+name).
-    migrate_task_names_allow_duplicates(conn);
-    // Migrate: add board_uuid column to objects table for board membership.
-    let _ = conn.execute_batch("ALTER TABLE objects ADD COLUMN board_uuid TEXT DEFAULT NULL;");
     Ok(())
-}
-
-/// Migrate task_names from (branch_name, task_name) PK to UNIQUE(task_uuid).
-/// This allows multiple tasks with the same name on the same branch.
-fn migrate_task_names_allow_duplicates(conn: &Connection) {
-    // Check if task_uuid already has a UNIQUE constraint (new schema).
-    // If the old PK exists we need to recreate the table.
-    let needs_migration: bool = conn
-        .query_row(
-            "SELECT sql FROM sqlite_master WHERE type='table' AND name='task_names'",
-            [],
-            |r| r.get::<_, String>(0),
-        )
-        .map(|sql| sql.contains("PRIMARY KEY (branch_name, task_name)"))
-        .unwrap_or(false);
-
-    if needs_migration {
-        let _ = conn.execute_batch(
-            "CREATE TABLE task_names_new (
-                 branch_name TEXT NOT NULL,
-                 task_name   TEXT NOT NULL,
-                 task_uuid   TEXT NOT NULL UNIQUE
-             );
-             INSERT OR IGNORE INTO task_names_new SELECT * FROM task_names;
-             DROP TABLE task_names;
-             ALTER TABLE task_names_new RENAME TO task_names;
-             CREATE INDEX IF NOT EXISTS idx_task_names_lookup
-                 ON task_names (branch_name, task_name);",
-        );
-    }
 }
 
 pub fn open_db(scope: &TaskScope) -> Result<Connection> {
@@ -1107,6 +1062,7 @@ pub fn list_deadlines(
     scope: &TaskScope,
     important_only: bool,
     horizon: Option<&str>,
+    board: Option<&str>,
 ) -> Result<Vec<DeadlineEntry>> {
     let horizon_secs: Option<f64> = match horizon {
         Some(h) => Some(parse_duration(h)?),
@@ -1125,25 +1081,45 @@ pub fn list_deadlines(
     if important_only {
         sql.push_str(" AND t.task_importance > 0.0");
     }
+    if board.is_some() {
+        sql.push_str(" AND t.board_uuid = ?2");
+    }
     sql.push_str(" ORDER BY t.task_deadline ASC");
 
     let mut stmt = conn.prepare(&sql)?;
-    let rows = stmt.query_map(params![scope.host_branch], |r| {
-        Ok(DeadlineEntry {
-            name: r.get(0)?,
-            uuid: r.get(1)?,
-            status: r.get(2)?,
-            kind: r.get(3)?,
-            deadline: r.get(4)?,
-            importance: r.get(5)?,
-            description: r.get(6)?,
-        })
-    })?;
+    let rows: Vec<DeadlineEntry> = if let Some(board_uuid) = board {
+        stmt.query_map(params![scope.host_branch, board_uuid], |r| {
+            Ok(DeadlineEntry {
+                name: r.get(0)?,
+                uuid: r.get(1)?,
+                status: r.get(2)?,
+                kind: r.get(3)?,
+                deadline: r.get(4)?,
+                importance: r.get(5)?,
+                description: r.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    } else {
+        stmt.query_map(params![scope.host_branch], |r| {
+            Ok(DeadlineEntry {
+                name: r.get(0)?,
+                uuid: r.get(1)?,
+                status: r.get(2)?,
+                kind: r.get(3)?,
+                deadline: r.get(4)?,
+                importance: r.get(5)?,
+                description: r.get(6)?,
+            })
+        })?
+        .filter_map(|r| r.ok())
+        .collect()
+    };
 
     let now_secs = current_unix_secs();
     let mut entries = Vec::new();
-    for row in rows {
-        let entry = row?;
+    for entry in rows {
         if let Some(horizon) = horizon_secs
             && let Some(deadline_secs) = parse_iso8601_to_unix(&entry.deadline)
         {
@@ -1307,39 +1283,33 @@ pub fn build_child_object_json(child_data: &serde_json::Value) -> String {
 
 // ─── Board Support ────────���───────────────────────────────────────
 
-/// Build a simplified `object.json` for a board.
-/// Boards have: `{"type": "board", "uuid": "<uuid>"}`.
-fn build_board_object_json(uuid: &str) -> String {
+/// Build a simplified `object.json` for a tree-format task (board).
+/// Tree tasks have: `{"type": "task", "format": "tree", "uuid": "<uuid>"}`.
+fn build_tree_object_json(uuid: &str) -> String {
     let obj = serde_json::json!({
-        "type": "board",
+        "type": "task",
+        "format": "tree",
         "uuid": uuid,
     });
     serde_json::to_string_pretty(&obj).unwrap() + "\n"
 }
 
-/// Generate a BOARD.md string for a sub-board reference.
-/// Contains the sub-board's description and UUID.
+/// Generate a link.json for a sub-board (or other linked object) reference.
+/// Contains the linked object's UUID and optional description.
 #[allow(dead_code)]
-pub fn generate_board_md(description: &str, uuid: &str) -> String {
-    let mut lines = vec!["---".to_string()];
-    lines.push(format!("uuid: {}", uuid));
-    if !description.is_empty() {
-        lines.push(format!("description: {}", description));
+pub fn generate_link_json(uuid: &str, description: Option<&str>) -> String {
+    let mut obj = serde_json::json!({ "uuid": uuid });
+    if let Some(desc) = description {
+        obj["description"] = serde_json::Value::String(desc.to_string());
     }
-    lines.push("---".to_string());
-    let mut result = lines.join("\n");
-    if !result.ends_with('\n') {
-        result.push('\n');
-    }
-    result
+    serde_json::to_string_pretty(&obj).unwrap() + "\n"
 }
 
-/// Parse a BOARD.md file, returning `(uuid, description)`.
-pub fn parse_board_md(content: &str) -> Option<(String, Option<String>)> {
-    let (pairs, _body) = parse_frontmatter(content);
-    let fm = FrontmatterMap(&pairs);
-    let uuid = fm.get("uuid")?;
-    let description = fm.get("description");
+/// Parse a link.json file, returning `(uuid, description)`.
+pub fn parse_link_json(content: &str) -> Option<(String, Option<String>)> {
+    let val: serde_json::Value = serde_json::from_str(content).ok()?;
+    let uuid = val["uuid"].as_str()?.to_string();
+    let description = val["description"].as_str().map(|s| s.to_string());
     Some((uuid, description))
 }
 
@@ -1411,8 +1381,8 @@ pub fn create_board(
     // Insert the root task into the tasks table.
     let conn = open_db(scope)?;
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?1)",
         params![board_uuid, name, status, kind, description, scope.project_uuid, deadline, importance],
     )?;
     conn.execute(
@@ -1423,7 +1393,7 @@ pub fn create_board(
     commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
 
     // Build the board branch: object.json + TASK.md at root.
-    let object_json = build_board_object_json(&board_uuid);
+    let object_json = build_tree_object_json(&board_uuid);
     let task_data = TaskData {
         title: None,
         uuid: board_uuid.clone(),
@@ -1447,9 +1417,9 @@ pub fn create_board(
         &[("object.json", &object_json), ("TASK.md", &task_md)],
     )?;
 
-    // Record in the objects table: the board itself is an object.
+    // Record in the objects table: the board itself is a task object.
     let conn = open_db(scope)?;
-    insert_object(&conn, &board_uuid, "board", &commit, source)?;
+    insert_object(&conn, &board_uuid, "task", &commit, source)?;
     // Board_uuid for the root task object entry is itself.
     conn.execute(
         "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
@@ -1506,8 +1476,8 @@ pub fn create_board_from_md(
 
     let conn = open_db(scope)?;
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL, ?1)",
         params![board_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance],
     )?;
     conn.execute(
@@ -1517,7 +1487,7 @@ pub fn create_board_from_md(
     drop(conn);
     commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
 
-    let object_json = build_board_object_json(&board_uuid);
+    let object_json = build_tree_object_json(&board_uuid);
     // Regenerate TASK.md with uuid embedded.
     let task_md = {
         let mut lines = vec!["---".to_string()];
@@ -1548,7 +1518,7 @@ pub fn create_board_from_md(
     )?;
 
     let conn = open_db(scope)?;
-    insert_object(&conn, &board_uuid, "board", &commit, source)?;
+    insert_object(&conn, &board_uuid, "task", &commit, source)?;
     conn.execute(
         "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
         params![board_uuid, board_uuid],
@@ -1591,12 +1561,12 @@ pub fn add_task_to_board(
     let kind = kind.unwrap_or(DEFAULT_KIND);
     let status = status.unwrap_or(DEFAULT_STATUS);
 
-    // Insert into tasks table with parent.
+    // Insert into tasks table with parent and board.
     let conn = open_db(scope)?;
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid, board_uuid],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -1824,9 +1794,9 @@ pub fn update_task_in_board(
 /// - Upsert into tasks table
 /// - Upsert into objects table (with board_uuid and current board commit)
 ///
-/// For each BOARD.md found (sub-boards):
-/// - Parse to get sub-board UUID and description
-/// - The sub-board itself is a separate board branch
+/// For each link.json found (sub-boards / linked objects):
+/// - Parse to get linked UUID and description
+/// - The linked object is a separate branch
 ///
 /// Returns the number of tasks synchronized.
 pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) -> Result<usize> {
@@ -1870,6 +1840,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                     None,
                     0.0,
                     parent_task_uuid.as_deref(),
+                    board_uuid,
                 )?;
                 upsert_object_from_board(
                     &conn,
@@ -1916,15 +1887,9 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                 deadline.as_deref(),
                 importance,
                 parent_task_uuid.as_deref(),
-            )?;
-            upsert_object_from_board(
-                &conn,
-                &task_uuid,
-                if path == "TASK.md" { "board" } else { "task" },
-                &head_commit,
                 board_uuid,
-                None,
             )?;
+            upsert_object_from_board(&conn, &task_uuid, "task", &head_commit, board_uuid, None)?;
 
             // Also register in task_names if not already present.
             let existing: Option<String> = conn
@@ -1942,19 +1907,12 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
             }
 
             count += 1;
-        } else if filename == "BOARD.md" {
-            // Sub-board reference.
-            if let Some((sub_uuid, _description)) = parse_board_md(content) {
-                // The sub-board entry in the objects table points to the separate
-                // board branch for the sub-board.
-                upsert_object_from_board(
-                    &conn,
-                    &sub_uuid,
-                    "board",
-                    &head_commit,
-                    board_uuid,
-                    None,
-                )?;
+        } else if filename == "link.json" {
+            // Sub-board (or other linked object) reference.
+            if let Some((sub_uuid, _description)) = parse_link_json(content) {
+                // The linked object in the objects table points to its own
+                // branch; we just record it here for tracking.
+                upsert_object_from_board(&conn, &sub_uuid, "task", &head_commit, board_uuid, None)?;
                 count += 1;
             }
         }
@@ -2025,12 +1983,12 @@ fn upsert_task_from_board(
     deadline: Option<&str>,
     importance: f64,
     parent_task_uuid: Option<&str>,
+    board_uuid: &str,
 ) -> Result<()> {
-    // Use INSERT OR REPLACE to upsert.
     conn.execute(
-        "INSERT OR REPLACE INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-        params![uuid, name, status, kind, description, project_uuid, deadline, importance, parent_task_uuid],
+        "INSERT OR REPLACE INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, board_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![uuid, name, status, kind, description, project_uuid, deadline, importance, parent_task_uuid, board_uuid],
     )?;
     Ok(())
 }

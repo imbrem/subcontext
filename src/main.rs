@@ -267,6 +267,9 @@ enum TaskCommand {
         /// Suffixes: s, m (minutes), h, d, w, mo (months), y. 0 = only overdue.
         #[arg(long)]
         horizon: Option<String>,
+        /// Filter deadlines by board (name or UUID)
+        #[arg(long)]
+        board: Option<String>,
     },
     /// Set (or unset) the current task for this branch
     Set {
@@ -672,8 +675,21 @@ fn main() -> Result<()> {
                 TaskCommand::Fail { name, time } => {
                     task::fail_task(backend, &scope, &name, time.as_deref())?;
                 }
-                TaskCommand::Deadlines { important, horizon } => {
-                    let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
+                TaskCommand::Deadlines {
+                    important,
+                    horizon,
+                    board,
+                } => {
+                    let board_uuid = board
+                        .as_ref()
+                        .map(|b| task::resolve_task_uuid(backend, &scope, b))
+                        .transpose()?;
+                    let entries = task::list_deadlines(
+                        &scope,
+                        important,
+                        horizon.as_deref(),
+                        board_uuid.as_deref(),
+                    )?;
                     print!("{}", task::format_deadlines(&entries));
                 }
                 TaskCommand::Set { name } => match name {

@@ -161,6 +161,6 @@ fn deadlines_text(
 ) -> anyhow::Result<String> {
     let root = git::find_main_git_root(backend, cwd)?;
     let scope = task::TaskScope::for_local(backend, &root)?;
-    let entries = task::list_deadlines(&scope, important_only, horizon)?;
+    let entries = task::list_deadlines(&scope, important_only, horizon, None)?;
     Ok(task::format_deadlines(&entries))
 }

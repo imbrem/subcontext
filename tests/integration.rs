@@ -2943,11 +2943,15 @@ fn board_create_creates_board_branch_with_tree() {
         .trim_start_matches("object/")
         .to_string();
 
-    // object.json should be a board type.
+    // object.json should be a tree-format task.
     let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
     assert!(
-        obj_json.contains("\"type\": \"board\""),
-        "should be board type, got: {obj_json}"
+        obj_json.contains("\"type\": \"task\""),
+        "should be task type, got: {obj_json}"
+    );
+    assert!(
+        obj_json.contains("\"format\": \"tree\""),
+        "should have format tree, got: {obj_json}"
     );
     assert!(
         obj_json.contains(&format!("\"uuid\": \"{uuid}\"")),
