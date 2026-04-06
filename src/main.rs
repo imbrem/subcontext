@@ -479,8 +479,8 @@ fn handle_task_show(
         || name_or_uuid == ".."
         || name_or_uuid.starts_with('/')
     {
-        let conn = task::open_db(scope)?;
-        task::resolve_task_path(&conn, scope, name_or_uuid, Some(backend)).ok()
+        let mut conn = task::open_db(scope)?;
+        task::resolve_task_path(&mut conn, scope, name_or_uuid, Some(backend)).ok()
     } else {
         None
     };
@@ -616,9 +616,9 @@ fn main() -> Result<()> {
             let resolve_parent = |parent: &Option<String>| -> Result<Option<String>> {
                 match parent {
                     Some(p) => {
-                        let conn = task::open_db(&scope)?;
+                        let mut conn = task::open_db(&scope)?;
                         Ok(Some(task::resolve_task_path(
-                            &conn,
+                            &mut conn,
                             &scope,
                             p,
                             Some(backend),
@@ -701,14 +701,15 @@ fn main() -> Result<()> {
                             &root.join(".git"),
                         )? {
                             let global_scope = global::global_task_scope(backend)?;
-                            let conn = task::open_db(&global_scope)?;
+                            let mut conn = task::open_db(&global_scope)?;
                             conn.execute(
                                 "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
                                 &[commit.as_str(), scope.project_uuid.as_str()],
                             )?;
-                            task::dolt_commit_and_track(
+                            task::dolt_commit_and_track_with(
                                 backend,
-                                &global_scope,
+                                &mut conn,
+                                &global_scope.state_dir,
                                 &format!("object update: {}", scope.project_uuid),
                             )?;
                         }
@@ -767,8 +768,8 @@ fn main() -> Result<()> {
                 }
                 TaskCommand::Set { name } => match name {
                     Some(ref n) => {
-                        let conn = task::open_db(&scope)?;
-                        let uuid = task::resolve_task_path(&conn, &scope, n, Some(backend))?;
+                        let mut conn = task::open_db(&scope)?;
+                        let uuid = task::resolve_task_path(&mut conn, &scope, n, Some(backend))?;
                         drop(conn);
                         task::set_branch_task(backend, &scope, &uuid)?;
                         eprintln!(
@@ -787,12 +788,17 @@ fn main() -> Result<()> {
                 TaskCommand::List { name } => {
                     let parent_uuid = match name {
                         Some(ref n) => {
-                            let conn = task::open_db(&scope)?;
-                            Some(task::resolve_task_path(&conn, &scope, n, Some(backend))?)
+                            let mut conn = task::open_db(&scope)?;
+                            Some(task::resolve_task_path(
+                                &mut conn,
+                                &scope,
+                                n,
+                                Some(backend),
+                            )?)
                         }
                         None => {
-                            let conn = task::open_db(&scope)?;
-                            task::get_branch_task(&conn, &scope.host_branch)?
+                            let mut conn = task::open_db(&scope)?;
+                            task::get_branch_task(&mut conn, &scope.host_branch)?
                         }
                     };
                     let tasks = task::list_subtasks(&scope, parent_uuid.as_deref())?;

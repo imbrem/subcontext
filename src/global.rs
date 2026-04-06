@@ -520,34 +520,36 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
     // 8. Register as managed child of the system subcontext.
     if let Some(commit) = register_child(backend, &user_uuid, USER_KIND)? {
         let global_scope = global_task_scope(backend)?;
-        let conn = crate::task::open_db(&global_scope)?;
-        crate::task::insert_object(&conn, &user_uuid, "managed", &commit, None)?;
-        crate::task::dolt_commit_and_track(
+        let mut conn = crate::task::open_db(&global_scope)?;
+        crate::task::insert_object(&mut conn, &user_uuid, "managed", &commit, None)?;
+        crate::task::dolt_commit_and_track_with(
             backend,
-            &global_scope,
+            &mut conn,
+            &global_scope.state_dir,
             &format!("object add: {user_uuid}"),
         )?;
     }
 
     // 9. Set as current user if none exists.
     let global_scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&global_scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&global_scope)?;
+    ensure_global_extra_schema(&mut conn)?;
     let existing: Option<String> = conn
         .query_row(
-            "SELECT value FROM config WHERE `key` = 'current_user'",
+            "SELECT value FROM config WHERE key_name = 'current_user'",
             &[],
             |row| row.get::<Option<String>>(0),
         )?
         .flatten();
     if existing.is_none() {
         conn.execute(
-            "REPLACE INTO config (`key`, value) VALUES (?1, ?2)",
+            "REPLACE INTO config (key_name, value) VALUES (?1, ?2)",
             &[&"current_user", &user_uuid.as_str()],
         )?;
-        crate::task::dolt_commit_and_track(
+        crate::task::dolt_commit_and_track_with(
             backend,
-            &global_scope,
+            &mut conn,
+            &global_scope.state_dir,
             &format!("set current user: {user_uuid}"),
         )?;
         eprintln!("[subcontext] Set current user to {user_uuid}.");
@@ -581,7 +583,7 @@ pub fn user_task_scope(backend: &dyn Backend) -> Result<TaskScope> {
 
 /// Ensure extra schema tables exist in the global DB (config table, parents
 /// table). Called lazily — safe to call multiple times.
-pub fn ensure_global_extra_schema(conn: &crate::dolt::DoltConnection) -> Result<()> {
+pub fn ensure_global_extra_schema(conn: &mut crate::dolt::DoltConnection) -> Result<()> {
     crate::dolt::create_dolt_global_schema(conn)?;
     Ok(())
 }
@@ -594,11 +596,11 @@ pub fn get_current_user(backend: &dyn Backend) -> Result<Option<String>> {
         return Ok(None);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
     let val: Option<String> = conn
         .query_row(
-            "SELECT value FROM config WHERE `key` = 'current_user'",
+            "SELECT value FROM config WHERE key_name = 'current_user'",
             &[],
             |row| row.get::<Option<String>>(0),
         )?
@@ -613,8 +615,8 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
         bail!("no global (system) subcontext installed");
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
 
     // Verify it's a managed user subcontext by checking the object branch.
     let repo = global_repo_dir()?;
@@ -646,10 +648,15 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
     }
 
     conn.execute(
-        "REPLACE INTO config (`key`, value) VALUES (?1, ?2)",
+        "REPLACE INTO config (key_name, value) VALUES (?1, ?2)",
         &[&"current_user", uuid],
     )?;
-    crate::task::dolt_commit_and_track(backend, &scope, &format!("set current user: {uuid}"))?;
+    crate::task::dolt_commit_and_track_with(
+        backend,
+        &mut conn,
+        &scope.state_dir,
+        &format!("set current user: {uuid}"),
+    )?;
     eprintln!("[subcontext] Current user set to {uuid}.");
     Ok(())
 }
@@ -660,8 +667,8 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
 /// A child can only have one parent; re-setting is an error unless the same.
 pub fn set_parent(backend: &dyn Backend, child_uuid: &str, parent_uuid: &str) -> Result<()> {
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
 
     let existing: Option<String> = conn
         .query_row(
@@ -681,9 +688,10 @@ pub fn set_parent(backend: &dyn Backend, child_uuid: &str, parent_uuid: &str) ->
         "INSERT INTO parents (child_uuid, parent_uuid) VALUES (?1, ?2)",
         &[child_uuid, parent_uuid],
     )?;
-    crate::task::dolt_commit_and_track(
+    crate::task::dolt_commit_and_track_with(
         backend,
-        &scope,
+        &mut conn,
+        &scope.state_dir,
         &format!("set parent of {child_uuid} to {parent_uuid}"),
     )?;
     Ok(())
@@ -695,8 +703,8 @@ pub fn get_parent(backend: &dyn Backend, child_uuid: &str) -> Result<Option<Stri
         return Ok(None);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
     let val: Option<String> = conn
         .query_row(
             "SELECT parent_uuid FROM parents WHERE child_uuid = ?1",
@@ -713,8 +721,8 @@ pub fn get_children(backend: &dyn Backend, parent_uuid: &str) -> Result<Vec<Stri
         return Ok(vec![]);
     }
     let scope = global_task_scope(backend)?;
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
     let children: Vec<String> = conn.query_map(
         "SELECT child_uuid FROM parents WHERE parent_uuid = ?1",
         &[parent_uuid],
@@ -750,8 +758,8 @@ pub fn tree_text(backend: &dyn Backend) -> Result<String> {
     let scope = global_task_scope(backend)?;
     let system_uuid = scope.project_uuid.clone();
 
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
 
     // Collect all managed objects.
     let managed: Vec<(String, String)> = conn.query_map(
@@ -860,8 +868,8 @@ pub fn ancestry_chain(backend: &dyn Backend, uuid: &str) -> Result<Vec<(String, 
     }
     let scope = global_task_scope(backend)?;
     let system_uuid = scope.project_uuid.clone();
-    let conn = crate::task::open_db(&scope)?;
-    ensure_global_extra_schema(&conn)?;
+    let mut conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&mut conn)?;
 
     let mut chain = vec![];
     let mut current = uuid.to_string();

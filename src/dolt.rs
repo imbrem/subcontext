@@ -1,22 +1,25 @@
-//! Dolt binary management, repo initialization, and SQL execution.
+//! Dolt binary management, repo initialization, and SQL execution via MySQL.
 //!
-//! Provides [`DoltConnection`] as a replacement for `rusqlite::Connection`,
-//! shelling out to `dolt sql` for SQL operations against a local Dolt repo.
-//! Dolt commit tracking is managed via the git state branch.
+//! Provides [`DoltConnection`] which connects to a `dolt sql-server` via the
+//! MySQL wire protocol using the `mysql` crate. A process-level server registry
+//! ensures only one server runs per dolt repo path.
 
 use anyhow::{Context, Result, bail};
+use mysql::prelude::*;
+use mysql::{Conn, Opts, OptsBuilder};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::backend::Backend;
 
 // ─── Binary management ───────────────────────────────────────────────
 
-/// Known Dolt release version to download.
 const DOLT_VERSION: &str = "1.85.0";
 
-/// Return the global Dolt binary path: `~/.subcontext/bin/dolt`.
 pub fn global_dolt_bin() -> Result<PathBuf> {
     let home = std::env::var("HOME").context("HOME not set")?;
     Ok(PathBuf::from(home)
@@ -25,18 +28,12 @@ pub fn global_dolt_bin() -> Result<PathBuf> {
         .join("dolt"))
 }
 
-/// Find the Dolt binary. Checks:
-/// 1. `~/.subcontext/bin/dolt`
-/// 2. `dolt` on PATH
 pub fn find_dolt_bin() -> Result<PathBuf> {
-    // Check global install location first
     if let Ok(global) = global_dolt_bin() {
         if global.is_file() {
             return Ok(global);
         }
     }
-
-    // Check PATH
     if let Ok(output) = Command::new("which").arg("dolt").output() {
         if output.status.success() {
             let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -45,21 +42,18 @@ pub fn find_dolt_bin() -> Result<PathBuf> {
             }
         }
     }
-
     bail!(
         "dolt binary not found. Run `subcontext install` to download it, \
          or install dolt manually and ensure it's on PATH."
     )
 }
 
-/// Download the Dolt binary to `~/.subcontext/bin/dolt`.
 pub fn download_dolt(backend: &dyn Backend) -> Result<PathBuf> {
     let bin_dir = {
         let home = std::env::var("HOME").context("HOME not set")?;
         PathBuf::from(home).join(".subcontext").join("bin")
     };
     backend.create_dir_all(&bin_dir)?;
-
     let dest = bin_dir.join("dolt");
     if backend.is_file(&dest) {
         eprintln!(
@@ -68,10 +62,8 @@ pub fn download_dolt(backend: &dyn Backend) -> Result<PathBuf> {
         );
         return Ok(dest);
     }
-
     let arch = std::env::consts::ARCH;
     let os = std::env::consts::OS;
-
     let (os_name, arch_name) = match (os, arch) {
         ("linux", "x86_64") => ("linux", "amd64"),
         ("linux", "aarch64") => ("linux", "arm64"),
@@ -79,15 +71,10 @@ pub fn download_dolt(backend: &dyn Backend) -> Result<PathBuf> {
         ("macos", "aarch64") => ("darwin", "arm64"),
         _ => bail!("unsupported platform: {os}/{arch}. Please install dolt manually."),
     };
-
     let url = format!(
         "https://github.com/dolthub/dolt/releases/download/v{DOLT_VERSION}/dolt-{os_name}-{arch_name}.tar.gz"
     );
-
     eprintln!("[subcontext] Downloading dolt v{DOLT_VERSION} for {os_name}/{arch_name}...");
-
-    // Download and extract in one pipeline:
-    //   curl -sL <url> | tar xz -C <bin_dir> --strip-components=1 dolt-<os>-<arch>/bin/dolt
     let tar_prefix = format!("dolt-{os_name}-{arch_name}/bin/dolt");
     let status = Command::new("sh")
         .arg("-c")
@@ -99,31 +86,23 @@ pub fn download_dolt(backend: &dyn Backend) -> Result<PathBuf> {
         ))
         .status()
         .context("failed to run curl | tar")?;
-
     if !status.success() {
         bail!("failed to download dolt from {url}");
     }
-
     #[cfg(unix)]
     backend.set_permissions_mode(&dest, 0o755)?;
-
     eprintln!("[subcontext] Dolt installed to {}", dest.display());
     Ok(dest)
 }
 
 // ─── Dolt repo initialization ────────────────────────────────────────
 
-/// Initialize a Dolt repository at the given path.
 pub fn init_dolt_repo(backend: &dyn Backend, dolt_path: &Path) -> Result<()> {
     backend.create_dir_all(dolt_path)?;
-
-    // Check if already initialized
     if backend.is_dir(&dolt_path.join(".dolt")) {
         return Ok(());
     }
-
     let dolt_bin = find_dolt_bin()?;
-
     let output = Command::new(&dolt_bin)
         .args([
             "init",
@@ -135,61 +114,215 @@ pub fn init_dolt_repo(backend: &dyn Backend, dolt_path: &Path) -> Result<()> {
         .current_dir(dolt_path)
         .output()
         .with_context(|| format!("failed to run dolt init in {}", dolt_path.display()))?;
-
-    let status = output.status;
-
-    if !status.success() {
+    if !output.status.success() {
         bail!("dolt init failed in {}", dolt_path.display());
     }
-
     Ok(())
+}
+
+// ─── Port allocation ────────────────────────────────────────────────
+
+fn find_free_port() -> Result<u16> {
+    let listener = TcpListener::bind("127.0.0.1:0").context("failed to bind to free port")?;
+    let port = listener.local_addr()?.port();
+    drop(listener);
+    Ok(port)
+}
+
+// ─── Server registry ─────────────────────────────────────────────────
+
+struct DoltServer {
+    server: Child,
+    port: u16,
+    db_name: String,
+    ref_count: usize,
+}
+
+impl DoltServer {
+    fn opts(&self) -> Opts {
+        OptsBuilder::new()
+            .ip_or_hostname(Some("127.0.0.1"))
+            .tcp_port(self.port)
+            .user(Some("root"))
+            .db_name(Some(&self.db_name))
+            .into()
+    }
+}
+
+fn server_registry() -> &'static Mutex<HashMap<PathBuf, Arc<Mutex<DoltServer>>>> {
+    static REG: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<DoltServer>>>>> = OnceLock::new();
+    REG.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ensure_server(repo_path: &Path) -> Result<Arc<Mutex<DoltServer>>> {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let mut registry = server_registry().lock().unwrap();
+
+    if let Some(entry) = registry.get(&canonical) {
+        let mut srv = entry.lock().unwrap();
+        if srv.server.try_wait().ok().flatten().is_none() {
+            srv.ref_count += 1;
+            return Ok(Arc::clone(entry));
+        }
+        drop(srv);
+        registry.remove(&canonical);
+    }
+
+    let dolt_bin = find_dolt_bin()?;
+    let port = find_free_port()?;
+
+    let config_yaml =
+        format!("behavior:\n  autocommit: false\nlistener:\n  host: 127.0.0.1\n  port: {port}\n");
+    std::fs::write(repo_path.join("config.yaml"), config_yaml.as_bytes())
+        .context("failed to write dolt config.yaml")?;
+
+    let config_path = repo_path.join("config.yaml");
+    let mut server = Command::new(&dolt_bin)
+        .args(["sql-server", "--config", &config_path.to_string_lossy()])
+        .current_dir(repo_path)
+        .stdout(Stdio::null())
+        .stderr({
+            let log_path = repo_path.join("sql-server.log");
+            std::fs::File::create(&log_path)
+                .map(Stdio::from)
+                .unwrap_or(Stdio::null())
+        })
+        .spawn()
+        .with_context(|| format!("failed to start dolt sql-server in {}", repo_path.display()))?;
+
+    let db_name = repo_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("dolt")
+        .to_string();
+
+    let opts: Opts = OptsBuilder::new()
+        .ip_or_hostname(Some("127.0.0.1"))
+        .tcp_port(port)
+        .user(Some("root"))
+        .db_name(Some(&db_name))
+        .into();
+
+    let mut connected = false;
+    let mut last_err = None;
+    for i in 0..80 {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        if let Some(status) = server.try_wait().ok().flatten() {
+            let log_path = repo_path.join("sql-server.log");
+            let stderr_msg = std::fs::read_to_string(&log_path).unwrap_or_default();
+            bail!("dolt sql-server exited early with {status} on port {port}: {stderr_msg}");
+        }
+        match Conn::new(opts.clone()) {
+            Ok(_c) => {
+                connected = true;
+                break;
+            }
+            Err(e) => {
+                last_err = Some(e);
+                if i % 20 == 19 {
+                    eprintln!(
+                        "[subcontext] Waiting for dolt sql-server on port {port}... ({:.1}s)",
+                        (i + 1) as f64 * 0.1
+                    );
+                }
+            }
+        }
+    }
+
+    if !connected {
+        let log_path = repo_path.join("sql-server.log");
+        let stderr_msg = std::fs::read_to_string(&log_path).unwrap_or_default();
+        let _ = server.kill();
+        let _ = server.wait();
+        bail!(
+            "failed to connect to dolt sql-server on port {port} after 8s: {}\nserver log: {stderr_msg}",
+            last_err
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "unknown error".to_string())
+        );
+    }
+
+    let entry = Arc::new(Mutex::new(DoltServer {
+        server,
+        port,
+        db_name,
+        ref_count: 1,
+    }));
+    registry.insert(canonical, Arc::clone(&entry));
+    Ok(entry)
+}
+
+fn release_server(repo_path: &Path) {
+    let canonical = std::fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let mut registry = server_registry().lock().unwrap();
+    let should_remove = if let Some(entry) = registry.get(&canonical) {
+        let mut srv = entry.lock().unwrap();
+        srv.ref_count = srv.ref_count.saturating_sub(1);
+        if srv.ref_count == 0 {
+            let _ = srv.server.kill();
+            let _ = srv.server.wait();
+            true
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+    if should_remove {
+        registry.remove(&canonical);
+    }
 }
 
 // ─── DoltConnection ──────────────────────────────────────────────────
 
-/// A connection to a local Dolt repository, analogous to `rusqlite::Connection`.
-/// All SQL operations shell out to `dolt sql`.
 pub struct DoltConnection {
-    /// Path to the Dolt repository (contains `.dolt/`).
+    conn: Conn,
     repo_path: PathBuf,
-    /// Path to the dolt binary.
-    dolt_bin: PathBuf,
+}
+
+impl Drop for DoltConnection {
+    fn drop(&mut self) {
+        release_server(&self.repo_path);
+    }
 }
 
 impl DoltConnection {
-    /// Open a connection to a Dolt repo at the given path.
     pub fn open(repo_path: &Path) -> Result<Self> {
-        let dolt_bin = find_dolt_bin()?;
+        let entry = ensure_server(repo_path)?;
+        let opts = entry.lock().unwrap().opts();
+        let conn = Conn::new(opts).with_context(|| {
+            format!(
+                "failed to create MySQL connection to dolt for {}",
+                repo_path.display()
+            )
+        })?;
         Ok(Self {
+            conn,
             repo_path: repo_path.to_path_buf(),
-            dolt_bin,
         })
     }
 
-    /// Execute a SQL statement that returns no rows (INSERT, UPDATE, DELETE, CREATE TABLE, etc.).
-    /// Parameters are substituted positionally: `?1`, `?2`, etc. are replaced with the
-    /// provided string values. Values are SQL-escaped.
-    pub fn execute(&self, sql: &str, params: &[&str]) -> Result<()> {
+    pub fn execute(&mut self, sql: &str, params: &[&str]) -> Result<()> {
         let resolved = substitute_params(sql, params);
-        self.run_sql(&resolved)?;
+        self.conn
+            .query_drop(&resolved)
+            .with_context(|| format!("dolt sql failed: {resolved}"))?;
         Ok(())
     }
 
-    /// Execute a batch of SQL statements (semicolon-separated, no params).
-    pub fn execute_batch(&self, sql: &str) -> Result<()> {
-        self.run_sql(sql)?;
+    pub fn execute_batch(&mut self, sql: &str) -> Result<()> {
+        self.conn
+            .query_drop(sql)
+            .with_context(|| format!("dolt sql batch failed: {sql}"))?;
         Ok(())
     }
 
-    /// Query a single row. Returns `None` if no rows match.
-    /// The closure receives a `DoltRow` from which columns can be extracted.
-    pub fn query_row<T, F>(&self, sql: &str, params: &[&str], f: F) -> Result<Option<T>>
+    pub fn query_row<T, F>(&mut self, sql: &str, params: &[&str], f: F) -> Result<Option<T>>
     where
         F: FnOnce(&DoltRow) -> Result<T>,
     {
         let resolved = substitute_params(sql, params);
-        let output = self.run_sql_json(&resolved)?;
-        let rows = parse_dolt_json_rows(&output)?;
+        let rows = self.run_query(&resolved)?;
         if rows.is_empty() {
             return Ok(None);
         }
@@ -197,14 +330,12 @@ impl DoltConnection {
         Ok(Some(f(&row)?))
     }
 
-    /// Query multiple rows. Returns a Vec built by applying the closure to each row.
-    pub fn query_map<T, F>(&self, sql: &str, params: &[&str], f: F) -> Result<Vec<T>>
+    pub fn query_map<T, F>(&mut self, sql: &str, params: &[&str], f: F) -> Result<Vec<T>>
     where
         F: Fn(&DoltRow) -> Result<T>,
     {
         let resolved = substitute_params(sql, params);
-        let output = self.run_sql_json(&resolved)?;
-        let rows = parse_dolt_json_rows(&output)?;
+        let rows = self.run_query(&resolved)?;
         let mut results = Vec::new();
         for row_data in &rows {
             let row = DoltRow { columns: row_data };
@@ -213,105 +344,71 @@ impl DoltConnection {
         Ok(results)
     }
 
-    /// Create a Dolt commit with the given message. Returns the commit hash.
-    pub fn commit(&self, message: &str) -> Result<String> {
-        // Stage all changes
-        self.run_dolt(&["add", "-A"])?;
-
-        // Commit (--allow-empty handles the "nothing to commit" case gracefully
-        // by creating a commit even when there are no changes, which is fine
-        // for our use case since we just want a commit hash to track).
-        self.run_dolt(&[
-            "commit",
-            "--allow-empty",
-            "-m",
-            message,
-            "--author",
-            "subcontext <subcontext@local>",
-        ])?;
-
+    pub fn commit(&mut self, message: &str) -> Result<String> {
+        self.conn
+            .query_drop("CALL DOLT_ADD('-A')")
+            .context("dolt add failed")?;
+        let escaped_msg = message.replace('\'', "''");
+        self.conn
+            .query_drop(format!(
+                "CALL DOLT_COMMIT('--allow-empty', '-m', '{escaped_msg}', \
+                 '--author', 'subcontext <subcontext@local>')"
+            ))
+            .context("dolt commit failed")?;
         self.head_commit()
     }
 
-    /// Get the current HEAD commit hash.
-    pub fn head_commit(&self) -> Result<String> {
-        // Use dolt log to get the latest commit hash
-        let output = self.run_sql_json("SELECT commit_hash FROM dolt_log LIMIT 1")?;
-        let rows = parse_dolt_json_rows(&output)?;
-        if rows.is_empty() {
-            bail!("no commits in dolt repo");
-        }
-        let row = DoltRow { columns: &rows[0] };
-        row.get::<String>(0)
+    pub fn head_commit(&mut self) -> Result<String> {
+        let result: Option<String> = self
+            .conn
+            .query_first("SELECT commit_hash FROM dolt_log LIMIT 1")
+            .context("failed to query dolt_log")?;
+        result.context("no commits in dolt repo")
     }
 
-    // ─── Internal helpers ────────────────────────────────────────────
-
-    /// Run `dolt sql -q <sql>` and return stdout.
-    fn run_sql(&self, sql: &str) -> Result<String> {
-        let output = Command::new(&self.dolt_bin)
-            .args(["sql", "-q", sql])
-            .current_dir(&self.repo_path)
-            .output()
-            .with_context(|| format!("failed to run dolt sql in {}", self.repo_path.display()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("dolt sql failed: {}\nSQL: {}", stderr.trim(), sql);
+    fn run_query(&mut self, sql: &str) -> Result<Vec<Vec<Value>>> {
+        let result: Vec<mysql::Row> = self
+            .conn
+            .query(sql)
+            .with_context(|| format!("dolt sql failed: {sql}"))?;
+        let mut rows = Vec::new();
+        for mysql_row in &result {
+            let mut values = Vec::new();
+            for i in 0..mysql_row.len() {
+                let val: mysql::Value = mysql_row.get(i).unwrap_or(mysql::Value::NULL);
+                values.push(mysql_value_to_json(&val));
+            }
+            rows.push(values);
         }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
+        Ok(rows)
     }
+}
 
-    /// Run `dolt sql -r json -q <sql>` and return JSON stdout.
-    fn run_sql_json(&self, sql: &str) -> Result<String> {
-        let output = Command::new(&self.dolt_bin)
-            .args(["sql", "-r", "json", "-q", sql])
-            .current_dir(&self.repo_path)
-            .output()
-            .with_context(|| format!("failed to run dolt sql in {}", self.repo_path.display()))?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("dolt sql failed: {}\nSQL: {}", stderr.trim(), sql);
+fn mysql_value_to_json(val: &mysql::Value) -> Value {
+    match val {
+        mysql::Value::NULL => Value::Null,
+        mysql::Value::Int(i) => serde_json::json!(*i),
+        mysql::Value::UInt(u) => serde_json::json!(*u),
+        mysql::Value::Float(f) => serde_json::json!(*f),
+        mysql::Value::Double(d) => serde_json::json!(*d),
+        mysql::Value::Bytes(b) => Value::String(String::from_utf8_lossy(b).to_string()),
+        mysql::Value::Date(y, m, d, h, mi, s, _us) => {
+            Value::String(format!("{y:04}-{m:02}-{d:02} {h:02}:{mi:02}:{s:02}"))
         }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
-    }
-
-    /// Run an arbitrary dolt command and return stdout.
-    fn run_dolt(&self, args: &[&str]) -> Result<String> {
-        let output = Command::new(&self.dolt_bin)
-            .args(args)
-            .current_dir(&self.repo_path)
-            .output()
-            .with_context(|| {
-                format!(
-                    "failed to run dolt {} in {}",
-                    args.join(" "),
-                    self.repo_path.display()
-                )
-            })?;
-
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            bail!("dolt {} failed: {}", args.join(" "), stderr.trim());
+        mysql::Value::Time(neg, d, h, mi, s, _us) => {
+            let sign = if *neg { "-" } else { "" };
+            Value::String(format!("{sign}{d}d {h:02}:{mi:02}:{s:02}"))
         }
-
-        Ok(String::from_utf8_lossy(&output.stdout).to_string())
     }
 }
 
 // ─── DoltRow ─────────────────────────────────────────────────────────
 
-/// A single row from a Dolt query result.
-/// Column values are stored as `serde_json::Value` and can be extracted by index.
 pub struct DoltRow<'a> {
     columns: &'a [Value],
 }
 
 impl<'a> DoltRow<'a> {
-    /// Get column value at the given index, converted to the requested type.
     pub fn get<T: FromDoltValue>(&self, idx: usize) -> Result<T> {
         if idx >= self.columns.len() {
             bail!(
@@ -323,7 +420,6 @@ impl<'a> DoltRow<'a> {
     }
 }
 
-/// Trait for converting a `serde_json::Value` to a Rust type.
 pub trait FromDoltValue: Sized {
     fn from_dolt_value(v: &Value) -> Result<Self>;
 }
@@ -388,10 +484,8 @@ impl FromDoltValue for usize {
 
 // ─── Parameter substitution ──────────────────────────────────────────
 
-/// Substitute `?1`, `?2`, etc. with SQL-escaped parameter values.
 fn substitute_params(sql: &str, params: &[&str]) -> String {
     let mut result = sql.to_string();
-    // Replace in reverse order so ?10 doesn't match ?1 first
     for (i, val) in params.iter().enumerate().rev() {
         let placeholder = format!("?{}", i + 1);
         let escaped = sql_escape_string(val);
@@ -400,64 +494,21 @@ fn substitute_params(sql: &str, params: &[&str]) -> String {
     result
 }
 
-/// Escape a string value for SQL (wrap in single quotes, escape inner quotes).
 fn sql_escape_string(s: &str) -> String {
     format!("'{}'", s.replace('\'', "''"))
 }
 
-// ─── JSON result parsing ─────────────────────────────────────────────
-
-/// Parse `dolt sql -r json` output into rows of column values.
-///
-/// Dolt JSON output looks like:
-/// ```json
-/// {"rows": [{"col1": "val1", "col2": 42}, ...]}
-/// ```
-fn parse_dolt_json_rows(json_str: &str) -> Result<Vec<Vec<Value>>> {
-    let trimmed = json_str.trim();
-    if trimmed.is_empty() {
-        return Ok(Vec::new());
-    }
-
-    let parsed: Value = serde_json::from_str(trimmed)
-        .with_context(|| format!("failed to parse dolt JSON output: {trimmed}"))?;
-
-    let empty_arr = Value::Array(Vec::new());
-    let rows_val = parsed.get("rows").unwrap_or(&empty_arr);
-
-    let rows_arr = match rows_val {
-        Value::Array(arr) => arr,
-        _ => return Ok(Vec::new()),
-    };
-
-    let mut result = Vec::new();
-    for row_obj in rows_arr {
-        match row_obj {
-            Value::Object(map) => {
-                // Preserve insertion order (serde_json objects maintain order)
-                let values: Vec<Value> = map.values().cloned().collect();
-                result.push(values);
-            }
-            _ => continue,
-        }
-    }
-
-    Ok(result)
-}
-
-// ─── Dolt commit tracking in state branch ────────────────────────────
+// ─── Dolt commit tracking ───────────────────────────────────────────
 
 const DOLT_HEAD_FILE: &str = "dolt_head";
 
-/// Write the current dolt commit hash to the state branch.
-/// This enables future branching: each git branch can track its own dolt commit.
 pub fn save_dolt_head(backend: &dyn Backend, state: &Path, dolt_commit: &str) -> Result<()> {
     let head_file = state.join(DOLT_HEAD_FILE);
     backend.write(&head_file, dolt_commit.as_bytes())?;
     Ok(())
 }
 
-/// Read the current dolt commit hash from the state branch.
+#[allow(dead_code)]
 pub fn read_dolt_head(backend: &dyn Backend, state: &Path) -> Result<Option<String>> {
     let head_file = state.join(DOLT_HEAD_FILE);
     if !backend.is_file(&head_file) {
@@ -473,11 +524,7 @@ pub fn read_dolt_head(backend: &dyn Backend, state: &Path) -> Result<Option<Stri
 
 // ─── Schema creation ─────────────────────────────────────────────────
 
-/// Create the tasks database schema in a Dolt repo.
-/// Equivalent to the old `create_schema()` for SQLite.
-pub fn create_dolt_schema(conn: &DoltConnection) -> Result<()> {
-    // Dolt uses MySQL syntax. Execute each statement separately since
-    // dolt sql doesn't always handle multi-statement batches well.
+pub fn create_dolt_schema(conn: &mut DoltConnection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS tasks (
              task_uuid        VARCHAR(36) PRIMARY KEY,
@@ -491,55 +538,48 @@ pub fn create_dolt_schema(conn: &DoltConnection) -> Result<()> {
              parent_task_uuid VARCHAR(36) DEFAULT NULL,
              board_uuid       VARCHAR(36) DEFAULT NULL,
              subtasks         TEXT NOT NULL DEFAULT '{}'
-         );",
+         )",
     )?;
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS task_names (
              branch_name   VARCHAR(255) NOT NULL,
              task_name     VARCHAR(255) NOT NULL,
              task_uuid     VARCHAR(36) NOT NULL UNIQUE,
              INDEX idx_task_names_lookup (branch_name, task_name)
-         );",
+         )",
     )?;
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS objects (
              uuid                  VARCHAR(36) PRIMARY KEY,
-             type                  VARCHAR(50) NOT NULL,
+             `type`                VARCHAR(50) NOT NULL,
              current_commit        VARCHAR(255) NOT NULL,
              board_uuid            VARCHAR(36) DEFAULT NULL,
              source_context_uuid   VARCHAR(36) DEFAULT NULL,
              source_object_uuid    VARCHAR(36) DEFAULT NULL,
              source_context_commit VARCHAR(255) DEFAULT NULL
-         );",
+         )",
     )?;
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS branch_tasks (
              scope_branch  VARCHAR(255) PRIMARY KEY,
              task_uuid     VARCHAR(36) NOT NULL
-         );",
+         )",
     )?;
-
     Ok(())
 }
 
-/// Create the extra global schema tables (config, parents) in a Dolt repo.
-pub fn create_dolt_global_schema(conn: &DoltConnection) -> Result<()> {
+pub fn create_dolt_global_schema(conn: &mut DoltConnection) -> Result<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS config (
              key_name   VARCHAR(255) PRIMARY KEY,
              value      TEXT NOT NULL
-         );",
+         )",
     )?;
-
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS parents (
              child_uuid  VARCHAR(36) PRIMARY KEY,
              parent_uuid VARCHAR(36) NOT NULL
-         );",
+         )",
     )?;
-
     Ok(())
 }

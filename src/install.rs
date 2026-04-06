@@ -94,11 +94,12 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
     if let Some(commit) = global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)? {
         // Record the managed child in the global objects table.
         if let Ok(global_scope) = global::global_task_scope(backend) {
-            let conn = task::open_db(&global_scope)?;
-            task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-            task::dolt_commit_and_track(
+            let mut conn = task::open_db(&global_scope)?;
+            task::insert_object(&mut conn, &project_uuid, "managed", &commit, None)?;
+            task::dolt_commit_and_track_with(
                 backend,
-                &global_scope,
+                &mut conn,
+                &global_scope.state_dir,
                 &format!("object add: {project_uuid}"),
             )?;
         }
@@ -135,11 +136,12 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
                     &project_uuid,
                     &[("object.json", &object_json)],
                 )?;
-                let conn = task::open_db(&user_scope)?;
-                task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-                task::dolt_commit_and_track(
+                let mut conn = task::open_db(&user_scope)?;
+                task::insert_object(&mut conn, &project_uuid, "managed", &commit, None)?;
+                task::dolt_commit_and_track_with(
                     backend,
-                    &user_scope,
+                    &mut conn,
+                    &user_scope.state_dir,
                     &format!("object add: {project_uuid}"),
                 )?;
             }

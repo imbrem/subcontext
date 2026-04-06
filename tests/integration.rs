@@ -3842,3 +3842,164 @@ fn task_tree_invalid_format() {
 
     cleanup(&root);
 }
+
+// ─── Dolt-specific tests ─────────────────────────────────────────────
+
+#[test]
+fn dolt_mysql_server_creates_schema_tables() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // Verify all expected tables exist by querying them via dolt sql CLI
+    let tables = dolt_sql(&dolt_dir, "SHOW TABLES");
+    assert!(tables.contains("tasks"), "missing tasks table: {tables}");
+    assert!(
+        tables.contains("task_names"),
+        "missing task_names table: {tables}"
+    );
+    assert!(
+        tables.contains("objects"),
+        "missing objects table: {tables}"
+    );
+    assert!(
+        tables.contains("branch_tasks"),
+        "missing branch_tasks table: {tables}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_task_add_persists_via_mysql() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "mysql-test-task", "--kind", "todo"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // Task should be in the database
+    let count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM tasks WHERE task_name = 'mysql-test-task'",
+    );
+    assert_eq!(count, 1, "expected 1 task named mysql-test-task");
+
+    // Task should have correct kind
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT task_kind FROM tasks WHERE task_name = 'mysql-test-task'",
+    );
+    assert!(csv.contains("todo"), "expected kind=todo, got: {csv}");
+
+    // task_names entry should exist
+    let names_count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM task_names WHERE task_name = 'mysql-test-task'",
+    );
+    assert_eq!(names_count, 1, "expected 1 task_names entry");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_commit_history_tracks_changes() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Get initial commit count
+    let initial_commits = dolt_count(
+        &root.join(".git/.subcontext/dolt"),
+        "SELECT COUNT(*) FROM dolt_log",
+    );
+
+    subcontext_ok(&root, &["task", "add", "first-task"]);
+
+    let after_add = dolt_count(
+        &root.join(".git/.subcontext/dolt"),
+        "SELECT COUNT(*) FROM dolt_log",
+    );
+
+    // Adding a task should create at least one new dolt commit
+    assert!(
+        after_add > initial_commits,
+        "expected more commits after task add: {initial_commits} -> {after_add}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_multiple_tasks_accumulate() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "task-alpha"]);
+    subcontext_ok(&root, &["task", "add", "task-beta"]);
+    subcontext_ok(&root, &["task", "add", "task-gamma"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    let count = dolt_count(&dolt_dir, "SELECT COUNT(*) FROM tasks");
+    assert_eq!(count, 3, "expected 3 tasks, got {count}");
+
+    let names_count = dolt_count(&dolt_dir, "SELECT COUNT(*) FROM task_names");
+    assert_eq!(names_count, 3, "expected 3 task_names, got {names_count}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_task_done_updates_status_in_db() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "finish-me"]);
+    subcontext_ok(&root, &["task", "done", "finish-me"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT task_status FROM tasks WHERE task_name = 'finish-me'",
+    );
+    assert!(csv.contains("done"), "expected status=done, got: {csv}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn dolt_objects_table_tracks_task_branches() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(&root, &["task", "add", "obj-test"]);
+
+    let dolt_dir = root.join(".git/.subcontext/dolt");
+
+    // An objects row should exist for the task
+    let obj_count = dolt_count(
+        &dolt_dir,
+        "SELECT COUNT(*) FROM objects WHERE `type` = 'task'",
+    );
+    assert!(
+        obj_count >= 1,
+        "expected at least 1 object of type task, got {obj_count}"
+    );
+
+    // The object should have a non-empty current_commit
+    let csv = dolt_sql(
+        &dolt_dir,
+        "SELECT current_commit FROM objects WHERE `type` = 'task' LIMIT 1",
+    );
+    let lines: Vec<&str> = csv.trim().lines().collect();
+    assert!(lines.len() >= 2, "expected object row, got: {csv}");
+    assert!(
+        !lines[1].trim().is_empty(),
+        "current_commit should not be empty"
+    );
+
+    cleanup(&root);
+}
