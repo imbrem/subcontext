@@ -1,107 +1,101 @@
 ---
 name: add-task
-description: Create, update, or view hierarchical tasks in the subcontext task system using TASK.md files with YAML frontmatter. Use when the user wants to create a new task, update an existing task, view task details, or manage task lifecycle.
+description: Create a new task in the current branch's board overlay or via CLI commands. Use when the user wants to create a new task, add a subtask, or populate a board.
 ---
 
-# Add Task Skill
+# Add Task
 
-Create or update a task in the subcontext task system by writing a TASK.md file
-and running the appropriate subcontext command.
+## Preferred: Add via overlay (board workflow)
 
-## Creating a new task
+If a board is pulled into the overlay (e.g. under `tasks/`), create tasks by
+writing TASK.md files directly:
 
-1. Write a TASK.md file with YAML frontmatter and a markdown body describing the task:
+1. Create a directory for the new task under the appropriate parent:
+   ```
+   mkdir -p tasks/my-new-task
+   ```
 
-```markdown
----
-uuid: <optional UUID; if provided, the task uses this UUID instead of generating a new one>
-title: <optional display title>
-kind: <task|goal|todo|tick>
-status: <created|active|inactive>
-description: <one-line summary>
-deadline: <ISO8601 UTC timestamp ending in Z, optional>
-importance: <number, optional, 0 = normal>
-subtasks:
-  - <child-name-1>
-  - <child-name-2>
----
+2. Write a TASK.md file:
+   ```markdown
+   ---
+   kind: task
+   status: created
+   description: One-line summary of the task
+   ---
 
-# <Task Title>
+   # My New Task
 
-<Full markdown description of the task, acceptance criteria, context, etc.>
+   Detailed description, acceptance criteria, etc.
+   ```
+
+   **You do NOT need to provide a `uuid`.** A UUID is automatically generated
+   when you run `board push` or `board commit`.
+
+3. For subtasks, nest directories:
+   ```
+   mkdir -p tasks/my-new-task/subtask-a
+   ```
+   And write `tasks/my-new-task/subtask-a/TASK.md`.
+
+4. Push changes to the board:
+   ```
+   git subcontext board push --path tasks/
+   ```
+
+## Alternative: Add via CLI
+
+### To a board
+```
+git subcontext board add-task <name> --board <board-uuid> [options]
 ```
 
-Note: `name:` is **not** stored in the task data. The task's lookup name is
-passed as a positional argument and stored in the parent's namespace.
+Options:
+- `--parent <uuid>` — parent task (defaults to board root)
+- `--kind <kind>` — task/goal/todo/tick
+- `--status <status>` — created/active/inactive
+- `--description <text>` — one-line summary
+- `--deadline <ISO8601Z>` — deadline timestamp
+- `--important [value]` — mark as important (default 1.0)
 
-2. Run: `git subcontext task add <name> [--file TASK.md] [--parent <path>]`
-
-   - `<name>` is **required** — it's the lookup name for this task.
-   - `--file` optionally provides a TASK.md with additional fields.
-   - `--parent` makes this a subtask of the given parent (name/path or `/uuid`).
-
-3. The command prints the task UUID to stdout. **Capture and report the UUID to the user.**
-
-## Hierarchical paths
-
-Tasks form a tree. The current task is set per-branch with `task set`.
-
-- `.` — the current task
-- `name` — child of current task
-- `name/child` — walk down from current task
-- `/uuid` — jump to a task by UUID
-- `/uuid/name` — start from UUID, walk down
-
-Use `task roots` to list root task UUIDs (tasks with no parent).
-
-## Setting the current task
-
+### Standalone task
 ```
-git subcontext task set <name-or-path>   # set current task for this branch
-git subcontext task set                  # unset
+git subcontext task add <name> [--file TASK.md] [--parent <path>] [options]
 ```
 
-## Listing subtasks
+- `<name>` is required — the lookup name
+- `--file` provides a TASK.md with additional fields
+- `--parent` makes this a subtask
+
+The command prints the task UUID to stdout.
+
+## Marking tasks done
+
+### Via overlay
+Edit the TASK.md frontmatter: change `status: created` to `status: done`.
+Then push.
+
+Or delete the task directory and push with `--mark-done`:
+```
+rm -rf tasks/completed-task
+git subcontext board push --path tasks/ --mark-done
+```
+
+### Via CLI
+```
+git subcontext task done <name-or-path>
+git subcontext task fail <name-or-path>
+```
+
+## Listing tasks
 
 ```
-git subcontext task list              # children of current task (or root tasks)
+git subcontext task list              # children of current task
 git subcontext task list <path>       # children of a specific task
-git subcontext task roots             # list root task UUIDs
+git subcontext task roots             # root task UUIDs
 ```
-
-## Updating an existing task
-
-To update a task by name or UUID:
-
-- **From a file:** Edit TASK.md, then run:
-  `git subcontext task update <name-or-uuid> --file TASK.md`
-
-- **Individual fields:**
-  `git subcontext task update <name-or-uuid> --status active --description "new desc"`
-
-The update command syncs both object.json and TASK.md on the object branch.
-
-## Viewing a task
-
-`git subcontext task show <name-or-uuid>`
-
-- If a single task matches, prints the full TASK.md content.
-- If multiple tasks match the name, prints all matching UUIDs with descriptions.
-
-## Marking tasks done or failed
-
-- `git subcontext task done <name-or-path> [--time <ISO8601Z>]`
-- `git subcontext task fail <name-or-path> [--time <ISO8601Z>]`
-
-Supports hierarchical paths (e.g. `parent/child`, `.`).
 
 ## Scope flags
 
 - `--user` — operate on the user subcontext
 - `--global` — operate on the system subcontext
 - `--local` — skip propagating shadow tasks to parent contexts
-
-## Syncing object.json and TASK.md
-
-`git subcontext object-commit <uuid>` ensures both files are in sync on the
-object branch. If one is missing, it generates it from the other.

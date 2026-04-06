@@ -4,8 +4,15 @@ use std::path::Path;
 use crate::backend::Backend;
 
 /// Each bundled skill: (directory_name, SKILL.md content).
-const BUNDLED_SKILLS: &[(&str, &str)] =
-    &[("add-task", include_str!("../skills/add-task/SKILL.md"))];
+const BUNDLED_SKILLS: &[(&str, &str)] = &[
+    ("add-task", include_str!("../skills/add-task/SKILL.md")),
+    (
+        "task-schema",
+        include_str!("../skills/task-schema/SKILL.md"),
+    ),
+    ("set-task", include_str!("../skills/set-task/SKILL.md")),
+    ("edit-task", include_str!("../skills/edit-task/SKILL.md")),
+];
 
 /// Install all bundled skills into the global Claude Code skills directory
 /// (`~/.claude/skills/`). If a skill directory already exists, print a

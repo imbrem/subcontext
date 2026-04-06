@@ -6,7 +6,8 @@ use uuid::Uuid;
 
 use crate::backend::{Backend, GitInvocation};
 use crate::git::{
-    current_branch, repo_dir, run_git_in_bare, run_work_git, state_dir, subcontext_dir,
+    CheckoutContext, current_branch, repo_dir, run_git_in_bare, run_work_git, state_dir,
+    subcontext_dir,
 };
 use crate::project::read_project_uuid;
 
@@ -1786,6 +1787,435 @@ pub fn update_task_in_board(
     Ok(commit)
 }
 
+/// Delete a task (and all its descendants) from a board.
+/// Removes the directory from the board tree and cleans up the DB.
+/// Returns the new board commit.
+pub fn delete_task_from_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    task_uuid: &str,
+    board_uuid: &str,
+) -> Result<String> {
+    let dir_path = compute_board_path(scope, task_uuid, board_uuid)?;
+    if dir_path.is_empty() {
+        bail!("cannot delete the board root task — delete the whole board instead");
+    }
+
+    // Collect all task UUIDs that will be deleted (this task + descendants).
+    let prefix = format!("{dir_path}/");
+    let board_files = read_board_tree(backend, scope, board_uuid)?;
+    let mut uuids_to_delete = vec![task_uuid.to_string()];
+    for (path, content) in &board_files {
+        if path.starts_with(&prefix) && path.ends_with("/TASK.md") {
+            let (pairs, _) = parse_frontmatter(content);
+            let fm = FrontmatterMap(&pairs);
+            if let Some(uuid) = fm.get("uuid") {
+                uuids_to_delete.push(uuid);
+            }
+        }
+    }
+
+    // Remove the directory from the board tree.
+    let remaining: Vec<(String, String)> = board_files
+        .into_iter()
+        .filter(|(path, _)| !path.starts_with(&prefix) && *path != format!("{dir_path}/TASK.md"))
+        .collect();
+
+    let file_refs: Vec<(&str, &str)> = remaining
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+    let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+
+    // Clean up DB entries.
+    let conn = open_db(scope)?;
+    for uuid in &uuids_to_delete {
+        conn.execute("DELETE FROM tasks WHERE task_uuid = ?1", params![uuid])?;
+        conn.execute("DELETE FROM task_names WHERE task_uuid = ?1", params![uuid])?;
+        conn.execute("DELETE FROM objects WHERE uuid = ?1", params![uuid])?;
+    }
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("board delete task: {task_uuid}"),
+    )?;
+
+    eprintln!(
+        "[subcontext] Deleted task {task_uuid} ({} total removed) from board {board_uuid}",
+        uuids_to_delete.len()
+    );
+    Ok(commit)
+}
+
+/// Move a task within a board to a new parent. The task keeps its UUID;
+/// only its position in the directory tree changes.
+/// Returns the new board commit.
+pub fn move_task_in_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    task_uuid: &str,
+    new_parent_uuid: &str,
+    board_uuid: &str,
+) -> Result<String> {
+    let old_path = compute_board_path(scope, task_uuid, board_uuid)?;
+    if old_path.is_empty() {
+        bail!("cannot move the board root task");
+    }
+
+    // Get the task name (last segment of the path).
+    let task_name = old_path.rsplit('/').next().unwrap_or(&old_path);
+
+    // Compute the new parent's path.
+    let new_parent_path = compute_board_path(scope, new_parent_uuid, board_uuid)?;
+    let new_path = if new_parent_path.is_empty() {
+        task_name.to_string()
+    } else {
+        format!("{new_parent_path}/{task_name}")
+    };
+
+    if old_path == new_path {
+        bail!("task is already at that location");
+    }
+
+    // Rewrite all paths: old_path/... → new_path/...
+    let old_prefix = format!("{old_path}/");
+    let new_prefix = format!("{new_path}/");
+    let board_files = read_board_tree(backend, scope, board_uuid)?;
+    let mut new_files: Vec<(String, String)> = Vec::new();
+    for (path, content) in board_files {
+        if path == format!("{old_path}/TASK.md") || path.starts_with(&old_prefix) {
+            // Rewrite path under new location.
+            let new_file_path = if path.starts_with(&old_prefix) {
+                format!("{new_prefix}{}", &path[old_prefix.len()..])
+            } else {
+                format!("{new_path}/TASK.md")
+            };
+            new_files.push((new_file_path, content));
+        } else {
+            new_files.push((path, content));
+        }
+    }
+
+    let file_refs: Vec<(&str, &str)> = new_files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+    let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+
+    // Update the parent in the DB.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE tasks SET parent_task_uuid = ?1 WHERE task_uuid = ?2",
+        params![new_parent_uuid, task_uuid],
+    )?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, board_uuid],
+    )?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, task_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("board move task: {task_uuid} to {new_parent_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Moved task {task_uuid} from {old_path} to {new_path}");
+    Ok(commit)
+}
+
+/// Pull a board (or subtask subtree) into the overlay work directory.
+/// Files are placed under `overlay_prefix` (e.g. "tasks/").
+/// If `root_task_uuid` is provided, only that subtree is pulled.
+/// If `filter_done` is true, completed/failed tasks are excluded.
+pub fn board_pull(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    ctx: &CheckoutContext,
+    board_uuid: &str,
+    overlay_prefix: &str,
+    root_task_uuid: Option<&str>,
+    filter_done: bool,
+) -> Result<usize> {
+    let board_files = read_board_tree(backend, scope, board_uuid)?;
+
+    // If pulling a subtree, compute the path prefix to filter by.
+    let subtree_prefix = match root_task_uuid {
+        Some(uuid) if uuid != board_uuid => {
+            let p = compute_board_path(scope, uuid, board_uuid)?;
+            if p.is_empty() {
+                String::new()
+            } else {
+                format!("{p}/")
+            }
+        }
+        _ => String::new(),
+    };
+
+    let work = ctx.overlay_work_dir();
+    let mut count = 0;
+
+    // Write a .board.json config so push knows what to sync back.
+    let config = serde_json::json!({
+        "board_uuid": board_uuid,
+        "root_task_uuid": root_task_uuid.unwrap_or(board_uuid),
+        "filter_done": filter_done,
+    });
+    let config_path = format!("{overlay_prefix}.board.json");
+    let config_content = serde_json::to_string_pretty(&config)? + "\n";
+
+    // Collect files to add to overlay.
+    let mut overlay_files: Vec<(String, String)> = Vec::new();
+    overlay_files.push((config_path.clone(), config_content));
+
+    // For subtree pulls, the root TASK.md is at `<subtree_dir>/TASK.md` in the
+    // board tree. The subtree_prefix has a trailing `/`, so children match via
+    // strip_prefix. We handle the root TASK.md specially.
+    let subtree_root_md = if !subtree_prefix.is_empty() {
+        let trimmed = subtree_prefix.trim_end_matches('/');
+        Some(format!("{trimmed}/TASK.md"))
+    } else {
+        None
+    };
+
+    for (path, content) in &board_files {
+        // Compute relative path within the pulled subtree.
+        let relative = if subtree_prefix.is_empty() {
+            path.clone()
+        } else if let Some(rest) = path.strip_prefix(&subtree_prefix) {
+            rest.to_string()
+        } else if subtree_root_md.as_deref() == Some(path.as_str()) {
+            // The root TASK.md of the subtree → maps to TASK.md at overlay root.
+            "TASK.md".to_string()
+        } else {
+            continue;
+        };
+
+        // Skip object.json (internal metadata).
+        if relative == "object.json" {
+            continue;
+        }
+
+        // Filter done tasks if requested.
+        if filter_done && relative.ends_with("TASK.md") {
+            let (pairs, _) = parse_frontmatter(content);
+            let fm = FrontmatterMap(&pairs);
+            if let Some(status) = fm.get("status") {
+                if status == "done" || status == "failed" {
+                    continue;
+                }
+            }
+        }
+
+        let overlay_path = format!("{overlay_prefix}{relative}");
+        overlay_files.push((overlay_path, content.clone()));
+        count += 1;
+    }
+
+    // Write files into the overlay work dir and add them.
+    for (path, content) in &overlay_files {
+        let dest = work.join(path);
+        if let Some(parent) = dest.parent() {
+            backend.create_dir_all(parent)?;
+        }
+        backend.write(&dest, content.as_bytes())?;
+        run_work_git(backend, &["add", path], &work)?;
+
+        // Also write to checkout root.
+        let checkout_dest = ctx.checkout_root.join(path);
+        if let Some(parent) = checkout_dest.parent() {
+            backend.create_dir_all(parent)?;
+        }
+        backend.write(&checkout_dest, content.as_bytes())?;
+    }
+
+    crate::overlay::sync_excludes(backend, ctx)?;
+
+    eprintln!("[subcontext] Pulled {count} files from board {board_uuid} into {overlay_prefix}");
+    Ok(count)
+}
+
+/// Push overlay files back to the board branch.
+/// Reads `.board.json` to find the board UUID and configuration.
+/// Deleted files (present in board but missing in overlay) are removed from the board.
+/// If `mark_done_on_delete` is true, deleted TASK.md entries are marked as done
+/// rather than being removed from the board.
+pub fn board_push(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    ctx: &CheckoutContext,
+    overlay_prefix: &str,
+    mark_done_on_delete: bool,
+) -> Result<String> {
+    let work = ctx.overlay_work_dir();
+    let config_path = work.join(format!("{overlay_prefix}.board.json"));
+    let config_str = backend.read_to_string(&config_path).with_context(|| {
+        format!("no .board.json found at {overlay_prefix} — run board pull first")
+    })?;
+    let config: serde_json::Value = serde_json::from_str(&config_str)?;
+    let board_uuid = config["board_uuid"]
+        .as_str()
+        .ok_or_else(|| anyhow::anyhow!("missing board_uuid in .board.json"))?;
+    let root_task_uuid = config["root_task_uuid"].as_str().unwrap_or(board_uuid);
+
+    // Read current board tree.
+    let mut board_files = read_board_tree(backend, scope, board_uuid)?;
+
+    // Compute subtree prefix in the board tree.
+    let subtree_prefix = if root_task_uuid != board_uuid {
+        let p = compute_board_path(scope, root_task_uuid, board_uuid)?;
+        if p.is_empty() {
+            String::new()
+        } else {
+            format!("{p}/")
+        }
+    } else {
+        String::new()
+    };
+
+    // Read overlay files under the prefix.
+    let overlay_listing = run_work_git(backend, &["ls-files", overlay_prefix], &work)?;
+    let overlay_paths: Vec<String> = overlay_listing
+        .lines()
+        .filter(|l| !l.is_empty())
+        .map(|l| l.to_string())
+        .collect();
+
+    // Build a map of overlay files (relative to subtree root) → content.
+    let mut overlay_map: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    for opath in &overlay_paths {
+        // Skip the config file itself.
+        if opath.ends_with(".board.json") {
+            continue;
+        }
+        // Strip the overlay prefix to get relative path.
+        let relative = opath
+            .strip_prefix(overlay_prefix)
+            .unwrap_or(opath)
+            .to_string();
+        if relative.is_empty() {
+            continue;
+        }
+        let board_path = if subtree_prefix.is_empty() {
+            relative.clone()
+        } else {
+            format!("{subtree_prefix}{relative}")
+        };
+        // Read from checkout root (where agent edits happen).
+        let src = ctx.checkout_root.join(opath);
+        if backend.exists(&src) {
+            let content = backend.read_to_string(&src)?;
+            overlay_map.insert(board_path, content);
+        }
+    }
+
+    // Determine which board files are in our subtree scope.
+    let in_scope = |path: &str| -> bool {
+        if subtree_prefix.is_empty() {
+            path != "object.json" // object.json is internal
+        } else {
+            path.starts_with(&subtree_prefix)
+        }
+    };
+
+    // Handle deleted files: board files in scope that are NOT in overlay_map.
+    if mark_done_on_delete {
+        for (path, content) in &mut board_files {
+            if !in_scope(path) {
+                continue;
+            }
+            if path.ends_with("/TASK.md") && !overlay_map.contains_key(path.as_str()) {
+                // Mark as done instead of deleting.
+                let (pairs, body) = parse_frontmatter(content);
+                let mut new_pairs: Vec<(String, String)> = Vec::new();
+                let mut has_status = false;
+                for (k, v) in &pairs {
+                    if k == "status" {
+                        new_pairs.push(("status".to_string(), "done".to_string()));
+                        has_status = true;
+                    } else {
+                        new_pairs.push((k.clone(), v.clone()));
+                    }
+                }
+                if !has_status {
+                    new_pairs.push(("status".to_string(), "done".to_string()));
+                }
+                *content = rebuild_task_md_from_pairs(&new_pairs, &body);
+            }
+        }
+    }
+
+    // Build the new board tree: overlay_map wins for files in scope.
+    let mut new_files: Vec<(String, String)> = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+
+    // First, keep all out-of-scope files from the board.
+    for (path, content) in &board_files {
+        if !in_scope(path) {
+            new_files.push((path.clone(), content.clone()));
+            seen.insert(path.clone());
+        }
+    }
+
+    // For in-scope files: use overlay version if present, otherwise keep board
+    // version only if not mark_done_on_delete (already handled above) or if
+    // the file was already modified for done-marking.
+    for (path, content) in &board_files {
+        if !in_scope(path) || seen.contains(path) {
+            continue;
+        }
+        if let Some(overlay_content) = overlay_map.get(path) {
+            new_files.push((path.clone(), overlay_content.clone()));
+        } else if mark_done_on_delete {
+            // Keep the (possibly done-marked) version.
+            new_files.push((path.clone(), content.clone()));
+        }
+        // If not mark_done_on_delete and not in overlay, the file is deleted.
+        seen.insert(path.clone());
+    }
+
+    // Add new files from overlay that weren't in the original board.
+    for (path, content) in &overlay_map {
+        if !seen.contains(path) {
+            new_files.push((path.clone(), content.clone()));
+        }
+    }
+
+    let file_refs: Vec<(&str, &str)> = new_files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+    let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+
+    // Update board commit in objects table.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("board push: {board_uuid}"),
+    )?;
+
+    // Run board_commit to sync DB state from the updated tree.
+    board_commit(backend, scope, board_uuid)?;
+
+    eprintln!("[subcontext] Pushed overlay changes to board {board_uuid}");
+    Ok(commit)
+}
+
 /// Walk a board's tree and synchronize all tasks into the state DB.
 /// This is called after any manual edits to the board branch.
 ///
@@ -1813,6 +2243,8 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
     let files = read_board_tree(backend, scope, board_uuid)?;
     let conn = open_db(scope)?;
     let mut count = 0;
+    // Track files that need a generated UUID written back.
+    let mut uuid_patches: Vec<(String, String, String)> = Vec::new(); // (path, generated_uuid, new_content)
 
     for (path, content) in &files {
         let filename = path.rsplit('/').next().unwrap_or(path);
@@ -1824,10 +2256,15 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
 
             // Check if this is an import.
             if let Some(import) = parse_task_import(content) {
-                // Import tasks get a new UUID but reference the foreign task.
                 let (pairs, _body) = parse_frontmatter(content);
                 let fm = FrontmatterMap(&pairs);
+                let had_uuid = fm.get("uuid").is_some();
                 let task_uuid = fm.get("uuid").unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                if !had_uuid {
+                    let new_content = inject_uuid_into_frontmatter(content, &task_uuid);
+                    uuid_patches.push((path.clone(), task_uuid.clone(), new_content));
+                }
 
                 upsert_task_from_board(
                     &conn,
@@ -1857,6 +2294,7 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
             let (pairs, _body) = parse_frontmatter(content);
             let fm = FrontmatterMap(&pairs);
 
+            let had_uuid = fm.get("uuid").is_some();
             let task_uuid = fm.get("uuid").unwrap_or_else(|| {
                 // For the root TASK.md, UUID must match board UUID.
                 if path == "TASK.md" {
@@ -1865,6 +2303,13 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
                     Uuid::new_v4().to_string()
                 }
             });
+
+            // If the TASK.md was missing a uuid, generate one and patch it.
+            if !had_uuid {
+                let new_content = inject_uuid_into_frontmatter(content, &task_uuid);
+                uuid_patches.push((path.clone(), task_uuid.clone(), new_content));
+            }
+
             let kind = fm.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
             let status = fm
                 .get("status")
@@ -1925,8 +2370,61 @@ pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) 
         &format!("board commit: {board_uuid}"),
     )?;
 
+    // If any TASK.md files were missing UUIDs, rewrite the board branch with
+    // the generated UUIDs injected so they're stable across future commits.
+    if !uuid_patches.is_empty() {
+        let patched_count = uuid_patches.len();
+        let mut patched_files = read_board_tree(backend, scope, board_uuid)?;
+        for (patch_path, _uuid, new_content) in &uuid_patches {
+            for (path, content) in &mut patched_files {
+                if path == patch_path {
+                    *content = new_content.clone();
+                    break;
+                }
+            }
+        }
+        let file_refs: Vec<(&str, &str)> = patched_files
+            .iter()
+            .map(|(n, c)| (n.as_str(), c.as_str()))
+            .collect();
+        let new_commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+        let conn = open_db(scope)?;
+        conn.execute(
+            "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+            params![new_commit, board_uuid],
+        )?;
+        drop(conn);
+        commit_state_in(
+            backend,
+            &scope.state_dir,
+            &format!("board uuid backfill: {board_uuid}"),
+        )?;
+        eprintln!("[subcontext] Generated UUIDs for {patched_count} task(s) missing them");
+    }
+
     eprintln!("[subcontext] Synchronized {count} tasks from board {board_uuid}");
     Ok(count)
+}
+
+/// Inject a `uuid: <value>` line into TASK.md frontmatter.
+/// Inserts it as the first field after the opening `---`.
+fn inject_uuid_into_frontmatter(content: &str, uuid: &str) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() || lines[0].trim() != "---" {
+        // No frontmatter — wrap it.
+        return format!("---\nuuid: {uuid}\n---\n{content}");
+    }
+    let mut result = Vec::new();
+    result.push(lines[0].to_string()); // "---"
+    result.push(format!("uuid: {uuid}"));
+    for line in &lines[1..] {
+        result.push(line.to_string());
+    }
+    let mut out = result.join("\n");
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out
 }
 
 /// Determine the task name from its path in the board tree.
@@ -2409,6 +2907,7 @@ fn strip_yaml_quotes(s: &str) -> String {
 /// Generate a TASK.md string from task data and an optional body.
 pub fn generate_task_md(data: &TaskData, body: &str) -> String {
     let mut lines = vec!["---".to_string()];
+    lines.push(format!("uuid: {}", data.uuid));
     if let Some(title) = &data.title {
         lines.push(format!("title: {}", title));
     }
