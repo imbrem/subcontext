@@ -121,6 +121,18 @@ enum Commands {
         command: TaskCommand,
     },
 
+    /// Manage boards (task trees)
+    Board {
+        /// Operate on the global (system-level) subcontext.
+        #[arg(long, global = true)]
+        global: bool,
+        /// Operate on the user subcontext.
+        #[arg(long, global = true, conflicts_with = "global")]
+        user: bool,
+        #[command(subcommand)]
+        command: BoardCommand,
+    },
+
     /// Sync TASK.md and object.json on an object branch
     ObjectCommit {
         /// Object UUID
@@ -268,6 +280,64 @@ enum TaskCommand {
     },
     /// List root task UUIDs (tasks with no parent)
     Roots,
+}
+
+#[derive(Subcommand)]
+enum BoardCommand {
+    /// Create a new board with a root task
+    Create {
+        /// Board name
+        name: Option<String>,
+        /// Path to a TASK.md file for the root task
+        #[arg(long)]
+        file: Option<String>,
+        /// Task kind
+        #[arg(long)]
+        kind: Option<String>,
+        /// Task status
+        #[arg(long)]
+        status: Option<String>,
+        /// Short description
+        #[arg(long)]
+        description: Option<String>,
+        /// Deadline (ISO8601 UTC ending in Z)
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Importance
+        #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
+        important: Option<f64>,
+    },
+    /// Add a subtask to a board
+    AddTask {
+        /// Task name
+        name: String,
+        /// Board UUID (or name/path of the board root task)
+        #[arg(long)]
+        board: String,
+        /// Parent task within the board (name/path or UUID). Defaults to board root.
+        #[arg(long)]
+        parent: Option<String>,
+        /// Task kind
+        #[arg(long)]
+        kind: Option<String>,
+        /// Task status
+        #[arg(long)]
+        status: Option<String>,
+        /// Short description
+        #[arg(long)]
+        description: Option<String>,
+        /// Deadline (ISO8601 UTC ending in Z)
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Importance
+        #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
+        important: Option<f64>,
+    },
+    /// Synchronize a board's tree into the state DB
+    Commit {
+        /// Board UUID
+        uuid: String,
+    },
 }
 
 #[derive(Subcommand)]
@@ -648,6 +718,90 @@ fn main() -> Result<()> {
                             println!("{uuid}");
                         }
                     }
+                }
+            }
+        }
+        Commands::Board {
+            global: global_flag,
+            user: user_flag,
+            command,
+        } => {
+            let local_root = git::find_main_git_root(backend, &cwd).ok();
+            let scope = if global_flag {
+                global::global_task_scope(backend)?
+            } else if user_flag {
+                global::user_task_scope(backend)?
+            } else if let Some(ref root) = local_root {
+                task::TaskScope::for_local(backend, root)?
+            } else if global::global_exists(backend)? {
+                global::user_task_scope(backend).unwrap_or(global::global_task_scope(backend)?)
+            } else {
+                bail!("not inside a git repo and no global subcontext installed");
+            };
+
+            match command {
+                BoardCommand::Create {
+                    name,
+                    file,
+                    kind,
+                    status,
+                    description,
+                    deadline,
+                    important,
+                } => {
+                    let importance = important.unwrap_or(0.0);
+                    if let Some(file_path) = file {
+                        let md = std::fs::read_to_string(&file_path)
+                            .with_context(|| format!("cannot read {file_path}"))?;
+                        task::create_board_from_md(backend, &scope, &md, None, name.as_deref())?;
+                    } else {
+                        let name = name.ok_or_else(|| {
+                            anyhow::anyhow!("board name is required (or use --file)")
+                        })?;
+                        task::create_board(
+                            backend,
+                            &scope,
+                            &name,
+                            kind.as_deref(),
+                            status.as_deref(),
+                            description.as_deref(),
+                            deadline.as_deref(),
+                            importance,
+                            None,
+                        )?;
+                    }
+                }
+                BoardCommand::AddTask {
+                    name,
+                    board,
+                    parent,
+                    kind,
+                    status,
+                    description,
+                    deadline,
+                    important,
+                } => {
+                    let importance = important.unwrap_or(0.0);
+                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let parent_uuid = match parent {
+                        Some(ref p) => task::resolve_task_uuid(backend, &scope, p)?,
+                        None => board_uuid.clone(),
+                    };
+                    task::add_task_to_board(
+                        backend,
+                        &scope,
+                        &board_uuid,
+                        &parent_uuid,
+                        &name,
+                        kind.as_deref(),
+                        status.as_deref(),
+                        description.as_deref(),
+                        deadline.as_deref(),
+                        importance,
+                    )?;
+                }
+                BoardCommand::Commit { uuid } => {
+                    task::board_commit(backend, &scope, &uuid)?;
                 }
             }
         }

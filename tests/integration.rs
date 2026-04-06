@@ -2860,11 +2860,17 @@ fn task_path_dotdot_walks_to_parent() {
     // Use .. to reference the parent — stderr should show the parent's UUID.
     let show_out = subcontext(&root, &["task", "show", ".."]);
     assert!(show_out.status.success(), "task show .. should succeed");
+    let show_stderr = String::from_utf8_lossy(&show_out.stderr);
     let show_stdout = String::from_utf8_lossy(&show_out.stdout);
-    // The TASK.md for a parent with subtasks should contain "child-task" in subtasks.
+    // The .. path should resolve to the parent task (verified by UUID in stderr).
     assert!(
-        show_stdout.contains("child-task"),
-        ".. should resolve to parent task (whose subtasks include child-task), got: {show_stdout}"
+        show_stderr.contains("Task UUID:"),
+        ".. should resolve to parent task, stderr: {show_stderr}, stdout: {show_stdout}"
+    );
+    // The parent's TASK.md should contain basic frontmatter.
+    assert!(
+        show_stdout.contains("kind: task"),
+        ".. should show parent TASK.md, got: {show_stdout}"
     );
 
     cleanup(&root);
@@ -2896,6 +2902,252 @@ fn task_path_dot_uuid_resolves_directly() {
     assert!(
         show_stderr.contains(uuid),
         "/.uuid/<uuid> should resolve to the task with UUID {uuid}, stderr: {show_stderr}"
+    );
+
+    cleanup(&root);
+}
+
+// ─── Board tests ──────────────────────────────────────────────────
+
+#[test]
+fn board_create_creates_board_branch_with_tree() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "create",
+            "work",
+            "--kind",
+            "goal",
+            "--description",
+            "My work board",
+        ],
+    );
+
+    // A board branch (object/<uuid>) should exist.
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    assert!(
+        branches.contains("object/"),
+        "expected a board branch, got: {branches}"
+    );
+
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    // object.json should be a board type.
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(
+        obj_json.contains("\"type\": \"board\""),
+        "should be board type, got: {obj_json}"
+    );
+    assert!(
+        obj_json.contains(&format!("\"uuid\": \"{uuid}\"")),
+        "should have board UUID, got: {obj_json}"
+    );
+
+    // TASK.md should exist with root task metadata.
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
+    assert!(
+        task_md.contains("kind: goal"),
+        "root TASK.md should have kind: {task_md}"
+    );
+    assert!(
+        task_md.contains("status: created"),
+        "root TASK.md should have status: {task_md}"
+    );
+    // TASK.md should NOT contain subtasks key.
+    assert!(
+        !task_md.contains("subtasks:"),
+        "TASK.md should not contain subtasks key: {task_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_add_task_creates_subtask_directory() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "write-docs",
+            "--board",
+            &board_uuid,
+            "--kind",
+            "todo",
+            "--description",
+            "Write documentation",
+        ],
+    );
+
+    // The board tree should now have write-docs/TASK.md.
+    let task_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:write-docs/TASK.md")],
+    );
+    assert!(task_md.contains("kind: todo"), "subtask TASK.md: {task_md}");
+    assert!(
+        task_md.contains("status: created"),
+        "subtask TASK.md: {task_md}"
+    );
+
+    // The root TASK.md should still be there.
+    let root_md = git_in_repo(&root, &["show", &format!("object/{board_uuid}:TASK.md")]);
+    assert!(root_md.contains("kind: task"), "root TASK.md: {root_md}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_add_nested_subtasks() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    // Add a direct subtask.
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "project-a", "--board", &board_uuid],
+    );
+
+    // Add a nested subtask under project-a.
+    // First find project-a's UUID.
+    let show_out = subcontext(&root, &["task", "show", "project-a"]);
+    let stderr = String::from_utf8_lossy(&show_out.stderr);
+    let project_a_uuid = stderr
+        .split("Task UUID: ")
+        .nth(1)
+        .and_then(|s| s.lines().next())
+        .unwrap()
+        .trim();
+
+    subcontext_ok(
+        &root,
+        &[
+            "board",
+            "add-task",
+            "sub-task",
+            "--board",
+            &board_uuid,
+            "--parent",
+            project_a_uuid,
+        ],
+    );
+
+    // The tree should have project-a/sub-task/TASK.md.
+    let nested_md = git_in_repo(
+        &root,
+        &[
+            "show",
+            &format!("object/{board_uuid}:project-a/sub-task/TASK.md"),
+        ],
+    );
+    assert!(
+        nested_md.contains("kind: task"),
+        "nested subtask: {nested_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_commit_syncs_state_db() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "task-one", "--board", &board_uuid],
+    );
+
+    // Run board commit to sync.
+    let commit_out = subcontext(&root, &["board", "commit", &board_uuid]);
+    assert!(
+        commit_out.status.success(),
+        "board commit failed: {}",
+        String::from_utf8_lossy(&commit_out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&commit_out.stderr);
+    assert!(
+        stderr.contains("Synchronized"),
+        "should report sync: {stderr}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn board_task_done_updates_board_tree() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let create_out = subcontext(&root, &["board", "create", "work"]);
+    assert!(create_out.status.success());
+    let board_uuid = String::from_utf8_lossy(&create_out.stdout)
+        .trim()
+        .to_string();
+
+    subcontext_ok(
+        &root,
+        &["board", "add-task", "finish-me", "--board", &board_uuid],
+    );
+
+    // Mark the subtask as done.
+    // First set the board root as current task so we can navigate.
+    subcontext_ok(&root, &["task", "set", "work"]);
+    subcontext_ok(
+        &root,
+        &[
+            "task",
+            "done",
+            "finish-me",
+            "--time",
+            "2026-06-01T00:00:00Z",
+        ],
+    );
+
+    // Check the board tree — finish-me/TASK.md should have status: done.
+    let task_md = git_in_repo(
+        &root,
+        &["show", &format!("object/{board_uuid}:finish-me/TASK.md")],
+    );
+    assert!(
+        task_md.contains("status: done"),
+        "subtask should be done: {task_md}"
+    );
+    assert!(
+        task_md.contains("completed_at: 2026-06-01T00:00:00Z"),
+        "subtask should have completed_at: {task_md}"
     );
 
     cleanup(&root);

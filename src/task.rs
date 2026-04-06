@@ -145,6 +145,8 @@ fn create_schema(conn: &Connection) -> Result<()> {
     );
     // Migrate: allow duplicate task names (old schema had PK on branch+name).
     migrate_task_names_allow_duplicates(conn);
+    // Migrate: add board_uuid column to objects table for board membership.
+    let _ = conn.execute_batch("ALTER TABLE objects ADD COLUMN board_uuid TEXT DEFAULT NULL;");
     Ok(())
 }
 
@@ -249,11 +251,18 @@ fn read_subtasks_ns(
 fn find_child_by_name(conn: &Connection, parent_uuid: Option<&str>, name: &str) -> Result<String> {
     match parent_uuid {
         Some(p) => {
+            // First try the subtasks namespace (legacy per-task branches).
             let subs = read_subtasks_ns(conn, p)?;
-            subs.get(name)
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string())
-                .with_context(|| format!("task '{name}' not found under parent {p}"))
+            if let Some(uuid) = subs.get(name).and_then(|v| v.as_str()) {
+                return Ok(uuid.to_string());
+            }
+            // Fall back to querying by parent_task_uuid (board-based tasks).
+            conn.query_row(
+                "SELECT task_uuid FROM tasks WHERE task_name = ?1 AND parent_task_uuid = ?2",
+                params![name, p],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("task '{name}' not found under parent {p}"))
         }
         None => conn
             .query_row(
@@ -489,11 +498,25 @@ pub fn list_subtasks(scope: &TaskScope, parent_uuid: Option<&str>) -> Result<Vec
 
     match parent_uuid {
         Some(p) => {
+            // First try the subtasks namespace (legacy).
             let subs = read_subtasks_ns(&conn, p)?;
             let mut entries: Vec<(String, String)> = subs
                 .iter()
                 .filter_map(|(name, val)| val.as_str().map(|uuid| (name.clone(), uuid.to_string())))
                 .collect();
+            // Also query tasks table for board-based children.
+            let mut stmt = conn.prepare(
+                "SELECT task_uuid, task_name FROM tasks WHERE parent_task_uuid = ?1 ORDER BY task_name",
+            )?;
+            let db_children: Vec<(String, String)> = stmt
+                .query_map(params![p], |r| Ok((r.get(0)?, r.get(1)?)))?
+                .filter_map(|r| r.ok())
+                .collect();
+            for (uuid, name) in db_children {
+                if !entries.iter().any(|(_, u)| *u == uuid) {
+                    entries.push((name, uuid));
+                }
+            }
             entries.sort_by(|a, b| a.0.cmp(&b.0));
             for (sub_name, sub_uuid) in &entries {
                 if let Ok(info) = conn.query_row(
@@ -816,7 +839,6 @@ pub fn done_task(
     drop(conn);
 
     let conn = open_db(scope)?;
-
     conn.execute(
         "UPDATE tasks SET task_status = 'done' WHERE task_uuid = ?1",
         params![task_uuid],
@@ -824,54 +846,110 @@ pub fn done_task(
     drop(conn);
 
     let completed_at = resolve_timestamp(time)?;
-
     commit_state_in(backend, &scope.state_dir, &format!("task done: {name}"))?;
 
-    // Read existing object.json, update the data fields.
-    let obj_branch = format!("object/{task_uuid}");
-    let existing = run_git_in_bare(
-        backend,
-        &["show", &format!("{obj_branch}:object.json")],
-        &scope.repo_dir,
-        &scope.repo_dir,
-    )?;
-    let mut val: serde_json::Value = serde_json::from_str(&existing)
-        .with_context(|| format!("invalid object.json on {obj_branch}"))?;
-    val["data"]["status"] = serde_json::Value::String("done".to_string());
-    val["data"]["completed_at"] = serde_json::Value::String(completed_at);
-
-    let new_json = serde_json::to_string_pretty(&val)? + "\n";
-
-    // Sync TASK.md from updated object.json.
-    let old_body = read_object_file(backend, scope, &task_uuid, "TASK.md")
-        .ok()
-        .flatten()
-        .map(|md| parse_frontmatter(&md).1)
+    // Check if this task is part of a board.
+    if let Some(board_uuid) = find_board_for_task(scope, &task_uuid)? {
+        // Update TASK.md within the board tree.
+        let dir_path = compute_board_path(scope, &task_uuid, &board_uuid)?;
+        let task_md_path = if dir_path.is_empty() {
+            "TASK.md".to_string()
+        } else {
+            format!("{dir_path}/TASK.md")
+        };
+        let obj_branch = format!("object/{board_uuid}");
+        let old_md = run_git_in_bare(
+            backend,
+            &["show", &format!("{obj_branch}:{task_md_path}")],
+            &scope.repo_dir,
+            &scope.repo_dir,
+        )
         .unwrap_or_default();
-    let new_md = generate_task_md_from_json(&val, &old_body);
+        let (pairs, body) = parse_frontmatter(&old_md);
+        // Rebuild with updated status and completed_at.
+        let mut new_pairs: Vec<(String, String)> = Vec::new();
+        let mut has_status = false;
+        let mut has_completed = false;
+        for (k, v) in &pairs {
+            if k == "status" {
+                new_pairs.push(("status".to_string(), "done".to_string()));
+                has_status = true;
+            } else if k == "completed_at" {
+                new_pairs.push(("completed_at".to_string(), completed_at.clone()));
+                has_completed = true;
+            } else {
+                new_pairs.push((k.clone(), v.clone()));
+            }
+        }
+        if !has_status {
+            new_pairs.push(("status".to_string(), "done".to_string()));
+        }
+        if !has_completed {
+            new_pairs.push(("completed_at".to_string(), completed_at.clone()));
+        }
+        let new_md = rebuild_task_md_from_pairs(&new_pairs, &body);
+        update_task_in_board(backend, scope, &task_uuid, &board_uuid, &new_md)?;
+    } else {
+        // Legacy: task has its own object branch.
+        let obj_branch = format!("object/{task_uuid}");
+        let existing = run_git_in_bare(
+            backend,
+            &["show", &format!("{obj_branch}:object.json")],
+            &scope.repo_dir,
+            &scope.repo_dir,
+        )?;
+        let mut val: serde_json::Value = serde_json::from_str(&existing)
+            .with_context(|| format!("invalid object.json on {obj_branch}"))?;
+        val["data"]["status"] = serde_json::Value::String("done".to_string());
+        val["data"]["completed_at"] = serde_json::Value::String(completed_at);
 
-    let new_commit = update_object_branch(
-        backend,
-        scope,
-        &task_uuid,
-        &[("object.json", &new_json), ("TASK.md", &new_md)],
-    )?;
+        let new_json = serde_json::to_string_pretty(&val)? + "\n";
+        let old_body = read_object_file(backend, scope, &task_uuid, "TASK.md")
+            .ok()
+            .flatten()
+            .map(|md| parse_frontmatter(&md).1)
+            .unwrap_or_default();
+        let new_md = generate_task_md_from_json(&val, &old_body);
 
-    // Update the object's current_commit.
-    let conn = open_db(scope)?;
-    conn.execute(
-        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![new_commit, task_uuid],
-    )?;
-    drop(conn);
-    commit_state_in(
-        backend,
-        &scope.state_dir,
-        &format!("object update: {task_uuid}"),
-    )?;
+        let new_commit = update_object_branch(
+            backend,
+            scope,
+            &task_uuid,
+            &[("object.json", &new_json), ("TASK.md", &new_md)],
+        )?;
+        let conn = open_db(scope)?;
+        conn.execute(
+            "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+            params![new_commit, task_uuid],
+        )?;
+        drop(conn);
+        commit_state_in(
+            backend,
+            &scope.state_dir,
+            &format!("object update: {task_uuid}"),
+        )?;
+    }
 
     eprintln!("[subcontext] Marked task '{name}' as done");
     Ok(())
+}
+
+/// Rebuild a TASK.md from key-value pairs and a body.
+fn rebuild_task_md_from_pairs(pairs: &[(String, String)], body: &str) -> String {
+    let mut lines = vec!["---".to_string()];
+    for (k, v) in pairs {
+        lines.push(format!("{}: {}", k, v));
+    }
+    lines.push("---".to_string());
+    let mut result = lines.join("\n");
+    if !body.is_empty() {
+        result.push('\n');
+        result.push_str(body);
+    }
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
 }
 
 /// Mark an existing task as failed. `name` supports hierarchical path syntax.
@@ -886,7 +964,6 @@ pub fn fail_task(
     drop(conn);
 
     let conn = open_db(scope)?;
-
     conn.execute(
         "UPDATE tasks SET task_status = 'failed' WHERE task_uuid = ?1",
         params![task_uuid],
@@ -894,49 +971,86 @@ pub fn fail_task(
     drop(conn);
 
     let completed_at = resolve_timestamp(time)?;
-
     commit_state_in(backend, &scope.state_dir, &format!("task fail: {name}"))?;
 
-    let obj_branch = format!("object/{task_uuid}");
-    let existing = run_git_in_bare(
-        backend,
-        &["show", &format!("{obj_branch}:object.json")],
-        &scope.repo_dir,
-        &scope.repo_dir,
-    )?;
-    let mut val: serde_json::Value = serde_json::from_str(&existing)
-        .with_context(|| format!("invalid object.json on {obj_branch}"))?;
-    val["data"]["status"] = serde_json::Value::String("failed".to_string());
-    val["data"]["completed_at"] = serde_json::Value::String(completed_at);
-
-    let new_json = serde_json::to_string_pretty(&val)? + "\n";
-
-    // Sync TASK.md from updated object.json.
-    let old_body = read_object_file(backend, scope, &task_uuid, "TASK.md")
-        .ok()
-        .flatten()
-        .map(|md| parse_frontmatter(&md).1)
+    // Check if this task is part of a board.
+    if let Some(board_uuid) = find_board_for_task(scope, &task_uuid)? {
+        let dir_path = compute_board_path(scope, &task_uuid, &board_uuid)?;
+        let task_md_path = if dir_path.is_empty() {
+            "TASK.md".to_string()
+        } else {
+            format!("{dir_path}/TASK.md")
+        };
+        let obj_branch = format!("object/{board_uuid}");
+        let old_md = run_git_in_bare(
+            backend,
+            &["show", &format!("{obj_branch}:{task_md_path}")],
+            &scope.repo_dir,
+            &scope.repo_dir,
+        )
         .unwrap_or_default();
-    let new_md = generate_task_md_from_json(&val, &old_body);
+        let (pairs, body) = parse_frontmatter(&old_md);
+        let mut new_pairs: Vec<(String, String)> = Vec::new();
+        let mut has_status = false;
+        let mut has_completed = false;
+        for (k, v) in &pairs {
+            if k == "status" {
+                new_pairs.push(("status".to_string(), "failed".to_string()));
+                has_status = true;
+            } else if k == "completed_at" {
+                new_pairs.push(("completed_at".to_string(), completed_at.clone()));
+                has_completed = true;
+            } else {
+                new_pairs.push((k.clone(), v.clone()));
+            }
+        }
+        if !has_status {
+            new_pairs.push(("status".to_string(), "failed".to_string()));
+        }
+        if !has_completed {
+            new_pairs.push(("completed_at".to_string(), completed_at.clone()));
+        }
+        let new_md = rebuild_task_md_from_pairs(&new_pairs, &body);
+        update_task_in_board(backend, scope, &task_uuid, &board_uuid, &new_md)?;
+    } else {
+        let obj_branch = format!("object/{task_uuid}");
+        let existing = run_git_in_bare(
+            backend,
+            &["show", &format!("{obj_branch}:object.json")],
+            &scope.repo_dir,
+            &scope.repo_dir,
+        )?;
+        let mut val: serde_json::Value = serde_json::from_str(&existing)
+            .with_context(|| format!("invalid object.json on {obj_branch}"))?;
+        val["data"]["status"] = serde_json::Value::String("failed".to_string());
+        val["data"]["completed_at"] = serde_json::Value::String(completed_at);
 
-    let new_commit = update_object_branch(
-        backend,
-        scope,
-        &task_uuid,
-        &[("object.json", &new_json), ("TASK.md", &new_md)],
-    )?;
+        let new_json = serde_json::to_string_pretty(&val)? + "\n";
+        let old_body = read_object_file(backend, scope, &task_uuid, "TASK.md")
+            .ok()
+            .flatten()
+            .map(|md| parse_frontmatter(&md).1)
+            .unwrap_or_default();
+        let new_md = generate_task_md_from_json(&val, &old_body);
 
-    let conn = open_db(scope)?;
-    conn.execute(
-        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-        params![new_commit, task_uuid],
-    )?;
-    drop(conn);
-    commit_state_in(
-        backend,
-        &scope.state_dir,
-        &format!("object update: {task_uuid}"),
-    )?;
+        let new_commit = update_object_branch(
+            backend,
+            scope,
+            &task_uuid,
+            &[("object.json", &new_json), ("TASK.md", &new_md)],
+        )?;
+        let conn = open_db(scope)?;
+        conn.execute(
+            "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+            params![new_commit, task_uuid],
+        )?;
+        drop(conn);
+        commit_state_in(
+            backend,
+            &scope.state_dir,
+            &format!("object update: {task_uuid}"),
+        )?;
+    }
 
     eprintln!("[subcontext] Marked task '{name}' as failed");
     Ok(())
@@ -1189,6 +1303,757 @@ pub fn build_child_object_json(child_data: &serde_json::Value) -> String {
         "data": child_data,
     });
     serde_json::to_string_pretty(&obj).unwrap() + "\n"
+}
+
+// ─── Board Support ────────���───────────────────────────────────────
+
+/// Build a simplified `object.json` for a board.
+/// Boards have: `{"type": "board", "uuid": "<uuid>"}`.
+fn build_board_object_json(uuid: &str) -> String {
+    let obj = serde_json::json!({
+        "type": "board",
+        "uuid": uuid,
+    });
+    serde_json::to_string_pretty(&obj).unwrap() + "\n"
+}
+
+/// Generate a BOARD.md string for a sub-board reference.
+/// Contains the sub-board's description and UUID.
+#[allow(dead_code)]
+pub fn generate_board_md(description: &str, uuid: &str) -> String {
+    let mut lines = vec!["---".to_string()];
+    lines.push(format!("uuid: {}", uuid));
+    if !description.is_empty() {
+        lines.push(format!("description: {}", description));
+    }
+    lines.push("---".to_string());
+    let mut result = lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Parse a BOARD.md file, returning `(uuid, description)`.
+pub fn parse_board_md(content: &str) -> Option<(String, Option<String>)> {
+    let (pairs, _body) = parse_frontmatter(content);
+    let fm = FrontmatterMap(&pairs);
+    let uuid = fm.get("uuid")?;
+    let description = fm.get("description");
+    Some((uuid, description))
+}
+
+/// Parsed import reference from a TASK.md.
+pub struct TaskImport {
+    pub context_uuid: String,
+    pub task_uuid: String,
+}
+
+/// Check if a TASK.md represents an import (foreign task reference).
+/// Import format in frontmatter: `import_context: <uuid>` and `import_task: <uuid>`.
+pub fn parse_task_import(content: &str) -> Option<TaskImport> {
+    let (pairs, _body) = parse_frontmatter(content);
+    let fm = FrontmatterMap(&pairs);
+    let context_uuid = fm.get("import_context")?;
+    let task_uuid = fm.get("import_task")?;
+    Some(TaskImport {
+        context_uuid,
+        task_uuid,
+    })
+}
+
+/// Generate an import TASK.md that references a foreign task.
+#[allow(dead_code)]
+pub fn generate_import_task_md(context_uuid: &str, task_uuid: &str) -> String {
+    let lines = vec![
+        "---".to_string(),
+        format!("import_context: {}", context_uuid),
+        format!("import_task: {}", task_uuid),
+        "---".to_string(),
+    ];
+    let mut result = lines.join("\n");
+    if !result.ends_with('\n') {
+        result.push('\n');
+    }
+    result
+}
+
+/// Create a new board. A board is a root task + all subtasks organized as a
+/// directory tree on a single `object/<board-uuid>` branch.
+///
+/// The root TASK.md shares the same UUID as the board's object.json.
+/// Returns `(board_uuid, commit)`.
+pub fn create_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    name: &str,
+    kind: Option<&str>,
+    status: Option<&str>,
+    description: Option<&str>,
+    deadline: Option<&str>,
+    importance: f64,
+    source: Option<(&str, &str, &str)>,
+) -> Result<(String, String)> {
+    if let Some(d) = deadline
+        && !d.ends_with('Z')
+    {
+        bail!("--deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
+    }
+
+    let branch: String = match source {
+        Some((ctx, _, _)) => ctx.to_string(),
+        None => scope.host_branch.clone(),
+    };
+    let board_uuid = Uuid::new_v4().to_string();
+    let kind = kind.unwrap_or(DEFAULT_KIND);
+    let status = status.unwrap_or(DEFAULT_STATUS);
+
+    // Insert the root task into the tasks table.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        params![board_uuid, name, status, kind, description, scope.project_uuid, deadline, importance],
+    )?;
+    conn.execute(
+        "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
+        params![branch, name, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
+
+    // Build the board branch: object.json + TASK.md at root.
+    let object_json = build_board_object_json(&board_uuid);
+    let task_data = TaskData {
+        title: None,
+        uuid: board_uuid.clone(),
+        status: status.to_string(),
+        kind: kind.to_string(),
+        project_uuid: scope.project_uuid.clone(),
+        completed_at: None,
+        description: description.map(|s| s.to_string()),
+        deadline: deadline.map(|s| s.to_string()),
+        importance,
+        parent_task_uuid: None,
+        subtasks: vec![],
+        subtasks_ns: serde_json::Map::new(),
+    };
+    let task_md = generate_task_md(&task_data, "");
+
+    let commit = create_object_branch(
+        backend,
+        scope,
+        &board_uuid,
+        &[("object.json", &object_json), ("TASK.md", &task_md)],
+    )?;
+
+    // Record in the objects table: the board itself is an object.
+    let conn = open_db(scope)?;
+    insert_object(&conn, &board_uuid, "board", &commit, source)?;
+    // Board_uuid for the root task object entry is itself.
+    conn.execute(
+        "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
+        params![board_uuid, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object add: {board_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Created board '{name}' ({board_uuid})");
+    println!("{board_uuid}");
+    Ok((board_uuid, commit))
+}
+
+/// Create a board from a TASK.md file. Returns `(board_uuid, commit)`.
+pub fn create_board_from_md(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    md_content: &str,
+    source: Option<(&str, &str, &str)>,
+    name_override: Option<&str>,
+) -> Result<(String, String)> {
+    let (pairs, body) = parse_frontmatter(md_content);
+    let fm = FrontmatterMap(&pairs);
+
+    let name = name_override
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("board name is required as a positional argument"))?;
+    let kind = fm.get("kind");
+    let status = fm.get("status");
+    let description = fm.get("description");
+    let deadline = fm.get("deadline");
+    let importance: f64 = fm
+        .get("importance")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    if let Some(d) = &deadline
+        && !d.ends_with('Z')
+    {
+        bail!("TASK.md deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
+    }
+
+    let branch: String = match source {
+        Some((ctx, _, _)) => ctx.to_string(),
+        None => scope.host_branch.clone(),
+    };
+    let board_uuid = fm.get("uuid").unwrap_or_else(|| Uuid::new_v4().to_string());
+    let kind_str = kind.as_deref().unwrap_or(DEFAULT_KIND);
+    let status_str = status.as_deref().unwrap_or(DEFAULT_STATUS);
+
+    let conn = open_db(scope)?;
+    conn.execute(
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, NULL)",
+        params![board_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance],
+    )?;
+    conn.execute(
+        "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
+        params![branch, name, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(backend, &scope.state_dir, &format!("board add: {name}"))?;
+
+    let object_json = build_board_object_json(&board_uuid);
+    // Regenerate TASK.md with uuid embedded.
+    let task_md = {
+        let mut lines = vec!["---".to_string()];
+        lines.push(format!("uuid: {}", board_uuid));
+        for (k, v) in &pairs {
+            if k == "uuid" {
+                continue;
+            }
+            lines.push(format!("{}: {}", k, v));
+        }
+        lines.push("---".to_string());
+        let mut out = lines.join("\n");
+        if !body.is_empty() {
+            out.push('\n');
+            out.push_str(&body);
+        }
+        if !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out
+    };
+
+    let commit = create_object_branch(
+        backend,
+        scope,
+        &board_uuid,
+        &[("object.json", &object_json), ("TASK.md", &task_md)],
+    )?;
+
+    let conn = open_db(scope)?;
+    insert_object(&conn, &board_uuid, "board", &commit, source)?;
+    conn.execute(
+        "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
+        params![board_uuid, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object add: {board_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Created board '{name}' ({board_uuid})");
+    println!("{board_uuid}");
+    Ok((board_uuid, commit))
+}
+
+/// Add a subtask to a board. The subtask is placed as a subdirectory in the
+/// board's tree at the appropriate path based on the parent hierarchy.
+///
+/// Returns `(task_uuid, board_commit)`.
+pub fn add_task_to_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    board_uuid: &str,
+    parent_task_uuid: &str,
+    name: &str,
+    kind: Option<&str>,
+    status: Option<&str>,
+    description: Option<&str>,
+    deadline: Option<&str>,
+    importance: f64,
+) -> Result<(String, String)> {
+    if let Some(d) = deadline
+        && !d.ends_with('Z')
+    {
+        bail!("--deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
+    }
+
+    let task_uuid = Uuid::new_v4().to_string();
+    let kind = kind.unwrap_or(DEFAULT_KIND);
+    let status = status.unwrap_or(DEFAULT_STATUS);
+
+    // Insert into tasks table with parent.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid],
+    )?;
+    conn.execute(
+        "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
+        params![scope.host_branch, name, task_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(backend, &scope.state_dir, &format!("task add: {name}"))?;
+
+    // Compute the path within the board tree for this subtask.
+    let dir_path = compute_board_path(scope, parent_task_uuid, board_uuid)?;
+    let task_md_path = if dir_path.is_empty() {
+        format!("{name}/TASK.md")
+    } else {
+        format!("{dir_path}/{name}/TASK.md")
+    };
+
+    let task_data = TaskData {
+        title: None,
+        uuid: task_uuid.clone(),
+        status: status.to_string(),
+        kind: kind.to_string(),
+        project_uuid: scope.project_uuid.clone(),
+        completed_at: None,
+        description: description.map(|s| s.to_string()),
+        deadline: deadline.map(|s| s.to_string()),
+        importance,
+        parent_task_uuid: Some(parent_task_uuid.to_string()),
+        subtasks: vec![],
+        subtasks_ns: serde_json::Map::new(),
+    };
+    let task_md = generate_task_md(&task_data, "");
+
+    // Read current board tree, add the new file, and update.
+    let board_files = read_board_tree(backend, scope, board_uuid)?;
+    let mut all_files: Vec<(String, String)> = board_files;
+    all_files.push((task_md_path, task_md));
+
+    let file_refs: Vec<(&str, &str)> = all_files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+    let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+
+    // Record task in objects table, pointing to board.
+    let conn = open_db(scope)?;
+    insert_object(&conn, &task_uuid, "task", &commit, None)?;
+    conn.execute(
+        "UPDATE objects SET board_uuid = ?1 WHERE uuid = ?2",
+        params![board_uuid, task_uuid],
+    )?;
+    // Update the board's commit too.
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object add: {task_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Added task '{name}' to board ({task_uuid})");
+    Ok((task_uuid, commit))
+}
+
+/// Compute the directory path within a board tree for a given task UUID.
+/// For the board root task, returns "". For a child of root, returns "".
+/// For deeper nesting, returns "child-name/grandchild-name/...".
+fn compute_board_path(scope: &TaskScope, task_uuid: &str, board_uuid: &str) -> Result<String> {
+    if task_uuid == board_uuid {
+        return Ok(String::new());
+    }
+    let conn = open_db(scope)?;
+    let mut segments: Vec<String> = Vec::new();
+    let mut current = task_uuid.to_string();
+    loop {
+        if current == board_uuid {
+            break;
+        }
+        let (name, parent): (String, Option<String>) = conn
+            .query_row(
+                "SELECT task_name, parent_task_uuid FROM tasks WHERE task_uuid = ?1",
+                params![current],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .with_context(|| format!("task '{current}' not found while computing board path"))?;
+        segments.push(name);
+        match parent {
+            Some(p) => current = p,
+            None => bail!("task '{current}' has no parent — not part of board {board_uuid}"),
+        }
+    }
+    segments.reverse();
+    Ok(segments.join("/"))
+}
+
+/// Read all files from a board's object branch tree.
+/// Returns `Vec<(path, content)>` where path uses `/` separators.
+fn read_board_tree(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    board_uuid: &str,
+) -> Result<Vec<(String, String)>> {
+    let obj_branch = format!("object/{board_uuid}");
+    // Use `git ls-tree -r` to list all files.
+    let listing = run_git_in_bare(
+        backend,
+        &["ls-tree", "-r", "--name-only", &obj_branch],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )?;
+
+    let mut files = Vec::new();
+    for line in listing.lines() {
+        let path = line.trim();
+        if path.is_empty() {
+            continue;
+        }
+        let content = run_git_in_bare(
+            backend,
+            &["show", &format!("{obj_branch}:{path}")],
+            &scope.repo_dir,
+            &scope.repo_dir,
+        )?;
+        files.push((path.to_string(), content));
+    }
+    Ok(files)
+}
+
+/// Read a task's TASK.md from within its board tree.
+fn read_task_md_from_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    task_uuid: &str,
+    board_uuid: &str,
+) -> Result<String> {
+    let dir_path = compute_board_path(scope, task_uuid, board_uuid)?;
+    let task_md_path = if dir_path.is_empty() {
+        "TASK.md".to_string()
+    } else {
+        format!("{dir_path}/TASK.md")
+    };
+    let obj_branch = format!("object/{board_uuid}");
+    run_git_in_bare(
+        backend,
+        &["show", &format!("{obj_branch}:{task_md_path}")],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )
+}
+
+/// Find the board UUID for a given task UUID.
+pub fn find_board_for_task(scope: &TaskScope, task_uuid: &str) -> Result<Option<String>> {
+    let conn = open_db(scope)?;
+    Ok(conn
+        .query_row(
+            "SELECT board_uuid FROM objects WHERE uuid = ?1",
+            params![task_uuid],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+/// Update a task's TASK.md within its board tree. Reads the current board tree,
+/// replaces the task's TASK.md, and commits.
+pub fn update_task_in_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    task_uuid: &str,
+    board_uuid: &str,
+    new_md: &str,
+) -> Result<String> {
+    let dir_path = compute_board_path(scope, task_uuid, board_uuid)?;
+    let task_md_path = if dir_path.is_empty() {
+        "TASK.md".to_string()
+    } else {
+        format!("{dir_path}/TASK.md")
+    };
+
+    let mut board_files = read_board_tree(backend, scope, board_uuid)?;
+    // Replace the matching file.
+    let mut found = false;
+    for (path, content) in &mut board_files {
+        if *path == task_md_path {
+            *content = new_md.to_string();
+            found = true;
+            break;
+        }
+    }
+    if !found {
+        board_files.push((task_md_path, new_md.to_string()));
+    }
+
+    let file_refs: Vec<(&str, &str)> = board_files
+        .iter()
+        .map(|(n, c)| (n.as_str(), c.as_str()))
+        .collect();
+    let commit = update_object_branch(backend, scope, board_uuid, &file_refs)?;
+
+    // Update commits for both the task and the board.
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, task_uuid],
+    )?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![commit, board_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object update: {task_uuid}"),
+    )?;
+    Ok(commit)
+}
+
+/// Walk a board's tree and synchronize all tasks into the state DB.
+/// This is called after any manual edits to the board branch.
+///
+/// For each TASK.md found:
+/// - Parse frontmatter to get task metadata
+/// - Upsert into tasks table
+/// - Upsert into objects table (with board_uuid and current board commit)
+///
+/// For each BOARD.md found (sub-boards):
+/// - Parse to get sub-board UUID and description
+/// - The sub-board itself is a separate board branch
+///
+/// Returns the number of tasks synchronized.
+pub fn board_commit(backend: &dyn Backend, scope: &TaskScope, board_uuid: &str) -> Result<usize> {
+    let obj_branch = format!("object/{board_uuid}");
+
+    // Get the current HEAD commit of the board branch.
+    let head_commit = run_git_in_bare(
+        backend,
+        &["rev-parse", &format!("refs/heads/{obj_branch}")],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )?;
+
+    let files = read_board_tree(backend, scope, board_uuid)?;
+    let conn = open_db(scope)?;
+    let mut count = 0;
+
+    for (path, content) in &files {
+        let filename = path.rsplit('/').next().unwrap_or(path);
+
+        if filename == "TASK.md" {
+            // Determine the task's parent by its directory position.
+            let parent_task_uuid = task_parent_from_path(path, board_uuid, &conn)?;
+            let task_name = task_name_from_path(path);
+
+            // Check if this is an import.
+            if let Some(import) = parse_task_import(content) {
+                // Import tasks get a new UUID but reference the foreign task.
+                let (pairs, _body) = parse_frontmatter(content);
+                let fm = FrontmatterMap(&pairs);
+                let task_uuid = fm.get("uuid").unwrap_or_else(|| Uuid::new_v4().to_string());
+
+                upsert_task_from_board(
+                    &conn,
+                    &task_uuid,
+                    &task_name,
+                    DEFAULT_STATUS,
+                    DEFAULT_KIND,
+                    None,
+                    &scope.project_uuid,
+                    None,
+                    0.0,
+                    parent_task_uuid.as_deref(),
+                )?;
+                upsert_object_from_board(
+                    &conn,
+                    &task_uuid,
+                    "task",
+                    &head_commit,
+                    board_uuid,
+                    Some((&import.context_uuid, &import.task_uuid)),
+                )?;
+                count += 1;
+                continue;
+            }
+
+            let (pairs, _body) = parse_frontmatter(content);
+            let fm = FrontmatterMap(&pairs);
+
+            let task_uuid = fm.get("uuid").unwrap_or_else(|| {
+                // For the root TASK.md, UUID must match board UUID.
+                if path == "TASK.md" {
+                    board_uuid.to_string()
+                } else {
+                    Uuid::new_v4().to_string()
+                }
+            });
+            let kind = fm.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
+            let status = fm
+                .get("status")
+                .unwrap_or_else(|| DEFAULT_STATUS.to_string());
+            let description = fm.get("description");
+            let deadline = fm.get("deadline");
+            let importance: f64 = fm
+                .get("importance")
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(0.0);
+
+            upsert_task_from_board(
+                &conn,
+                &task_uuid,
+                &task_name,
+                &status,
+                &kind,
+                description.as_deref(),
+                &scope.project_uuid,
+                deadline.as_deref(),
+                importance,
+                parent_task_uuid.as_deref(),
+            )?;
+            upsert_object_from_board(
+                &conn,
+                &task_uuid,
+                if path == "TASK.md" { "board" } else { "task" },
+                &head_commit,
+                board_uuid,
+                None,
+            )?;
+
+            // Also register in task_names if not already present.
+            let existing: Option<String> = conn
+                .query_row(
+                    "SELECT task_uuid FROM task_names WHERE task_uuid = ?1",
+                    params![task_uuid],
+                    |r| r.get(0),
+                )
+                .ok();
+            if existing.is_none() {
+                conn.execute(
+                    "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
+                    params![scope.host_branch, task_name, task_uuid],
+                )?;
+            }
+
+            count += 1;
+        } else if filename == "BOARD.md" {
+            // Sub-board reference.
+            if let Some((sub_uuid, _description)) = parse_board_md(content) {
+                // The sub-board entry in the objects table points to the separate
+                // board branch for the sub-board.
+                upsert_object_from_board(
+                    &conn,
+                    &sub_uuid,
+                    "board",
+                    &head_commit,
+                    board_uuid,
+                    None,
+                )?;
+                count += 1;
+            }
+        }
+    }
+
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("board commit: {board_uuid}"),
+    )?;
+
+    eprintln!("[subcontext] Synchronized {count} tasks from board {board_uuid}");
+    Ok(count)
+}
+
+/// Determine the task name from its path in the board tree.
+/// "TASK.md" → board root name (from DB), "foo/TASK.md" → "foo",
+/// "foo/bar/TASK.md" → "bar".
+fn task_name_from_path(path: &str) -> String {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 1 {
+        // Root TASK.md — name comes from elsewhere.
+        return String::new();
+    }
+    // The directory name immediately before the filename is the task name.
+    parts[parts.len() - 2].to_string()
+}
+
+/// Determine the parent task UUID from a file path in the board tree.
+/// "TASK.md" → None (root task), "foo/TASK.md" → board root UUID,
+/// "foo/bar/TASK.md" → UUID of "foo" task.
+fn task_parent_from_path(
+    path: &str,
+    board_uuid: &str,
+    conn: &Connection,
+) -> Result<Option<String>> {
+    let parts: Vec<&str> = path.split('/').collect();
+    if parts.len() <= 1 {
+        // Root TASK.md — no parent.
+        return Ok(None);
+    }
+    if parts.len() == 2 {
+        // Direct child of root — parent is the board root task.
+        return Ok(Some(board_uuid.to_string()));
+    }
+    // Walk up from board root: parts[0]/parts[1]/.../TASK.md
+    // The parent directory names are parts[0..len-2], parent is parts[0..len-2].
+    // We need to find the task UUID for the directory at parts[0..len-2].
+    let mut current_uuid = board_uuid.to_string();
+    for i in 0..parts.len() - 2 {
+        let child_name = parts[i];
+        current_uuid = find_child_by_name(conn, Some(&current_uuid), child_name)?;
+    }
+    Ok(Some(current_uuid))
+}
+
+/// Upsert a task into the tasks table from board tree walking.
+#[allow(clippy::too_many_arguments)]
+fn upsert_task_from_board(
+    conn: &Connection,
+    uuid: &str,
+    name: &str,
+    status: &str,
+    kind: &str,
+    description: Option<&str>,
+    project_uuid: &str,
+    deadline: Option<&str>,
+    importance: f64,
+    parent_task_uuid: Option<&str>,
+) -> Result<()> {
+    // Use INSERT OR REPLACE to upsert.
+    conn.execute(
+        "INSERT OR REPLACE INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![uuid, name, status, kind, description, project_uuid, deadline, importance, parent_task_uuid],
+    )?;
+    Ok(())
+}
+
+/// Upsert an object entry from board tree walking.
+fn upsert_object_from_board(
+    conn: &Connection,
+    uuid: &str,
+    obj_type: &str,
+    commit: &str,
+    board_uuid: &str,
+    source: Option<(&str, &str)>,
+) -> Result<()> {
+    let (src_ctx, src_obj) = match source {
+        Some((c, o)) => (Some(c), Some(o)),
+        None => (None, None),
+    };
+    conn.execute(
+        "INSERT OR REPLACE INTO objects (uuid, type, current_commit, board_uuid, source_context_uuid, source_object_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![uuid, obj_type, commit, board_uuid, src_ctx, src_obj],
+    )?;
+    Ok(())
 }
 
 /// Insert a row into the `objects` table.
@@ -1607,12 +2472,7 @@ pub fn generate_task_md(data: &TaskData, body: &str) -> String {
     if let Some(ts) = &data.completed_at {
         lines.push(format!("completed_at: {}", ts));
     }
-    if !data.subtasks.is_empty() {
-        lines.push("subtasks:".to_string());
-        for name in &data.subtasks {
-            lines.push(format!("  - {}", name));
-        }
-    }
+    // Subtasks are now represented as subdirectories, not in TASK.md frontmatter.
     lines.push("---".to_string());
 
     let mut result = lines.join("\n");
@@ -1656,16 +2516,7 @@ fn generate_task_md_from_json(val: &serde_json::Value, body: &str) -> String {
     if let Some(completed_at) = data["completed_at"].as_str() {
         lines.push(format!("completed_at: {}", completed_at));
     }
-    // Emit subtasks list if present.
-    if let Some(arr) = data["subtasks"].as_array() {
-        let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
-        if !names.is_empty() {
-            lines.push("subtasks:".to_string());
-            for name in names {
-                lines.push(format!("  - {}", name));
-            }
-        }
-    }
+    // Subtasks are now represented as subdirectories, not in TASK.md frontmatter.
     lines.push("---".to_string());
 
     let mut result = lines.join("\n");
@@ -1927,7 +2778,24 @@ pub fn update_task(
     deadline: Option<&str>,
     importance: Option<f64>,
 ) -> Result<String> {
-    // Read current object.json.
+    // Check if this task is part of a board.
+    if let Some(board_uuid) = find_board_for_task(scope, uuid)? {
+        return update_task_board(
+            backend,
+            scope,
+            uuid,
+            &board_uuid,
+            md_content,
+            name,
+            kind,
+            status,
+            description,
+            deadline,
+            importance,
+        );
+    }
+
+    // Legacy: task has its own object branch with object.json.
     let obj_branch = format!("object/{uuid}");
     let existing_json = run_git_in_bare(
         backend,
@@ -1941,7 +2809,6 @@ pub fn update_task(
     let new_md;
 
     if let Some(md) = md_content {
-        // TASK.md is source of truth — update object.json from it.
         let (pairs, _body) = parse_frontmatter(md);
         let fm = FrontmatterMap(&pairs);
 
@@ -1967,10 +2834,8 @@ pub fn update_task(
         {
             val["data"]["importance"] = serde_json::json!(v);
         }
-        // Store TASK.md as-is.
         new_md = md.to_string();
     } else {
-        // Update from individual fields. `name` here is actually `title`.
         if let Some(n) = name {
             val["data"]["title"] = serde_json::Value::String(n.to_string());
         }
@@ -1989,7 +2854,6 @@ pub fn update_task(
         if let Some(imp) = importance {
             val["data"]["importance"] = serde_json::json!(imp);
         }
-        // Regenerate TASK.md from updated object.json.
         let old_body = read_object_file(backend, scope, uuid, "TASK.md")
             .ok()
             .flatten()
@@ -2000,8 +2864,6 @@ pub fn update_task(
 
     let updated_json = serde_json::to_string_pretty(&val)? + "\n";
 
-    // Update DB. task_name in DB is the lookup name (not in object.json).
-    // Only update status/kind/desc/deadline/importance from object.json.
     let task_status = val["data"]["status"]
         .as_str()
         .unwrap_or("created")
@@ -2050,6 +2912,88 @@ pub fn update_task(
     Ok(new_commit)
 }
 
+/// Update a task that lives within a board tree.
+#[allow(clippy::too_many_arguments)]
+fn update_task_board(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    uuid: &str,
+    board_uuid: &str,
+    md_content: Option<&str>,
+    name: Option<&str>,
+    kind: Option<&str>,
+    status: Option<&str>,
+    description: Option<&str>,
+    deadline: Option<&str>,
+    importance: Option<f64>,
+) -> Result<String> {
+    let new_md = if let Some(md) = md_content {
+        md.to_string()
+    } else {
+        // Read current TASK.md from board tree, apply field updates.
+        let old_md = read_task_md_from_board(backend, scope, uuid, board_uuid)?;
+        let (pairs, body) = parse_frontmatter(&old_md);
+        let mut new_pairs: Vec<(String, String)> = Vec::new();
+        for (k, v) in &pairs {
+            let updated = match k.as_str() {
+                "title" => name.map(|s| s.to_string()),
+                "kind" => kind.map(|s| s.to_string()),
+                "status" => status.map(|s| s.to_string()),
+                "description" => description.map(|s| s.to_string()),
+                "deadline" => deadline.map(|s| s.to_string()),
+                "importance" => importance.map(|i| {
+                    if i == i.floor() {
+                        format!("{}", i as i64)
+                    } else {
+                        format!("{}", i)
+                    }
+                }),
+                _ => None,
+            };
+            new_pairs.push((k.clone(), updated.unwrap_or_else(|| v.clone())));
+        }
+        // Add fields that weren't in the original frontmatter.
+        if name.is_some() && !pairs.iter().any(|(k, _)| k == "title") {
+            new_pairs.push(("title".to_string(), name.unwrap().to_string()));
+        }
+        rebuild_task_md_from_pairs(&new_pairs, &body)
+    };
+
+    // Parse the new TASK.md to update DB.
+    let (pairs, _) = parse_frontmatter(&new_md);
+    let fm = FrontmatterMap(&pairs);
+    let task_status = fm.get("status").unwrap_or_else(|| "created".to_string());
+    let task_kind = fm.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
+    let task_desc = fm.get("description");
+    let task_deadline = fm.get("deadline");
+    let task_imp: f64 = fm
+        .get("importance")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0.0);
+
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE tasks SET task_status=?1, task_kind=?2, \
+         task_description=?3, task_deadline=?4, task_importance=?5 \
+         WHERE task_uuid=?6",
+        params![
+            task_status,
+            task_kind,
+            task_desc,
+            task_deadline,
+            task_imp,
+            uuid
+        ],
+    )?;
+    drop(conn);
+    commit_state_in(backend, &scope.state_dir, &format!("task update: {uuid}"))?;
+
+    let commit = update_task_in_board(backend, scope, uuid, board_uuid, &new_md)?;
+
+    eprintln!("[subcontext] Updated task ({uuid})");
+    Ok(commit)
+}
+
 // ─── Task Show ─────────────────────────────────────────────────────
 
 /// Result of looking up a task for display.
@@ -2076,7 +3020,14 @@ pub fn show_task(
     scope: &TaskScope,
     name_or_uuid: &str,
 ) -> Result<ShowTaskResult> {
-    // Try UUID first.
+    // Try reading from board tree first (for board-based tasks).
+    if let Ok(Some(board_uuid)) = find_board_for_task(scope, name_or_uuid) {
+        if let Ok(md) = read_task_md_from_board(backend, scope, name_or_uuid, &board_uuid) {
+            return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
+        }
+    }
+
+    // Try UUID on its own branch (legacy tasks or board root).
     if let Ok(Some(md)) = read_object_file(backend, scope, name_or_uuid, "TASK.md") {
         return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
     }
@@ -2104,6 +3055,13 @@ pub fn show_task(
         0 => bail!("no task found matching '{name_or_uuid}'"),
         1 => {
             let m = &matches[0];
+            // Try board tree first.
+            if let Ok(Some(board_uuid)) = find_board_for_task(scope, &m.uuid) {
+                if let Ok(md) = read_task_md_from_board(backend, scope, &m.uuid, &board_uuid) {
+                    return Ok(ShowTaskResult::Single(m.uuid.clone(), md));
+                }
+            }
+            // Fall back to own object branch (legacy).
             let md = read_object_file(backend, scope, &m.uuid, "TASK.md")?;
             let content = match md {
                 Some(c) => c,
@@ -2137,7 +3095,7 @@ pub fn resolve_task_uuid(
     scope: &TaskScope,
     name_or_uuid: &str,
 ) -> Result<String> {
-    // UUID path.
+    // UUID path: check if it has a git branch or exists in the tasks table.
     if name_or_uuid.contains('-') {
         let ref_name = format!("refs/heads/object/{name_or_uuid}");
         if run_git_in_bare(
@@ -2148,6 +3106,11 @@ pub fn resolve_task_uuid(
         )
         .is_ok()
         {
+            return Ok(name_or_uuid.to_string());
+        }
+        // Also check the tasks table (for board-based subtasks without own branch).
+        let conn = open_db(scope)?;
+        if verify_task_uuid(&conn, name_or_uuid).is_ok() {
             return Ok(name_or_uuid.to_string());
         }
     }
@@ -2481,8 +3444,7 @@ mod tests {
         assert_eq!(fm.get("importance").unwrap(), "1.5");
         assert!(body.contains("# Body"));
         assert!(body.contains("Content here"));
-        // Subtasks should be in the raw content but excluded from pairs.
-        assert!(md.contains("subtasks:"));
-        assert!(md.contains("  - sub1"));
+        // Subtasks are now represented as subdirectories, not in TASK.md.
+        assert!(!md.contains("subtasks:"));
     }
 }
