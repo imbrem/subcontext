@@ -544,7 +544,7 @@ pub fn install_user(backend: &dyn Backend) -> Result<String> {
     if existing.is_none() {
         conn.execute(
             "REPLACE INTO config (key_name, value) VALUES (?1, ?2)",
-            &[&"current_user", &user_uuid.as_str()],
+            &["current_user", user_uuid.as_str()],
         )?;
         crate::task::dolt_commit_and_track_with(
             backend,
@@ -649,7 +649,7 @@ pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
 
     conn.execute(
         "REPLACE INTO config (key_name, value) VALUES (?1, ?2)",
-        &[&"current_user", uuid],
+        &["current_user", uuid],
     )?;
     crate::task::dolt_commit_and_track_with(
         backend,

@@ -1165,7 +1165,7 @@ fn main() -> Result<()> {
                 .args(&str_args)
                 .current_dir(&dolt_repo)
                 .status()
-                .with_context(|| format!("failed to run dolt"))?;
+                .with_context(|| "failed to run dolt".to_string())?;
             if !status.success() {
                 std::process::exit(status.code().unwrap_or(1));
             }

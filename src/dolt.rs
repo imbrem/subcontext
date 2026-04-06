@@ -29,17 +29,17 @@ pub fn global_dolt_bin() -> Result<PathBuf> {
 }
 
 pub fn find_dolt_bin() -> Result<PathBuf> {
-    if let Ok(global) = global_dolt_bin() {
-        if global.is_file() {
-            return Ok(global);
-        }
+    if let Ok(global) = global_dolt_bin()
+        && global.is_file()
+    {
+        return Ok(global);
     }
-    if let Ok(output) = Command::new("which").arg("dolt").output() {
-        if output.status.success() {
-            let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
-            if !path.is_empty() {
-                return Ok(PathBuf::from(path));
-            }
+    if let Ok(output) = Command::new("which").arg("dolt").output()
+        && output.status.success()
+    {
+        let path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if !path.is_empty() {
+            return Ok(PathBuf::from(path));
         }
     }
     bail!(

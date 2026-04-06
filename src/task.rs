@@ -14,6 +14,16 @@ use crate::project::read_project_uuid;
 pub const DEFAULT_KIND: &str = "task";
 pub const DEFAULT_STATUS: &str = "created";
 
+/// Row type returned when loading all tasks for tree building.
+type TaskRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+);
+
 /// Convert `Option<&str>` to either a `'quoted'` SQL literal or the bare
 /// keyword `NULL`, for direct interpolation into SQL strings.
 fn sql_nullable(opt: Option<&str>) -> String {
@@ -580,14 +590,7 @@ pub fn build_task_tree(
     let mut conn = open_db(scope)?;
 
     // Load all tasks into memory for efficient tree building.
-    let all_tasks: Vec<(
-        String,
-        String,
-        String,
-        String,
-        Option<String>,
-        Option<String>,
-    )> = conn.query_map(
+    let all_tasks: Vec<TaskRow> = conn.query_map(
         "SELECT task_uuid, task_name, task_status, task_kind, task_description, parent_task_uuid \
          FROM tasks ORDER BY task_name",
         &[],
@@ -613,14 +616,7 @@ pub fn build_task_tree(
     let mut total_size: usize = 0;
 
     fn build_node(
-        all_tasks: &[(
-            String,
-            String,
-            String,
-            String,
-            Option<String>,
-            Option<String>,
-        )],
+        all_tasks: &[TaskRow],
         children_map: &std::collections::HashMap<Option<String>, Vec<usize>>,
         idx: usize,
         opts: &TreeOptions,
@@ -640,10 +636,10 @@ pub fn build_task_tree(
         }
 
         // Check max_size.
-        if let Some(max) = opts.max_size {
-            if *total_size >= max {
-                return None;
-            }
+        if let Some(max) = opts.max_size
+            && *total_size >= max
+        {
+            return None;
         }
         *total_size += 1;
 
@@ -656,17 +652,17 @@ pub fn build_task_tree(
             if let Some(child_indices) = children_map.get(&Some(uuid.clone())) {
                 let mut count = 0;
                 for &ci in child_indices {
-                    if let Some(max_b) = opts.max_breadth {
-                        if count >= max_b {
-                            truncated_children = child_indices.len() - count;
-                            break;
-                        }
+                    if let Some(max_b) = opts.max_breadth
+                        && count >= max_b
+                    {
+                        truncated_children = child_indices.len() - count;
+                        break;
                     }
-                    if let Some(max_s) = opts.max_size {
-                        if *total_size >= max_s {
-                            truncated_children = child_indices.len() - count;
-                            break;
-                        }
+                    if let Some(max_s) = opts.max_size
+                        && *total_size >= max_s
+                    {
+                        truncated_children = child_indices.len() - count;
+                        break;
                     }
                     if let Some(child_node) =
                         build_node(all_tasks, children_map, ci, opts, depth + 1, total_size)
@@ -681,7 +677,7 @@ pub fn build_task_tree(
             truncated_children = child_indices
                 .iter()
                 .filter(|&&ci| {
-                    let ref st = all_tasks[ci].2;
+                    let st = &all_tasks[ci].2;
                     match opts.filter {
                         TreeFilter::Active => st != "done" && st != "failed",
                         TreeFilter::All => true,
@@ -721,10 +717,10 @@ pub fn build_task_tree(
             // All root tasks (no parent).
             let root_indices: Vec<usize> = children_map.get(&None).cloned().unwrap_or_default();
             for idx in root_indices {
-                if let Some(max_s) = opts.max_size {
-                    if total_size >= max_s {
-                        break;
-                    }
+                if let Some(max_s) = opts.max_size
+                    && total_size >= max_s
+                {
+                    break;
                 }
                 if let Some(node) =
                     build_node(&all_tasks, &children_map, idx, opts, 0, &mut total_size)
@@ -1635,7 +1631,7 @@ pub fn parse_task_import(content: &str) -> Option<TaskImport> {
 /// Generate an import TASK.md that references a foreign task.
 #[allow(dead_code)]
 pub fn generate_import_task_md(context_uuid: &str, task_uuid: &str) -> String {
-    let lines = vec![
+    let lines = [
         "---".to_string(),
         format!("import_context: {}", context_uuid),
         format!("import_task: {}", task_uuid),
@@ -1653,6 +1649,7 @@ pub fn generate_import_task_md(context_uuid: &str, task_uuid: &str) -> String {
 ///
 /// The root TASK.md shares the same UUID as the board's object.json.
 /// Returns `(board_uuid, commit)`.
+#[allow(clippy::too_many_arguments)]
 pub fn create_board(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -1855,6 +1852,7 @@ pub fn create_board_from_md(
 /// board's tree at the appropriate path based on the parent hierarchy.
 ///
 /// Returns `(task_uuid, board_commit)`.
+#[allow(clippy::too_many_arguments)]
 pub fn add_task_to_board(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -2337,10 +2335,10 @@ pub fn board_pull(
         if filter_done && relative.ends_with("TASK.md") {
             let (pairs, _) = parse_frontmatter(content);
             let fm = FrontmatterMap(&pairs);
-            if let Some(status) = fm.get("status") {
-                if status == "done" || status == "failed" {
-                    continue;
-                }
+            if let Some(status) = fm.get("status")
+                && (status == "done" || status == "failed")
+            {
+                continue;
             }
         }
 
@@ -2803,8 +2801,7 @@ fn task_parent_from_path(
     // The parent directory names are parts[0..len-2], parent is parts[0..len-2].
     // We need to find the task UUID for the directory at parts[0..len-2].
     let mut current_uuid = board_uuid.to_string();
-    for i in 0..parts.len() - 2 {
-        let child_name = parts[i];
+    for child_name in parts.iter().take(parts.len() - 2) {
         current_uuid = find_child_by_name(conn, Some(&current_uuid), child_name)?;
     }
     Ok(Some(current_uuid))
@@ -3767,8 +3764,10 @@ fn update_task_board(
             new_pairs.push((k.clone(), updated.unwrap_or_else(|| v.clone())));
         }
         // Add fields that weren't in the original frontmatter.
-        if name.is_some() && !pairs.iter().any(|(k, _)| k == "title") {
-            new_pairs.push(("title".to_string(), name.unwrap().to_string()));
+        if let Some(n) = name
+            && !pairs.iter().any(|(k, _)| k == "title")
+        {
+            new_pairs.push(("title".to_string(), n.to_string()));
         }
         rebuild_task_md_from_pairs(&new_pairs, &body)
     };
@@ -3838,10 +3837,10 @@ pub fn show_task(
     name_or_uuid: &str,
 ) -> Result<ShowTaskResult> {
     // Try reading from board tree first (for board-based tasks).
-    if let Ok(Some(board_uuid)) = find_board_for_task(scope, name_or_uuid) {
-        if let Ok(md) = read_task_md_from_board(backend, scope, name_or_uuid, &board_uuid) {
-            return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
-        }
+    if let Ok(Some(board_uuid)) = find_board_for_task(scope, name_or_uuid)
+        && let Ok(md) = read_task_md_from_board(backend, scope, name_or_uuid, &board_uuid)
+    {
+        return Ok(ShowTaskResult::Single(name_or_uuid.to_string(), md));
     }
 
     // Try UUID on its own branch (legacy tasks or board root).
@@ -3871,10 +3870,10 @@ pub fn show_task(
         1 => {
             let m = &matches[0];
             // Try board tree first.
-            if let Ok(Some(board_uuid)) = find_board_for_task(scope, &m.uuid) {
-                if let Ok(md) = read_task_md_from_board(backend, scope, &m.uuid, &board_uuid) {
-                    return Ok(ShowTaskResult::Single(m.uuid.clone(), md));
-                }
+            if let Ok(Some(board_uuid)) = find_board_for_task(scope, &m.uuid)
+                && let Ok(md) = read_task_md_from_board(backend, scope, &m.uuid, &board_uuid)
+            {
+                return Ok(ShowTaskResult::Single(m.uuid.clone(), md));
             }
             // Fall back to own object branch (legacy).
             let md = read_object_file(backend, scope, &m.uuid, "TASK.md")?;
