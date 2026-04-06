@@ -226,7 +226,7 @@ enum TaskCommand {
         #[arg(long)]
         topic: Option<String>,
         /// Updated type
-        #[arg(long, name = "type")]
+        #[arg(long = "type")]
         task_type: Option<String>,
         /// Updated status
         #[arg(long)]

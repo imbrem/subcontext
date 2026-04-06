@@ -18,12 +18,16 @@ const BUNDLED_DOCS: &[(&str, &str)] = &[
         include_str!("../docs/skills/edit-task/SKILL.md"),
     ),
     (
-        "skills/set-task/SKILL.md",
-        include_str!("../docs/skills/set-task/SKILL.md"),
-    ),
-    (
         "skills/task-schema/SKILL.md",
         include_str!("../docs/skills/task-schema/SKILL.md"),
+    ),
+    (
+        "branches/state/SCHEMA.md",
+        include_str!("../docs/branches/state/SCHEMA.md"),
+    ),
+    (
+        "branches/pool/SCHEMA.md",
+        include_str!("../docs/branches/pool/SCHEMA.md"),
     ),
 ];
 

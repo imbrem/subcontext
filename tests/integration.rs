@@ -1583,9 +1583,13 @@ fn install_writes_project_config_and_state_branch() {
     assert!(branches.contains("state"));
     assert!(root.join(".git/.subcontext/state/tasks.db").exists());
 
-    // Pool worktree + index.db exist
+    // State branch has SCHEMA.md
+    assert!(root.join(".git/.subcontext/state/SCHEMA.md").exists());
+
+    // Pool worktree + index.db + SCHEMA.md exist
     assert!(root.join(".git/.subcontext/pool").exists());
     assert!(root.join(".git/.subcontext/pool/index.db").exists());
+    assert!(root.join(".git/.subcontext/pool/SCHEMA.md").exists());
 
     cleanup(&root);
 }

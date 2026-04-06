@@ -1,101 +1,59 @@
 ---
 name: add-task
-description: Create a new task in the current branch's board overlay or via CLI commands. Use when the user wants to create a new task, add a subtask, or populate a board.
+description: Create a new task in the pool via CLI. Use when the user wants to add a task, create a subtask, or populate the task pool.
 ---
 
 # Add Task
 
-## Preferred: Add via overlay (board workflow)
+## CLI
 
-If a board is pulled into the overlay (e.g. under `tasks/`), create tasks by
-writing TASK.md files directly:
-
-1. Create a directory for the new task under the appropriate parent:
-   ```
-   mkdir -p tasks/my-new-task
-   ```
-
-2. Write a TASK.md file:
-   ```markdown
-   ---
-   kind: task
-   status: created
-   description: One-line summary of the task
-   ---
-
-   # My New Task
-
-   Detailed description, acceptance criteria, etc.
-   ```
-
-   **You do NOT need to provide a `uuid`.** A UUID is automatically generated
-   when you run `board push` or `board commit`.
-
-3. For subtasks, nest directories:
-   ```
-   mkdir -p tasks/my-new-task/subtask-a
-   ```
-   And write `tasks/my-new-task/subtask-a/TASK.md`.
-
-4. Push changes to the board:
-   ```
-   git subcontext board push --path tasks/
-   ```
-
-## Alternative: Add via CLI
-
-### To a board
-```
-git subcontext board add-task <name> --board <board-uuid> [options]
+```bash
+subcontext task add "Title" [options]
 ```
 
-Options:
-- `--parent <uuid>` — parent task (defaults to board root)
-- `--kind <kind>` — task/goal/todo/tick
-- `--status <status>` — created/active/inactive
-- `--description <text>` — one-line summary
-- `--deadline <ISO8601Z>` — deadline timestamp
-- `--important [value]` — mark as important (default 1.0)
+### Options
 
-### Standalone task
-```
-git subcontext task add <name> [--file TASK.md] [--parent <path>] [options]
-```
+| Flag          | Description                                |
+|---------------|--------------------------------------------|
+| `--list X`    | Grouping label (e.g. work, personal)       |
+| `--topic Y`   | Topic tag                                  |
+| `--type Z`    | Task type: todo (default), goal, task, tick|
+| `--status S`  | Initial status: active (default)           |
+| `--important` | Mark as important                          |
+| `--deadline D`| Deadline (ISO 8601 timestamp)              |
+| `--parents 1,2`| Parent task IDs (comma-separated)         |
+| `--uuid U`    | Explicit UUID for cross-context references |
 
-- `<name>` is required — the lookup name
-- `--file` provides a TASK.md with additional fields
-- `--parent` makes this a subtask
+### Examples
 
-The command prints the task UUID to stdout.
+```bash
+# Simple task
+subcontext task add "Write documentation"
 
-## Marking tasks done
+# Task with metadata
+subcontext task add "Deploy v2" --list work --topic infra --deadline 2026-06-01T00:00:00Z
 
-### Via overlay
-Edit the TASK.md frontmatter: change `status: created` to `status: done`.
-Then push.
+# Important subtask
+subcontext task add "Fix auth bug" --important --parents 3
 
-Or delete the task directory and push with `--mark-done`:
-```
-rm -rf tasks/completed-task
-git subcontext board push --path tasks/ --mark-done
+# Task with explicit type
+subcontext task add "Weekly review" --type tick
 ```
 
-### Via CLI
-```
-git subcontext task done <name-or-path>
-git subcontext task fail <name-or-path>
-```
+The command prints the assigned task ID to stdout.
 
-## Listing tasks
+Tasks are stored in the pool at `.git/.subcontext/pool/tasks/{id}/TASK.md`.
 
-```
-git subcontext task list              # children of current task
-git subcontext task list <path>       # children of a specific task
-git subcontext task roots             # root task UUIDs
+## Completing tasks
+
+```bash
+subcontext task done <id>           # mark as done
+subcontext task fail <id>           # mark as cancelled
+subcontext task done <id> --time T  # with explicit timestamp
 ```
 
 ## Scope flags
 
-- `--user` — operate on the user subcontext
-- `--global` — operate on the system subcontext
-- `--local` — skip propagating shadow tasks to parent contexts
+- `--global` -- operate on the system-level subcontext
+- `--user` -- operate on the user subcontext
+- `--local` -- only act on the local (per-repo) subcontext

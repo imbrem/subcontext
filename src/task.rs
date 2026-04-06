@@ -81,6 +81,9 @@ pub fn init_state_branch_in(backend: &dyn Backend, bare: &Path, state: &Path) ->
         bare,
     )?;
 
+    // Write SCHEMA.md
+    backend.write(&state.join("SCHEMA.md"), STATE_SCHEMA_MD.as_bytes())?;
+
     // Create DB + schema
     let conn = Connection::open(state.join(DB_NAME))?;
     create_state_schema(&conn)?;
@@ -158,25 +161,13 @@ fn create_pool_schema(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
-const POOL_SCHEMA_MD: &str = "\
-# Pool Schema
+const POOL_SCHEMA_MD: &str = include_str!("../docs/branches/pool/SCHEMA.md");
+const STATE_SCHEMA_MD: &str = include_str!("../docs/branches/state/SCHEMA.md");
 
-## Layout
-```
-SCHEMA.md
-index.db
-tasks/{id}/TASK.md
-```
-
-## index.db
-- `meta(key, value)` — next_id counter
-- `tasks(id, uuid, list, topic, type, status, important, deadline, created, done, cancelled, parents, subtasks)`
-- `open` view — tasks not done/cancelled with a list set
-";
-
-/// Initialize a pool: create pool branch, worktree, SCHEMA.md, index.db,
-/// and register it in state.db. Returns the pool UUID.
-pub fn init_pool(
+/// Create an empty pool: branch, worktree, and state.db registration.
+/// Returns the pool UUID. The pool has no schema or files yet — call
+/// `init_task_pool` to set it up as a task pool.
+pub fn create_pool(
     backend: &dyn Backend,
     bare_repo: &Path,
     pool_path: &Path,
@@ -213,6 +204,22 @@ pub fn init_pool(
     // Add worktree
     backend.worktree_add(bare_repo, pool_path, &branch_name)?;
 
+    // Register in state.db
+    let state_conn = open_state_db(state_path)?;
+    // Use the empty-tree commit as initial current_commit
+    state_conn.execute(
+        "INSERT INTO pools (uuid, current_commit) VALUES (?1, ?2)",
+        params![pool_uuid, commit.trim()],
+    )?;
+    drop(state_conn);
+    commit_state_in(backend, state_path, &format!("pool add: {pool_uuid}"))?;
+
+    Ok(pool_uuid)
+}
+
+/// Initialize a pool worktree as a task pool: write SCHEMA.md, create
+/// `tasks/` directory, create `index.db` with the task schema, and commit.
+pub fn init_task_pool(backend: &dyn Backend, pool_path: &Path) -> Result<()> {
     // Create tasks/ directory
     let tasks_dir = pool_path.join("tasks");
     backend.create_dir_all(&tasks_dir)?;
@@ -229,17 +236,31 @@ pub fn init_pool(
 
     // Commit pool worktree
     run_work_git(backend, &["add", "-A"], pool_path)?;
-    run_work_git(backend, &["commit", "-m", "init pool"], pool_path)?;
+    run_work_git(backend, &["commit", "-m", "init task pool"], pool_path)?;
 
-    // Register in state.db
+    Ok(())
+}
+
+/// Initialize a pool: create pool branch, worktree, SCHEMA.md, index.db,
+/// and register it in state.db. Returns the pool UUID.
+pub fn init_pool(
+    backend: &dyn Backend,
+    bare_repo: &Path,
+    pool_path: &Path,
+    state_path: &Path,
+) -> Result<String> {
+    let pool_uuid = create_pool(backend, bare_repo, pool_path, state_path)?;
+    init_task_pool(backend, pool_path)?;
+
+    // Update state.db with the real commit now that we have content
     let state_conn = open_state_db(state_path)?;
     let pool_commit = run_work_git(backend, &["rev-parse", "HEAD"], pool_path)?;
     state_conn.execute(
-        "INSERT INTO pools (uuid, current_commit) VALUES (?1, ?2)",
-        params![pool_uuid, pool_commit.trim()],
+        "UPDATE pools SET current_commit = ?1 WHERE uuid = ?2",
+        params![pool_commit.trim(), pool_uuid],
     )?;
     drop(state_conn);
-    commit_state_in(backend, state_path, &format!("pool add: {pool_uuid}"))?;
+    commit_state_in(backend, state_path, &format!("pool init: {pool_uuid}"))?;
 
     eprintln!("[subcontext] Initialized pool ({pool_uuid})");
     Ok(pool_uuid)
