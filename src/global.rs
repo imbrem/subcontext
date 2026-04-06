@@ -69,6 +69,11 @@ pub fn global_state_dir() -> Result<PathBuf> {
     Ok(global_subcontext_dir()?.join("state"))
 }
 
+/// Config dir for the user subcontext (~/.subcontext/user/config).
+pub fn user_config_dir() -> Result<PathBuf> {
+    Ok(global_root()?.join("user").join("config"))
+}
+
 /// Does a global subcontext already exist on this machine?
 pub fn global_exists(backend: &dyn Backend) -> Result<bool> {
     Ok(backend.exists(&global_repo_dir()?))

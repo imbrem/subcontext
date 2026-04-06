@@ -279,31 +279,54 @@ fn verify_task_uuid(conn: &Connection, uuid: &str) -> Result<String> {
 ///
 /// Path syntax:
 /// - `.` — the current task itself
+/// - `..` — parent of the current task
 /// - `name` — look up among children of current task
 /// - `name/name2` — walk down from current task
-/// - `/uuid` — resolve a UUID directly
-/// - `/uuid/name` — start from a UUID, then walk down by name
-pub fn resolve_task_path(conn: &Connection, scope: &TaskScope, path: &str) -> Result<String> {
+/// - `/.uuid/<uuid>` — resolve a UUID directly
+/// - `/.uuid/<uuid>/name` — start from a UUID, then walk down by name
+/// - `/.project/name/...` — resolve `name` via the project subcontext's namespace
+/// - `/.user/name/...` — resolve `name` via the user subcontext's namespace
+/// - `/name/...` — resolve `name` via the user subcontext's namespace (default)
+///
+/// When `backend` is `None`, namespace-based resolution (absolute paths
+/// starting with `/`) is unavailable and will return an error.
+pub fn resolve_task_path(
+    conn: &Connection,
+    scope: &TaskScope,
+    path: &str,
+    backend: Option<&dyn Backend>,
+) -> Result<String> {
     if path == "." {
         return get_branch_task(conn, &scope.host_branch)?.ok_or_else(|| {
             anyhow::anyhow!("no current task set for branch '{}'", scope.host_branch)
         });
     }
 
+    if path == ".." {
+        let current = get_branch_task(conn, &scope.host_branch)?.ok_or_else(|| {
+            anyhow::anyhow!("no current task set for branch '{}'", scope.host_branch)
+        })?;
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_task_uuid FROM tasks WHERE task_uuid = ?1",
+                params![current],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("task '{current}' not found"))?;
+        return parent.ok_or_else(|| anyhow::anyhow!("current task has no parent"));
+    }
+
     if let Some(rest) = path.strip_prefix('/') {
-        // Absolute: first segment must be a UUID.
+        // Absolute path — use namespace resolution.
         let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
         if segments.is_empty() {
             bail!("empty task path after '/'");
         }
-        let root_uuid = verify_task_uuid(conn, segments[0])?;
-        if segments.len() == 1 {
-            return Ok(root_uuid);
-        }
-        return resolve_segments(conn, Some(&root_uuid), &segments[1..]);
+
+        return resolve_absolute_path(conn, scope, &segments, backend);
     }
 
-    // Relative: walk from current task.
+    // Relative: walk from current task, with support for ".." segments.
     let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     if segments.is_empty() {
         bail!("empty task path");
@@ -311,6 +334,87 @@ pub fn resolve_task_path(conn: &Connection, scope: &TaskScope, path: &str) -> Re
 
     let start_parent = get_branch_task(conn, &scope.host_branch)?;
     resolve_segments(conn, start_parent.as_deref(), &segments)
+}
+
+/// Resolve an absolute path (segments after stripping the leading `/`).
+///
+/// Handles `.uuid`, `.project`, `.user` interpolation and namespace lookup.
+fn resolve_absolute_path(
+    conn: &Connection,
+    scope: &TaskScope,
+    segments: &[&str],
+    backend: Option<&dyn Backend>,
+) -> Result<String> {
+    let first = segments[0];
+
+    // /.uuid/<uuid>[/...] — direct UUID reference.
+    if first == ".uuid" {
+        if segments.len() < 2 {
+            bail!("/.uuid requires a UUID argument: /.uuid/<uuid>");
+        }
+        let root_uuid = verify_task_uuid(conn, segments[1])?;
+        if segments.len() == 2 {
+            return Ok(root_uuid);
+        }
+        return resolve_segments(conn, Some(&root_uuid), &segments[2..]);
+    }
+
+    // /.project — current project subcontext UUID (as a value).
+    if first == ".project" && segments.len() == 1 {
+        return Ok(scope.project_uuid.clone());
+    }
+
+    // /.user — current user subcontext UUID (as a value).
+    if first == ".user" && segments.len() == 1 {
+        let backend =
+            backend.ok_or_else(|| anyhow::anyhow!("backend required for .user resolution"))?;
+        let user_uuid = crate::global::get_current_user(backend)?
+            .ok_or_else(|| anyhow::anyhow!("no current user set"))?;
+        return Ok(user_uuid);
+    }
+
+    let backend =
+        backend.ok_or_else(|| anyhow::anyhow!("backend required for namespace resolution"))?;
+
+    // /.project/name/... — resolve through project subcontext's namespace.
+    if first == ".project" {
+        let config_dir = crate::git::config_dir_from_repo(&scope.repo_dir);
+        let ns = crate::namespace::read_namespaces(backend, &config_dir)?;
+        let (uuid, remaining) = crate::namespace::resolve_namespace(&ns, &segments[1..])?;
+        if remaining.is_empty() {
+            return Ok(uuid);
+        }
+        // The UUID is a task UUID in this scope — resolve remaining segments.
+        let root_uuid = verify_task_uuid(conn, &uuid)?;
+        return resolve_segments(conn, Some(&root_uuid), remaining);
+    }
+
+    // /.user/name/... — resolve through user subcontext's namespace.
+    if first == ".user" {
+        let user_config_dir = crate::global::user_config_dir()?;
+        let ns = crate::namespace::read_namespaces(backend, &user_config_dir)?;
+        let (uuid, remaining) = crate::namespace::resolve_namespace(&ns, &segments[1..])?;
+        if remaining.is_empty() {
+            return Ok(uuid);
+        }
+        let root_uuid = verify_task_uuid(conn, &uuid)?;
+        return resolve_segments(conn, Some(&root_uuid), remaining);
+    }
+
+    // Reject other dot-prefixed segments.
+    if first.starts_with('.') {
+        bail!("unknown interpolation: '{first}' (expected .uuid, .project, or .user)");
+    }
+
+    // /name/... — default: resolve through user subcontext's namespace.
+    let user_config_dir = crate::global::user_config_dir()?;
+    let ns = crate::namespace::read_namespaces(backend, &user_config_dir)?;
+    let (uuid, remaining) = crate::namespace::resolve_namespace(&ns, segments)?;
+    if remaining.is_empty() {
+        return Ok(uuid);
+    }
+    let root_uuid = verify_task_uuid(conn, &uuid)?;
+    resolve_segments(conn, Some(&root_uuid), remaining)
 }
 
 /// List all root task UUIDs (tasks with no parent).
@@ -336,6 +440,25 @@ fn resolve_segments(conn: &Connection, parent: Option<&str>, segments: &[&str]) 
                 return current_parent
                     .ok_or_else(|| anyhow::anyhow!("'.' used with no current task"));
             }
+            continue;
+        }
+
+        if *seg == ".." {
+            // Walk to parent task.
+            let current = current_parent
+                .as_deref()
+                .ok_or_else(|| anyhow::anyhow!("'..' used with no current task"))?;
+            let parent_uuid: Option<String> = conn
+                .query_row(
+                    "SELECT parent_task_uuid FROM tasks WHERE task_uuid = ?1",
+                    params![current],
+                    |r| r.get(0),
+                )
+                .with_context(|| format!("task '{current}' not found"))?;
+            if is_last {
+                return parent_uuid.ok_or_else(|| anyhow::anyhow!("task has no parent"));
+            }
+            current_parent = parent_uuid;
             continue;
         }
 
@@ -689,7 +812,7 @@ pub fn done_task(
     time: Option<&str>,
 ) -> Result<()> {
     let conn = open_db(scope)?;
-    let task_uuid = resolve_task_path(&conn, scope, name)?;
+    let task_uuid = resolve_task_path(&conn, scope, name, Some(backend))?;
     drop(conn);
 
     let conn = open_db(scope)?;
@@ -759,7 +882,7 @@ pub fn fail_task(
     time: Option<&str>,
 ) -> Result<()> {
     let conn = open_db(scope)?;
-    let task_uuid = resolve_task_path(&conn, scope, name)?;
+    let task_uuid = resolve_task_path(&conn, scope, name, Some(backend))?;
     drop(conn);
 
     let conn = open_db(scope)?;
