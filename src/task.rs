@@ -454,6 +454,7 @@ pub fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Re
 /// `source_context_uuid` is used as the `task_names.branch_name` namespace
 /// (so shadow tasks from different origin projects don't collide), and the
 /// source fields are recorded in `object.json` and the `objects` table.
+#[allow(clippy::too_many_arguments)]
 pub fn add_task(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -467,10 +468,10 @@ pub fn add_task(
     parent_task_uuid: Option<&str>,
 ) -> Result<(String, String)> {
     // Validate deadline if provided.
-    if let Some(d) = deadline {
-        if !d.ends_with('Z') {
-            bail!("--deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
-        }
+    if let Some(d) = deadline
+        && !d.ends_with('Z')
+    {
+        bail!("--deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
     }
 
     // Shadow tasks live under their origin's project UUID as the branch
@@ -830,12 +831,6 @@ pub struct DeadlineEntry {
     pub description: Option<String>,
 }
 
-/// List tasks with deadlines that are not "done" or "failed".
-///
-/// - `important_only`: if true, only return tasks with importance > 0.
-/// - `horizon_secs`: if `Some(n)`, only return tasks whose deadline is at most
-///   `n` seconds in the future from now. If `n == 0`, only past deadlines.
-///   If `None`, return all matching tasks regardless of deadline time.
 /// Parse a human-readable duration string into seconds.
 ///
 /// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours),
@@ -912,12 +907,12 @@ pub fn list_deadlines(
     let mut entries = Vec::new();
     for row in rows {
         let entry = row?;
-        if let Some(horizon) = horizon_secs {
-            if let Some(deadline_secs) = parse_iso8601_to_unix(&entry.deadline) {
-                let cutoff = now_secs as f64 + horizon;
-                if (deadline_secs as f64) > cutoff {
-                    continue;
-                }
+        if let Some(horizon) = horizon_secs
+            && let Some(deadline_secs) = parse_iso8601_to_unix(&entry.deadline)
+        {
+            let cutoff = now_secs as f64 + horizon;
+            if (deadline_secs as f64) > cutoff {
+                continue;
             }
         }
         entries.push(entry);
@@ -1412,11 +1407,11 @@ pub fn parse_subtasks_from_content(content: &str) -> Option<SubtasksParsed> {
     let mut subtasks_start = None;
     for (i, line) in yaml_lines.iter().enumerate() {
         let trimmed = line.trim();
-        if let Some((key, _)) = trimmed.split_once(':') {
-            if key.trim() == "subtasks" {
-                subtasks_start = Some(i);
-                break;
-            }
+        if let Some((key, _)) = trimmed.split_once(':')
+            && key.trim() == "subtasks"
+        {
+            subtasks_start = Some(i);
+            break;
         }
     }
     let start = subtasks_start?;
@@ -1441,7 +1436,7 @@ pub fn parse_subtasks_from_content(content: &str) -> Option<SubtasksParsed> {
         let names = indented
             .iter()
             .filter_map(|l| l.strip_prefix("- "))
-            .map(|s| strip_yaml_quotes(&s.trim().to_string()))
+            .map(|s| strip_yaml_quotes(s.trim()))
             .collect();
         Some(SubtasksParsed::List(names))
     } else {
@@ -1449,10 +1444,7 @@ pub fn parse_subtasks_from_content(content: &str) -> Option<SubtasksParsed> {
         let mut entries = vec![];
         for line in &indented {
             if let Some((k, v)) = line.split_once(':') {
-                entries.push((
-                    k.trim().to_string(),
-                    strip_yaml_quotes(&v.trim().to_string()),
-                ));
+                entries.push((k.trim().to_string(), strip_yaml_quotes(v.trim())));
             }
         }
         Some(SubtasksParsed::Dict(entries))
@@ -1619,10 +1611,10 @@ pub fn add_task_from_md(
         .and_then(|s| s.parse().ok())
         .unwrap_or(0.0);
 
-    if let Some(d) = &deadline {
-        if !d.ends_with('Z') {
-            bail!("TASK.md deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
-        }
+    if let Some(d) = &deadline
+        && !d.ends_with('Z')
+    {
+        bail!("TASK.md deadline must be an ISO8601 UTC timestamp ending with 'Z' (got: {d})");
     }
 
     // Parse subtasks from TASK.md content.
@@ -1796,6 +1788,7 @@ impl<'a> FrontmatterMap<'a> {
 /// Update an existing task by UUID. If `md_content` is provided, parse it and
 /// update both object.json and TASK.md. Otherwise, update individual fields.
 /// Returns the new commit SHA.
+#[allow(clippy::too_many_arguments)]
 pub fn update_task(
     backend: &dyn Backend,
     scope: &TaskScope,
@@ -1843,10 +1836,10 @@ pub fn update_task(
         if let Some(d) = fm.get("deadline") {
             val["data"]["deadline"] = serde_json::Value::String(d);
         }
-        if let Some(imp) = fm.get("importance") {
-            if let Ok(v) = imp.parse::<f64>() {
-                val["data"]["importance"] = serde_json::json!(v);
-            }
+        if let Some(imp) = fm.get("importance")
+            && let Ok(v) = imp.parse::<f64>()
+        {
+            val["data"]["importance"] = serde_json::json!(v);
         }
         // Store TASK.md as-is.
         new_md = md.to_string();
@@ -2170,13 +2163,13 @@ fn check_field(
     mismatches: &mut Vec<String>,
 ) {
     let json_val = val["data"][field].as_str().unwrap_or("");
-    if let Some(md_val) = fm.get(field) {
-        if md_val != json_val {
-            mismatches.push(format!(
-                "  {}: object.json='{}' vs TASK.md='{}'",
-                field, json_val, md_val
-            ));
-        }
+    if let Some(md_val) = fm.get(field)
+        && md_val != json_val
+    {
+        mismatches.push(format!(
+            "  {}: object.json='{}' vs TASK.md='{}'",
+            field, json_val, md_val
+        ));
     }
 }
 

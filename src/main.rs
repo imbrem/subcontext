@@ -701,6 +701,7 @@ fn main() -> Result<()> {
 /// Recursively propagate a task from a child context up through its parent
 /// chain. Each parent gets a shadow task whose source points to the original
 /// child task.
+#[allow(clippy::too_many_arguments)]
 fn propagate_task_up(
     backend: &dyn Backend,
     child_uuid: &str,
@@ -768,17 +769,15 @@ fn propagate_task_up(
 /// Resolve a TaskScope for a given UUID. Checks if it's the user subcontext
 /// or the system subcontext.
 fn resolve_scope_for_uuid(backend: &dyn Backend, uuid: &str) -> Result<task::TaskScope> {
-    // Check if it's the system (global) subcontext.
-    if let Ok(scope) = global::global_task_scope(backend) {
-        if scope.project_uuid == uuid {
-            return Ok(scope);
-        }
+    if let Ok(scope) = global::global_task_scope(backend)
+        && scope.project_uuid == uuid
+    {
+        return Ok(scope);
     }
-    // Check if it's the user subcontext.
-    if let Ok(scope) = global::user_task_scope(backend) {
-        if scope.project_uuid == uuid {
-            return Ok(scope);
-        }
+    if let Ok(scope) = global::user_task_scope(backend)
+        && scope.project_uuid == uuid
+    {
+        return Ok(scope);
     }
     bail!(
         "cannot resolve TaskScope for UUID {uuid} — only system and user subcontexts support receiving propagated tasks"
