@@ -1,5 +1,6 @@
 pub use subcontext::backend;
 
+mod board;
 mod clone;
 mod docs;
 mod git;
@@ -307,36 +308,18 @@ enum TaskCommand {
 
 #[derive(Subcommand)]
 enum BoardCommand {
-    /// Create a new board with a root task
+    /// Create a new board
     Create {
-        /// Board name
+        /// Board name (informational)
         name: Option<String>,
-        /// Path to a TASK.md file for the root task
-        #[arg(long)]
-        file: Option<String>,
-        /// Task kind
-        #[arg(long)]
-        kind: Option<String>,
-        /// Task status
-        #[arg(long)]
-        status: Option<String>,
-        /// Short description
-        #[arg(long)]
-        description: Option<String>,
-        /// Deadline (ISO8601 UTC ending in Z)
-        #[arg(long)]
-        deadline: Option<String>,
-        /// Importance
-        #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
-        important: Option<f64>,
     },
     /// Add a subtask to a board
     AddTask {
         /// Task name
         name: String,
-        /// Board UUID (or name/path of the board root task)
+        /// Board UUID (or name/path). Omit to use the current board.
         #[arg(long)]
-        board: String,
+        board: Option<String>,
         /// Parent task within the board (name/path or UUID). Defaults to board root.
         #[arg(long)]
         parent: Option<String>,
@@ -356,10 +339,15 @@ enum BoardCommand {
         #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
         important: Option<f64>,
     },
-    /// Synchronize a board's tree into the state DB
+    /// Synchronize a board's database from its task tree
     Commit {
-        /// Board UUID
-        uuid: String,
+        /// Board UUID. Omit to use the current board.
+        uuid: Option<String>,
+    },
+    /// Check a board's database for corruption / consistency
+    Check {
+        /// Board UUID. Omit to use the current board.
+        uuid: Option<String>,
     },
     /// Delete a task from a board
     DeleteTask {
@@ -367,7 +355,7 @@ enum BoardCommand {
         task: String,
         /// Board UUID
         #[arg(long)]
-        board: String,
+        board: Option<String>,
     },
     /// Move a task to a new parent within a board
     MoveTask {
@@ -378,12 +366,12 @@ enum BoardCommand {
         parent: String,
         /// Board UUID
         #[arg(long)]
-        board: String,
+        board: Option<String>,
     },
     /// Pull a board's tasks into the overlay (materializes files in working tree)
     Pull {
-        /// Board UUID (or name/path)
-        board: String,
+        /// Board UUID (or name/path). Omit to use the current board.
+        board: Option<String>,
         /// Overlay directory prefix (default: "tasks/")
         #[arg(long, default_value = "tasks/")]
         path: String,
@@ -857,37 +845,19 @@ fn main() -> Result<()> {
                 bail!("not inside a git repo and no global subcontext installed");
             };
 
+            // Helper: resolve board UUID — use explicit arg or current board.
+            let resolve_board = |b: &Option<String>| -> Result<String> {
+                match b {
+                    Some(s) => task::resolve_task_uuid(backend, &scope, s),
+                    None => task::get_board_uuid(&scope)?
+                        .ok_or_else(|| anyhow::anyhow!("no current board — create one first")),
+                }
+            };
+
             match command {
-                BoardCommand::Create {
-                    name,
-                    file,
-                    kind,
-                    status,
-                    description,
-                    deadline,
-                    important,
-                } => {
-                    let importance = important.unwrap_or(0.0);
-                    if let Some(file_path) = file {
-                        let md = std::fs::read_to_string(&file_path)
-                            .with_context(|| format!("cannot read {file_path}"))?;
-                        task::create_board_from_md(backend, &scope, &md, None, name.as_deref())?;
-                    } else {
-                        let name = name.ok_or_else(|| {
-                            anyhow::anyhow!("board name is required (or use --file)")
-                        })?;
-                        task::create_board(
-                            backend,
-                            &scope,
-                            &name,
-                            kind.as_deref(),
-                            status.as_deref(),
-                            description.as_deref(),
-                            deadline.as_deref(),
-                            importance,
-                            None,
-                        )?;
-                    }
+                BoardCommand::Create { name } => {
+                    let name = name.as_deref().unwrap_or("board");
+                    task::create_board(backend, &scope, name)?;
                 }
                 BoardCommand::AddTask {
                     name,
@@ -900,7 +870,7 @@ fn main() -> Result<()> {
                     important,
                 } => {
                     let importance = important.unwrap_or(0.0);
-                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let board_uuid = resolve_board(&board)?;
                     let parent_uuid = match parent {
                         Some(ref p) => task::resolve_task_uuid(backend, &scope, p)?,
                         None => board_uuid.clone(),
@@ -919,10 +889,35 @@ fn main() -> Result<()> {
                     )?;
                 }
                 BoardCommand::Commit { uuid } => {
-                    task::board_commit(backend, &scope, &uuid)?;
+                    let board_uuid = match uuid {
+                        Some(ref u) => u.clone(),
+                        None => resolve_board(&None)?,
+                    };
+                    task::board_commit(backend, &scope, &board_uuid)?;
+                }
+                BoardCommand::Check { uuid } => {
+                    let board_uuid = match uuid {
+                        Some(ref u) => u.clone(),
+                        None => resolve_board(&None)?,
+                    };
+                    let b = board::Board::new(scope.scratch_base.clone(), board_uuid.clone());
+                    b.ensure_worktree(backend)?;
+                    let issues = b.check(backend)?;
+                    if issues.is_empty() {
+                        eprintln!("[subcontext] Board {board_uuid}: OK");
+                    } else {
+                        eprintln!(
+                            "[subcontext] Board {board_uuid}: {} issue(s) found:",
+                            issues.len()
+                        );
+                        for issue in &issues {
+                            eprintln!("  - {issue}");
+                        }
+                        std::process::exit(1);
+                    }
                 }
                 BoardCommand::DeleteTask { task, board } => {
-                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let board_uuid = resolve_board(&board)?;
                     let task_uuid = task::resolve_task_uuid(backend, &scope, &task)?;
                     task::delete_task_from_board(backend, &scope, &task_uuid, &board_uuid)?;
                 }
@@ -931,7 +926,7 @@ fn main() -> Result<()> {
                     parent,
                     board,
                 } => {
-                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let board_uuid = resolve_board(&board)?;
                     let task_uuid = task::resolve_task_uuid(backend, &scope, &task)?;
                     let parent_uuid = task::resolve_task_uuid(backend, &scope, &parent)?;
                     task::move_task_in_board(
@@ -952,7 +947,7 @@ fn main() -> Result<()> {
                         .as_ref()
                         .ok_or_else(|| anyhow::anyhow!("board pull requires a local git repo"))?;
                     let ctx = CheckoutContext::main_only(root);
-                    let board_uuid = task::resolve_task_uuid(backend, &scope, &board)?;
+                    let board_uuid = resolve_board(&board)?;
                     let root_task = match task_filter {
                         Some(ref t) => Some(task::resolve_task_uuid(backend, &scope, t)?),
                         None => None,
