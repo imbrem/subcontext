@@ -154,12 +154,18 @@ enum TaskCommand {
         /// Task kind (e.g. goal, todo, tick, task)
         #[arg(long)]
         kind: Option<String>,
-        /// Task status (e.g. created, active, inactive, done)
+        /// Task status (e.g. created, active, inactive, done, failed)
         #[arg(long)]
         status: Option<String>,
         /// Short task description
         #[arg(long)]
         description: Option<String>,
+        /// Deadline (ISO8601 UTC timestamp ending in Z)
+        #[arg(long)]
+        deadline: Option<String>,
+        /// Mark as important. Without a value sets importance to 1.0.
+        #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
+        important: Option<f64>,
     },
     /// Mark a task as done
     Done {
@@ -168,6 +174,24 @@ enum TaskCommand {
         /// Completion timestamp (ISO8601). Defaults to now.
         #[arg(long)]
         time: Option<String>,
+    },
+    /// Mark a task as failed
+    Fail {
+        /// Task name
+        name: String,
+        /// Failure timestamp (ISO8601). Defaults to now.
+        #[arg(long)]
+        time: Option<String>,
+    },
+    /// Show deadlines for active tasks
+    Deadlines {
+        /// Only show important tasks (importance > 0)
+        #[arg(long)]
+        important: bool,
+        /// Only show deadlines within this duration from now (e.g. 1d, 2w, 3mo, 1y).
+        /// Suffixes: s, m (minutes), h, d, w, mo (months), y. 0 = only overdue.
+        #[arg(long)]
+        horizon: Option<String>,
     },
 }
 
@@ -298,7 +322,10 @@ fn main() -> Result<()> {
                         kind,
                         status,
                         description,
+                        deadline,
+                        important,
                     } => {
+                        let importance = important.unwrap_or(0.0);
                         task::add_task(
                             backend,
                             &scope,
@@ -306,12 +333,21 @@ fn main() -> Result<()> {
                             kind.as_deref(),
                             status.as_deref(),
                             description.as_deref(),
+                            deadline.as_deref(),
+                            importance,
                             None,
                         )
                         .map(|_| ())?;
                     }
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
+                    }
+                    TaskCommand::Fail { name, time } => {
+                        task::fail_task(backend, &scope, &name, time.as_deref())?;
+                    }
+                    TaskCommand::Deadlines { important, horizon } => {
+                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
+                        print!("{}", task::format_deadlines(&entries));
                     }
                 }
             } else {
@@ -323,7 +359,10 @@ fn main() -> Result<()> {
                         kind,
                         status,
                         description,
+                        deadline,
+                        important,
                     } => {
+                        let importance = important.unwrap_or(0.0);
                         let (local_uuid, local_commit) = task::add_task(
                             backend,
                             &scope,
@@ -331,6 +370,8 @@ fn main() -> Result<()> {
                             kind.as_deref(),
                             status.as_deref(),
                             description.as_deref(),
+                            deadline.as_deref(),
+                            importance,
                             None,
                         )?;
                         // Propagate task up the parent chain unless --local.
@@ -344,6 +385,8 @@ fn main() -> Result<()> {
                                 kind.as_deref(),
                                 status.as_deref(),
                                 description.as_deref(),
+                                deadline.as_deref(),
+                                importance,
                             )?;
                             if let Some(commit) = global::record_child_checkout_path(
                                 backend,
@@ -367,6 +410,13 @@ fn main() -> Result<()> {
                     }
                     TaskCommand::Done { name, time } => {
                         task::done_task(backend, &scope, &name, time.as_deref())?;
+                    }
+                    TaskCommand::Fail { name, time } => {
+                        task::fail_task(backend, &scope, &name, time.as_deref())?;
+                    }
+                    TaskCommand::Deadlines { important, horizon } => {
+                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
+                        print!("{}", task::format_deadlines(&entries));
                     }
                 }
             }
@@ -475,6 +525,8 @@ fn propagate_task_up(
     kind: Option<&str>,
     status: Option<&str>,
     description: Option<&str>,
+    deadline: Option<&str>,
+    importance: f64,
 ) -> Result<()> {
     // Find the parent of this child via the system DB.
     let parent_uuid = match global::get_parent(backend, child_uuid)? {
@@ -490,6 +542,8 @@ fn propagate_task_up(
                 kind,
                 status,
                 description,
+                deadline,
+                importance,
                 Some((child_uuid, task_uuid, task_commit)),
             )?;
             return Ok(());
@@ -506,6 +560,8 @@ fn propagate_task_up(
         kind,
         status,
         description,
+        deadline,
+        importance,
         Some((child_uuid, task_uuid, task_commit)),
     )?;
 
@@ -519,6 +575,8 @@ fn propagate_task_up(
         kind,
         status,
         description,
+        deadline,
+        importance,
     )
 }
 
