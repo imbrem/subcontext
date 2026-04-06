@@ -1801,13 +1801,19 @@ fn task_done_accepts_now_and_rejects_local_time() {
 }
 
 #[test]
-fn task_add_duplicate_name_fails() {
+fn task_add_duplicate_name_warns() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
     subcontext_ok(&root, &["task", "add", "dup"]);
 
+    // Duplicate names are allowed but emit a warning on stdout.
     let out = subcontext(&root, &["task", "add", "dup"]);
-    assert!(!out.status.success(), "duplicate task name should fail");
+    assert!(out.status.success(), "duplicate task name should succeed");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("WARNING") && stdout.contains("not unique"),
+        "expected uniqueness warning, got: {stdout}"
+    );
 
     cleanup(&root);
 }
@@ -2333,5 +2339,330 @@ fn status_shows_global_and_ancestry() {
 
     cleanup(&fake_home);
     cleanup(&global_path);
+    cleanup(&root);
+}
+
+// ─── TASK.md integration tests ────────────────────���─────────────────
+
+#[test]
+fn task_add_creates_task_md_on_object_branch() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &[
+            "task",
+            "add",
+            "write-docs",
+            "--kind",
+            "todo",
+            "--description",
+            "Write the docs",
+        ],
+    );
+
+    // Extract UUID from object branch.
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    // TASK.md should exist on the object branch.
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
+    assert!(task_md.contains("name: write-docs"), "TASK.md: {task_md}");
+    assert!(task_md.contains("kind: todo"), "TASK.md: {task_md}");
+    assert!(task_md.contains("status: created"), "TASK.md: {task_md}");
+
+    // object.json should also exist.
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(
+        obj_json.contains("\"name\": \"write-docs\""),
+        "obj: {obj_json}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_from_file() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Write a TASK.md file.
+    let task_md = "---\nname: file-task\nkind: goal\nstatus: active\ndescription: From a file\ndeadline: 2026-12-31T00:00:00Z\nimportance: 2.0\n---\n# File Task\n\nDetailed description here.\n";
+    fs::write(root.join("TASK.md"), task_md).unwrap();
+
+    let out = subcontext(&root, &["task", "add", "--file", "TASK.md"]);
+    assert!(
+        out.status.success(),
+        "task add --file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // stdout should contain the UUID.
+    let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+    let uuid_line = stdout.lines().last().unwrap().trim();
+    assert!(
+        uuid_line.contains('-'),
+        "expected UUID on stdout, got: {stdout}"
+    );
+
+    // Check TASK.md on the object branch — should contain the original body.
+    let stored_md = git_in_repo(&root, &["show", &format!("object/{uuid_line}:TASK.md")]);
+    assert!(
+        stored_md.contains("# File Task"),
+        "stored TASK.md: {stored_md}"
+    );
+    assert!(
+        stored_md.contains("Detailed description here"),
+        "stored TASK.md: {stored_md}"
+    );
+    assert!(
+        stored_md.contains("name: file-task"),
+        "stored TASK.md: {stored_md}"
+    );
+
+    // object.json should have the parsed fields.
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid_line}:object.json")]);
+    assert!(
+        obj_json.contains("\"name\": \"file-task\""),
+        "obj: {obj_json}"
+    );
+    assert!(obj_json.contains("\"kind\": \"goal\""), "obj: {obj_json}");
+    assert!(
+        obj_json.contains("\"status\": \"active\""),
+        "obj: {obj_json}"
+    );
+    assert!(
+        obj_json.contains("\"deadline\": \"2026-12-31T00:00:00Z\""),
+        "obj: {obj_json}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_show_prints_task_md() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let task_md = "---\nname: show-me\nkind: task\n---\n# Show Me\n\nBody content.\n";
+    fs::write(root.join("TASK.md"), task_md).unwrap();
+    subcontext_ok(&root, &["task", "add", "--file", "TASK.md"]);
+
+    let stdout = subcontext_ok(&root, &["task", "show", "show-me"]);
+    assert!(
+        stdout.contains("name: show-me"),
+        "show should print TASK.md frontmatter: {stdout}"
+    );
+    assert!(
+        stdout.contains("# Show Me"),
+        "show should print TASK.md body: {stdout}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_show_ambiguous_lists_matches() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    subcontext_ok(
+        &root,
+        &["task", "add", "ambig", "--description", "First task"],
+    );
+    subcontext_ok(
+        &root,
+        &["task", "add", "ambig", "--description", "Second task"],
+    );
+
+    let stdout = subcontext_ok(&root, &["task", "show", "ambig"]);
+    assert!(
+        stdout.contains("Multiple tasks match"),
+        "expected ambiguity message: {stdout}"
+    );
+    assert!(
+        stdout.contains("First task") && stdout.contains("Second task"),
+        "should list both descriptions: {stdout}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_update_by_name() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "update-me"]);
+
+    subcontext_ok(
+        &root,
+        &[
+            "task",
+            "update",
+            "update-me",
+            "--status",
+            "active",
+            "--description",
+            "Now active",
+        ],
+    );
+
+    // Verify object.json was updated.
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(
+        obj_json.contains("\"status\": \"active\""),
+        "obj: {obj_json}"
+    );
+    assert!(
+        obj_json.contains("\"description\": \"Now active\""),
+        "obj: {obj_json}"
+    );
+
+    // TASK.md should also be updated.
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
+    assert!(task_md.contains("status: active"), "TASK.md: {task_md}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_update_from_file() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "file-update"]);
+
+    let new_md = "---\nname: file-update\nkind: goal\nstatus: active\n---\n# Updated Body\n";
+    fs::write(root.join("updated.md"), new_md).unwrap();
+
+    subcontext_ok(
+        &root,
+        &["task", "update", "file-update", "--file", "updated.md"],
+    );
+
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
+    assert!(obj_json.contains("\"kind\": \"goal\""), "obj: {obj_json}");
+    assert!(
+        obj_json.contains("\"status\": \"active\""),
+        "obj: {obj_json}"
+    );
+
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
+    assert!(task_md.contains("# Updated Body"), "TASK.md: {task_md}");
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_done_syncs_task_md() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "sync-done"]);
+
+    subcontext_ok(
+        &root,
+        &[
+            "task",
+            "done",
+            "sync-done",
+            "--time",
+            "2026-06-01T12:00:00Z",
+        ],
+    );
+
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
+    assert!(
+        task_md.contains("status: done"),
+        "TASK.md should show done: {task_md}"
+    );
+    assert!(
+        task_md.contains("completed_at: 2026-06-01T12:00:00Z"),
+        "TASK.md should show completed_at: {task_md}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn object_commit_reports_in_sync() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+    subcontext_ok(&root, &["task", "add", "commit-test"]);
+
+    let branches = git_in_repo(&root, &["branch", "--list", "object/*"]);
+    let uuid = branches
+        .lines()
+        .next()
+        .unwrap()
+        .trim()
+        .trim_start_matches("* ")
+        .trim_start_matches("object/")
+        .to_string();
+
+    // TASK.md already exists (created by add_task), so object-commit should
+    // report them in sync.
+    let out = subcontext(&root, &["object-commit", &uuid]);
+    assert!(
+        out.status.success(),
+        "object-commit failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("in sync"),
+        "expected in-sync message: {stderr}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_add_no_name_no_file_fails() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let out = subcontext(&root, &["task", "add"]);
+    assert!(
+        !out.status.success(),
+        "task add without name or --file should fail"
+    );
+
     cleanup(&root);
 }

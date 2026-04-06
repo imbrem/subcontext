@@ -115,7 +115,7 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
                         backend,
                         &user_scope,
                         &project_uuid,
-                        &object_json,
+                        &[("object.json", &object_json)],
                     )?;
                     let conn = task::open_db(&user_scope)?;
                     task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
