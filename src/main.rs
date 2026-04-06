@@ -10,6 +10,7 @@ mod mcp_config;
 mod overlay;
 mod project;
 mod settings;
+mod skills;
 mod startup;
 mod status;
 mod submodule;
@@ -44,12 +45,17 @@ enum Commands {
 
         /// Install the global (system) subcontext and MCP server into the
         /// user's Claude Code config (`~/.claude.json`).
-        #[arg(long, conflicts_with_all = ["repair", "user"])]
+        #[arg(long, conflicts_with_all = ["repair", "user", "skills"])]
         global: bool,
 
         /// Install a user subcontext under the global (system) subcontext.
-        #[arg(long, conflicts_with_all = ["repair", "global"])]
+        #[arg(long, conflicts_with_all = ["repair", "global", "skills"])]
         user: bool,
+
+        /// Install bundled Claude Code skills globally (~/.claude/skills/).
+        /// Skips skills that already exist.
+        #[arg(long, conflicts_with_all = ["repair", "global", "user"])]
+        skills: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
@@ -301,8 +307,11 @@ fn main() -> Result<()> {
             repair,
             global,
             user,
+            skills,
         } => {
-            if global {
+            if skills {
+                skills::install_skills(backend)?;
+            } else if global {
                 global::install(backend)?;
                 mcp_config::install_global(backend)?;
             } else if user {

@@ -2666,3 +2666,83 @@ fn task_add_no_name_no_file_fails() {
 
     cleanup(&root);
 }
+
+// ─── Skill installation tests ───────────────────────────────────────
+
+#[test]
+fn install_skills_creates_skill_directory() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-skills-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+
+    let bin = test_bin_dir().join("subcontext");
+    let out = Command::new(bin)
+        .args(["install", "--skills"])
+        .envs(test_env())
+        .env("HOME", &fake_home)
+        .current_dir(&fake_home)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "install --skills failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Skill should be installed.
+    let skill_path = fake_home.join(".claude/skills/add-task/SKILL.md");
+    assert!(skill_path.exists(), "skill SKILL.md should exist");
+    let content = fs::read_to_string(&skill_path).unwrap();
+    assert!(content.contains("name: add-task"), "content: {content}");
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("Installed skill 'add-task'"),
+        "stderr: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&fake_home);
+}
+
+#[test]
+fn install_skills_skips_existing() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-skills-skip-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+
+    // Pre-create the skill directory with different content.
+    let skill_dir = fake_home.join(".claude/skills/add-task");
+    fs::create_dir_all(&skill_dir).unwrap();
+    fs::write(skill_dir.join("SKILL.md"), "custom content").unwrap();
+
+    let bin = test_bin_dir().join("subcontext");
+    let out = Command::new(bin)
+        .args(["install", "--skills"])
+        .envs(test_env())
+        .env("HOME", &fake_home)
+        .current_dir(&fake_home)
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Original content should be preserved (not overwritten).
+    let content = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
+    assert_eq!(
+        content, "custom content",
+        "existing skill should not be overwritten"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("already exists") && stderr.contains("skipping"),
+        "expected skip warning: {stderr}"
+    );
+
+    let _ = fs::remove_dir_all(&fake_home);
+}

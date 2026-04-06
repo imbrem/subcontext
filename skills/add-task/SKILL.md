@@ -1,3 +1,8 @@
+---
+name: add-task
+description: Create, update, or view tasks in the subcontext task system using TASK.md files with YAML frontmatter. Use when the user wants to create a new task, update an existing task, view task details, or manage task lifecycle.
+---
+
 # Add Task Skill
 
 Create or update a task in the subcontext task system by writing a TASK.md file
