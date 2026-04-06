@@ -106,7 +106,9 @@ fn create_schema(conn: &Connection) -> Result<()> {
              task_description TEXT DEFAULT NULL,
              project_uuid    TEXT NOT NULL,
              task_deadline   TEXT DEFAULT NULL,
-             task_importance REAL NOT NULL DEFAULT 0.0
+             task_importance REAL NOT NULL DEFAULT 0.0,
+             parent_task_uuid TEXT DEFAULT NULL,
+             subtasks        TEXT NOT NULL DEFAULT '{}'
          );
          CREATE TABLE IF NOT EXISTS task_names (
              branch_name   TEXT NOT NULL,
@@ -122,12 +124,24 @@ fn create_schema(conn: &Connection) -> Result<()> {
              source_context_uuid   TEXT DEFAULT NULL,
              source_object_uuid    TEXT DEFAULT NULL,
              source_context_commit TEXT DEFAULT NULL
+         );
+         CREATE TABLE IF NOT EXISTS branch_tasks (
+             scope_branch  TEXT PRIMARY KEY,
+             task_uuid     TEXT NOT NULL
          );",
     )?;
     // Migrate existing databases that lack the new columns.
     let _ = conn.execute_batch(
         "ALTER TABLE tasks ADD COLUMN task_deadline TEXT DEFAULT NULL;
          ALTER TABLE tasks ADD COLUMN task_importance REAL NOT NULL DEFAULT 0.0;",
+    );
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN parent_task_uuid TEXT DEFAULT NULL;");
+    let _ = conn.execute_batch("ALTER TABLE tasks ADD COLUMN subtasks TEXT NOT NULL DEFAULT '{}';");
+    let _ = conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS branch_tasks (
+             scope_branch  TEXT PRIMARY KEY,
+             task_uuid     TEXT NOT NULL
+         );",
     );
     // Migrate: allow duplicate task names (old schema had PK on branch+name).
     migrate_task_names_allow_duplicates(conn);
@@ -168,6 +182,261 @@ pub fn open_db(scope: &TaskScope) -> Result<Connection> {
     Ok(Connection::open(scope.db_path())?)
 }
 
+// ─── Branch-task mapping ───────────────────────────────────────────
+
+/// Get the current task UUID for a branch.
+pub fn get_branch_task(conn: &Connection, branch: &str) -> Result<Option<String>> {
+    Ok(conn
+        .query_row(
+            "SELECT task_uuid FROM branch_tasks WHERE scope_branch = ?1",
+            params![branch],
+            |r| r.get(0),
+        )
+        .ok())
+}
+
+/// Set the current task for a branch.
+pub fn set_branch_task(backend: &dyn Backend, scope: &TaskScope, task_uuid: &str) -> Result<()> {
+    let conn = open_db(scope)?;
+    conn.execute(
+        "INSERT OR REPLACE INTO branch_tasks (scope_branch, task_uuid) VALUES (?1, ?2)",
+        params![scope.host_branch, task_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("set branch task: {}", scope.host_branch),
+    )?;
+    Ok(())
+}
+
+/// Unset the current task for a branch.
+pub fn unset_branch_task(backend: &dyn Backend, scope: &TaskScope) -> Result<()> {
+    let conn = open_db(scope)?;
+    conn.execute(
+        "DELETE FROM branch_tasks WHERE scope_branch = ?1",
+        params![scope.host_branch],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("unset branch task: {}", scope.host_branch),
+    )?;
+    Ok(())
+}
+
+// ─── Hierarchical task path resolution ─────────────────────────────
+
+/// Read the subtasks namespace dict `{name: uuid}` for a task.
+fn read_subtasks_ns(
+    conn: &Connection,
+    task_uuid: &str,
+) -> Result<serde_json::Map<String, serde_json::Value>> {
+    let json_str: String = conn
+        .query_row(
+            "SELECT subtasks FROM tasks WHERE task_uuid = ?1",
+            params![task_uuid],
+            |r| r.get(0),
+        )
+        .with_context(|| format!("task '{task_uuid}' not found"))?;
+    let val: serde_json::Value = serde_json::from_str(&json_str).unwrap_or(serde_json::json!({}));
+    Ok(val.as_object().cloned().unwrap_or_default())
+}
+
+/// Find a child task by name under a given parent (or root if parent is None).
+fn find_child_by_name(conn: &Connection, parent_uuid: Option<&str>, name: &str) -> Result<String> {
+    match parent_uuid {
+        Some(p) => {
+            let subs = read_subtasks_ns(conn, p)?;
+            subs.get(name)
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string())
+                .with_context(|| format!("task '{name}' not found under parent {p}"))
+        }
+        None => conn
+            .query_row(
+                "SELECT task_uuid FROM tasks WHERE task_name = ?1 AND parent_task_uuid IS NULL",
+                params![name],
+                |r| r.get(0),
+            )
+            .with_context(|| format!("task '{name}' not found at root level")),
+    }
+}
+
+/// Verify a task UUID exists and return it.
+fn verify_task_uuid(conn: &Connection, uuid: &str) -> Result<String> {
+    conn.query_row(
+        "SELECT task_uuid FROM tasks WHERE task_uuid = ?1",
+        params![uuid],
+        |r| r.get(0),
+    )
+    .with_context(|| format!("task UUID '{uuid}' not found"))
+}
+
+/// Resolve a hierarchical task path to a task UUID.
+///
+/// Path syntax:
+/// - `.` — the current task itself
+/// - `name` — look up among children of current task
+/// - `name/name2` — walk down from current task
+/// - `/uuid` — resolve a UUID directly
+/// - `/uuid/name` — start from a UUID, then walk down by name
+pub fn resolve_task_path(conn: &Connection, scope: &TaskScope, path: &str) -> Result<String> {
+    if path == "." {
+        return get_branch_task(conn, &scope.host_branch)?.ok_or_else(|| {
+            anyhow::anyhow!("no current task set for branch '{}'", scope.host_branch)
+        });
+    }
+
+    if let Some(rest) = path.strip_prefix('/') {
+        // Absolute: first segment must be a UUID.
+        let segments: Vec<&str> = rest.split('/').filter(|s| !s.is_empty()).collect();
+        if segments.is_empty() {
+            bail!("empty task path after '/'");
+        }
+        let root_uuid = verify_task_uuid(conn, segments[0])?;
+        if segments.len() == 1 {
+            return Ok(root_uuid);
+        }
+        return resolve_segments(conn, Some(&root_uuid), &segments[1..]);
+    }
+
+    // Relative: walk from current task.
+    let segments: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
+    if segments.is_empty() {
+        bail!("empty task path");
+    }
+
+    let start_parent = get_branch_task(conn, &scope.host_branch)?;
+    resolve_segments(conn, start_parent.as_deref(), &segments)
+}
+
+/// List all root task UUIDs (tasks with no parent).
+pub fn list_root_uuids(scope: &TaskScope) -> Result<Vec<String>> {
+    let conn = open_db(scope)?;
+    let mut stmt = conn
+        .prepare("SELECT task_uuid FROM tasks WHERE parent_task_uuid IS NULL ORDER BY task_name")?;
+    let uuids: Vec<String> = stmt
+        .query_map([], |r| r.get(0))?
+        .filter_map(|r| r.ok())
+        .collect();
+    Ok(uuids)
+}
+
+fn resolve_segments(conn: &Connection, parent: Option<&str>, segments: &[&str]) -> Result<String> {
+    let mut current_parent = parent.map(|s| s.to_string());
+
+    for (i, seg) in segments.iter().enumerate() {
+        let is_last = i == segments.len() - 1;
+
+        if *seg == "." {
+            if is_last {
+                return current_parent
+                    .ok_or_else(|| anyhow::anyhow!("'.' used with no current task"));
+            }
+            continue;
+        }
+
+        let uuid = find_child_by_name(conn, current_parent.as_deref(), seg)?;
+        if is_last {
+            return Ok(uuid);
+        }
+        current_parent = Some(uuid);
+    }
+    unreachable!()
+}
+
+// ─── Subtask listing ───────────────────────────────────────────────
+
+/// Info about a task, used for listing.
+pub struct TaskInfo {
+    pub uuid: String,
+    pub name: String,
+    pub status: String,
+    pub kind: String,
+    pub description: Option<String>,
+}
+
+/// List subtasks of a given parent task (or root tasks if parent is None).
+pub fn list_subtasks(scope: &TaskScope, parent_uuid: Option<&str>) -> Result<Vec<TaskInfo>> {
+    let conn = open_db(scope)?;
+    let mut tasks = Vec::new();
+
+    match parent_uuid {
+        Some(p) => {
+            let subs = read_subtasks_ns(&conn, p)?;
+            let mut entries: Vec<(String, String)> = subs
+                .iter()
+                .filter_map(|(name, val)| val.as_str().map(|uuid| (name.clone(), uuid.to_string())))
+                .collect();
+            entries.sort_by(|a, b| a.0.cmp(&b.0));
+            for (sub_name, sub_uuid) in &entries {
+                if let Ok(info) = conn.query_row(
+                    "SELECT task_status, task_kind, task_description \
+                     FROM tasks WHERE task_uuid = ?1",
+                    params![sub_uuid],
+                    |r| {
+                        Ok(TaskInfo {
+                            uuid: sub_uuid.clone(),
+                            name: sub_name.clone(),
+                            status: r.get(0)?,
+                            kind: r.get(1)?,
+                            description: r.get(2)?,
+                        })
+                    },
+                ) {
+                    tasks.push(info);
+                }
+            }
+        }
+        None => {
+            let mut stmt = conn.prepare(
+                "SELECT task_uuid, task_name, task_status, task_kind, task_description \
+                 FROM tasks WHERE parent_task_uuid IS NULL ORDER BY task_name",
+            )?;
+            let rows = stmt.query_map([], |r| {
+                Ok(TaskInfo {
+                    uuid: r.get(0)?,
+                    name: r.get(1)?,
+                    status: r.get(2)?,
+                    kind: r.get(3)?,
+                    description: r.get(4)?,
+                })
+            })?;
+            for row in rows {
+                tasks.push(row?);
+            }
+        }
+    }
+    Ok(tasks)
+}
+
+/// Format subtask list as human-readable text.
+pub fn format_subtasks(tasks: &[TaskInfo], parent_name: Option<&str>) -> String {
+    if tasks.is_empty() {
+        return match parent_name {
+            Some(name) => format!("No subtasks under '{name}'."),
+            None => "No tasks at root level.".to_string(),
+        };
+    }
+    let mut out = String::new();
+    for t in tasks {
+        out.push_str(&format!(
+            "- {name} [{status}] ({kind}) {uuid}\n",
+            name = t.name,
+            status = t.status,
+            kind = t.kind,
+            uuid = t.uuid,
+        ));
+        if let Some(desc) = &t.description {
+            out.push_str(&format!("  {desc}\n"));
+        }
+    }
+    out
+}
+
 pub fn commit_state_in(backend: &dyn Backend, state: &Path, message: &str) -> Result<()> {
     run_work_git(backend, &["add", "-A"], state)?;
     let status = run_work_git(backend, &["status", "--porcelain"], state)?;
@@ -195,6 +464,7 @@ pub fn add_task(
     deadline: Option<&str>,
     importance: f64,
     source: Option<(&str, &str, &str)>,
+    parent_task_uuid: Option<&str>,
 ) -> Result<(String, String)> {
     // Validate deadline if provided.
     if let Some(d) = deadline {
@@ -232,10 +502,24 @@ pub fn add_task(
             existing.join(", ")
         );
     }
+    // Validate parent exists if specified.
+    if let Some(parent) = parent_task_uuid {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE task_uuid = ?1",
+                params![parent],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            bail!("parent task '{parent}' not found");
+        }
+    }
+
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        params![task_uuid, name, status, kind, description, scope.project_uuid, deadline, importance, parent_task_uuid],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -251,7 +535,7 @@ pub fn add_task(
     commit_state_in(backend, &scope.state_dir, &commit_msg)?;
 
     let task_data = TaskData {
-        name: name.to_string(),
+        title: None,
         uuid: task_uuid.clone(),
         status: status.to_string(),
         kind: kind.to_string(),
@@ -260,6 +544,9 @@ pub fn add_task(
         description: description.map(|s| s.to_string()),
         deadline: deadline.map(|s| s.to_string()),
         importance,
+        parent_task_uuid: parent_task_uuid.map(|s| s.to_string()),
+        subtasks: vec![],
+        subtasks_ns: serde_json::Map::new(),
     };
     let object_json = build_task_object_json(&task_data, source);
     let task_md = generate_task_md(&task_data, "");
@@ -280,6 +567,11 @@ pub fn add_task(
         &format!("object add: {task_uuid}"),
     )?;
 
+    // If this task has a parent, add it to the parent's subtasks namespace.
+    if let Some(parent) = parent_task_uuid {
+        update_parent_subtasks(backend, scope, parent, name, &task_uuid)?;
+    }
+
     if source.is_some() {
         eprintln!("[subcontext] Added shadow task '{name}' ({task_uuid})");
     } else {
@@ -288,26 +580,118 @@ pub fn add_task(
     Ok((task_uuid, commit))
 }
 
-/// Mark an existing task as done.
+/// Add an entry to a parent task's subtasks namespace (both DB and object branch).
+fn update_parent_subtasks(
+    backend: &dyn Backend,
+    scope: &TaskScope,
+    parent_uuid: &str,
+    child_name: &str,
+    child_uuid: &str,
+) -> Result<()> {
+    // 1. Update the DB column.
+    let conn = open_db(scope)?;
+    let mut subs = read_subtasks_ns(&conn, parent_uuid)?;
+    subs.insert(
+        child_name.to_string(),
+        serde_json::Value::String(child_uuid.to_string()),
+    );
+    let subs_json = serde_json::to_string(&serde_json::Value::Object(subs.clone()))?;
+    conn.execute(
+        "UPDATE tasks SET subtasks = ?1 WHERE task_uuid = ?2",
+        params![subs_json, parent_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("subtask add: {child_name} under {parent_uuid}"),
+    )?;
+
+    // 2. Update the parent's object.json branch.
+    let obj_branch = format!("object/{parent_uuid}");
+    let existing = run_git_in_bare(
+        backend,
+        &["show", &format!("{obj_branch}:object.json")],
+        &scope.repo_dir,
+        &scope.repo_dir,
+    )?;
+    let mut val: serde_json::Value = serde_json::from_str(&existing)
+        .with_context(|| format!("invalid object.json on {obj_branch}"))?;
+    if let Some(data) = val.get_mut("data") {
+        // Ensure namespaces object exists.
+        if data.get("namespaces").is_none() || !data["namespaces"].is_object() {
+            data["namespaces"] = serde_json::json!({});
+        }
+        if let Some(ns) = data.get_mut("namespaces").and_then(|v| v.as_object_mut()) {
+            if !ns.contains_key("subtasks") {
+                ns.insert("subtasks".to_string(), serde_json::json!({}));
+            }
+            if let Some(ns_subs) = ns.get_mut("subtasks").and_then(|v| v.as_object_mut()) {
+                ns_subs.insert(
+                    child_name.to_string(),
+                    serde_json::Value::String(child_uuid.to_string()),
+                );
+            }
+        }
+        // Update subtasks list (names only).
+        let list = data
+            .get("subtasks")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let mut names: Vec<String> = list
+            .iter()
+            .filter_map(|v| v.as_str().map(|s| s.to_string()))
+            .collect();
+        if !names.contains(&child_name.to_string()) {
+            names.push(child_name.to_string());
+        }
+        data["subtasks"] =
+            serde_json::Value::Array(names.into_iter().map(serde_json::Value::String).collect());
+    }
+    let new_json = serde_json::to_string_pretty(&val)? + "\n";
+
+    // Also regenerate TASK.md for the parent.
+    let old_body = read_object_file(backend, scope, parent_uuid, "TASK.md")
+        .ok()
+        .flatten()
+        .map(|md| parse_frontmatter(&md).1)
+        .unwrap_or_default();
+    let new_md = generate_task_md_from_json(&val, &old_body);
+
+    let new_commit = update_object_branch(
+        backend,
+        scope,
+        parent_uuid,
+        &[("object.json", &new_json), ("TASK.md", &new_md)],
+    )?;
+
+    let conn = open_db(scope)?;
+    conn.execute(
+        "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+        params![new_commit, parent_uuid],
+    )?;
+    drop(conn);
+    commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("object update: {parent_uuid}"),
+    )?;
+    Ok(())
+}
+
+/// Mark an existing task as done. `name` supports hierarchical path syntax.
 pub fn done_task(
     backend: &dyn Backend,
     scope: &TaskScope,
     name: &str,
     time: Option<&str>,
 ) -> Result<()> {
-    let branch = &scope.host_branch;
+    let conn = open_db(scope)?;
+    let task_uuid = resolve_task_path(&conn, scope, name)?;
+    drop(conn);
 
     let conn = open_db(scope)?;
-    let row: (String, String) = conn
-        .query_row(
-            "SELECT t.task_uuid, t.task_name \
-             FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid
-             WHERE n.branch_name = ?1 AND n.task_name = ?2",
-            params![branch, name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .with_context(|| format!("task '{name}' not found on branch '{branch}'"))?;
-    let (task_uuid, _task_name) = row;
 
     conn.execute(
         "UPDATE tasks SET task_status = 'done' WHERE task_uuid = ?1",
@@ -366,26 +750,18 @@ pub fn done_task(
     Ok(())
 }
 
-/// Mark an existing task as failed.
+/// Mark an existing task as failed. `name` supports hierarchical path syntax.
 pub fn fail_task(
     backend: &dyn Backend,
     scope: &TaskScope,
     name: &str,
     time: Option<&str>,
 ) -> Result<()> {
-    let branch = &scope.host_branch;
+    let conn = open_db(scope)?;
+    let task_uuid = resolve_task_path(&conn, scope, name)?;
+    drop(conn);
 
     let conn = open_db(scope)?;
-    let row: (String, String) = conn
-        .query_row(
-            "SELECT t.task_uuid, t.task_name \
-             FROM task_names n JOIN tasks t ON n.task_uuid = t.task_uuid
-             WHERE n.branch_name = ?1 AND n.task_name = ?2",
-            params![branch, name],
-            |r| Ok((r.get(0)?, r.get(1)?)),
-        )
-        .with_context(|| format!("task '{name}' not found on branch '{branch}'"))?;
-    let (task_uuid, _task_name) = row;
 
     conn.execute(
         "UPDATE tasks SET task_status = 'failed' WHERE task_uuid = ?1",
@@ -622,7 +998,7 @@ fn days_from_civil(year: i64, month: u32, day: u32) -> i64 {
 }
 
 pub struct TaskData {
-    name: String,
+    title: Option<String>,
     uuid: String,
     status: String,
     kind: String,
@@ -631,32 +1007,50 @@ pub struct TaskData {
     description: Option<String>,
     deadline: Option<String>,
     importance: f64,
+    parent_task_uuid: Option<String>,
+    subtasks: Vec<String>,
+    subtasks_ns: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Build a complete `object.json` for a task, with all data inlined under
-/// the `"data"` key.
+/// the `"data"` key. Names are stored in the parent's namespace, not here.
 fn build_task_object_json(t: &TaskData, source: Option<(&str, &str, &str)>) -> String {
     let mut data = serde_json::json!({
-        "name": t.name,
         "uuid": t.uuid,
         "status": t.status,
         "kind": t.kind,
         "project_uuid": t.project_uuid,
         "importance": t.importance,
     });
+    if let Some(title) = &t.title {
+        data["title"] = serde_json::Value::String(title.clone());
+    }
     if let Some(ts) = &t.completed_at {
         data["completed_at"] = serde_json::Value::String(ts.clone());
     }
-    // Always include description (null when absent).
     data["description"] = match &t.description {
         Some(d) => serde_json::Value::String(d.clone()),
         None => serde_json::Value::Null,
     };
-    // Always include deadline (null when absent).
     data["deadline"] = match &t.deadline {
         Some(d) => serde_json::Value::String(d.clone()),
         None => serde_json::Value::Null,
     };
+    data["parent_task_uuid"] = match &t.parent_task_uuid {
+        Some(p) => serde_json::Value::String(p.clone()),
+        None => serde_json::Value::Null,
+    };
+    // subtasks: list of names
+    data["subtasks"] = serde_json::Value::Array(
+        t.subtasks
+            .iter()
+            .map(|s| serde_json::Value::String(s.clone()))
+            .collect(),
+    );
+    // namespaces.subtasks: { name: uuid }
+    data["namespaces"] = serde_json::json!({
+        "subtasks": serde_json::Value::Object(t.subtasks_ns.clone()),
+    });
 
     let mut obj = serde_json::json!({
         "type": "task",
@@ -924,9 +1318,19 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 
 // ─── TASK.md Parsing & Generation ──────────────────────────────────
 
+/// Parsed subtasks from TASK.md frontmatter.
+pub enum SubtasksParsed {
+    /// A list of subtask names: `subtasks:\n  - name1\n  - name2`
+    List(Vec<String>),
+    /// A dict of name→uuid: `subtasks:\n  name1: uuid1\n  name2: uuid2`
+    Dict(Vec<(String, String)>),
+}
+
 /// Parse YAML frontmatter from a markdown string.
 /// Returns `(key-value pairs, body after frontmatter)`.
 /// If no valid frontmatter is found, returns empty pairs and full content.
+/// Note: the `subtasks` key is excluded from pairs; use `parse_subtasks_from_content`
+/// to extract it.
 pub fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, String) {
     let lines: Vec<&str> = content.lines().collect();
     if lines.is_empty() || lines[0].trim() != "---" {
@@ -948,23 +1352,35 @@ pub fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, String) {
 
     let yaml_lines = &lines[1..end_line];
     let mut pairs = vec![];
-    for line in yaml_lines {
-        let line = line.trim();
+    let mut i = 0;
+    while i < yaml_lines.len() {
+        let line = yaml_lines[i].trim();
         if line.is_empty() || line.starts_with('#') {
+            i += 1;
             continue;
         }
         if let Some((key, value)) = line.split_once(':') {
             let key = key.trim().to_string();
             let value = value.trim().to_string();
+            if key == "subtasks" {
+                // Skip subtasks and its indented block — handled separately.
+                i += 1;
+                while i < yaml_lines.len()
+                    && (yaml_lines[i].starts_with("  ") || yaml_lines[i].starts_with('\t'))
+                {
+                    i += 1;
+                }
+                continue;
+            }
             let value = strip_yaml_quotes(&value);
             pairs.push((key, value));
         }
+        i += 1;
     }
 
     // Body is everything after the closing ---.
     let body_lines = &lines[end_line + 1..];
     let body = body_lines.join("\n");
-    // Preserve trailing newline if original content had one.
     let body = if content.ends_with('\n') && !body.is_empty() && !body.ends_with('\n') {
         body + "\n"
     } else {
@@ -972,6 +1388,75 @@ pub fn parse_frontmatter(content: &str) -> (Vec<(String, String)>, String) {
     };
 
     (pairs, body)
+}
+
+/// Parse the `subtasks:` block from TASK.md content.
+/// Returns None if no subtasks key is present.
+pub fn parse_subtasks_from_content(content: &str) -> Option<SubtasksParsed> {
+    let lines: Vec<&str> = content.lines().collect();
+    if lines.is_empty() || lines[0].trim() != "---" {
+        return None;
+    }
+
+    let mut end_line = None;
+    for (i, line) in lines.iter().enumerate().skip(1) {
+        if line.trim() == "---" {
+            end_line = Some(i);
+            break;
+        }
+    }
+    let end_line = end_line?;
+    let yaml_lines = &lines[1..end_line];
+
+    // Find the subtasks: line.
+    let mut subtasks_start = None;
+    for (i, line) in yaml_lines.iter().enumerate() {
+        let trimmed = line.trim();
+        if let Some((key, _)) = trimmed.split_once(':') {
+            if key.trim() == "subtasks" {
+                subtasks_start = Some(i);
+                break;
+            }
+        }
+    }
+    let start = subtasks_start?;
+
+    // Collect indented lines after subtasks:
+    let mut indented = vec![];
+    for line in yaml_lines.iter().skip(start + 1) {
+        if line.starts_with("  ") || line.starts_with('\t') {
+            indented.push(line.trim());
+        } else {
+            break;
+        }
+    }
+
+    if indented.is_empty() {
+        return Some(SubtasksParsed::List(vec![]));
+    }
+
+    // Detect list vs dict.
+    if indented[0].starts_with("- ") {
+        // List of names.
+        let names = indented
+            .iter()
+            .filter_map(|l| l.strip_prefix("- "))
+            .map(|s| strip_yaml_quotes(&s.trim().to_string()))
+            .collect();
+        Some(SubtasksParsed::List(names))
+    } else {
+        // Dict: name: uuid
+        let mut entries = vec![];
+        for line in &indented {
+            if let Some((k, v)) = line.split_once(':') {
+                entries.push((
+                    k.trim().to_string(),
+                    strip_yaml_quotes(&v.trim().to_string()),
+                ));
+            }
+        }
+        Some(SubtasksParsed::Dict(entries))
+    }
 }
 
 fn strip_yaml_quotes(s: &str) -> String {
@@ -986,7 +1471,9 @@ fn strip_yaml_quotes(s: &str) -> String {
 /// Generate a TASK.md string from task data and an optional body.
 pub fn generate_task_md(data: &TaskData, body: &str) -> String {
     let mut lines = vec!["---".to_string()];
-    lines.push(format!("name: {}", data.name));
+    if let Some(title) = &data.title {
+        lines.push(format!("title: {}", title));
+    }
     lines.push(format!("kind: {}", data.kind));
     lines.push(format!("status: {}", data.status));
     if let Some(desc) = &data.description {
@@ -1005,6 +1492,12 @@ pub fn generate_task_md(data: &TaskData, body: &str) -> String {
     if let Some(ts) = &data.completed_at {
         lines.push(format!("completed_at: {}", ts));
     }
+    if !data.subtasks.is_empty() {
+        lines.push("subtasks:".to_string());
+        for name in &data.subtasks {
+            lines.push(format!("  - {}", name));
+        }
+    }
     lines.push("---".to_string());
 
     let mut result = lines.join("\n");
@@ -1022,8 +1515,8 @@ pub fn generate_task_md(data: &TaskData, body: &str) -> String {
 fn generate_task_md_from_json(val: &serde_json::Value, body: &str) -> String {
     let data = &val["data"];
     let mut lines = vec!["---".to_string()];
-    if let Some(name) = data["name"].as_str() {
-        lines.push(format!("name: {}", name));
+    if let Some(title) = data["title"].as_str() {
+        lines.push(format!("title: {}", title));
     }
     if let Some(kind) = data["kind"].as_str() {
         lines.push(format!("kind: {}", kind));
@@ -1047,6 +1540,16 @@ fn generate_task_md_from_json(val: &serde_json::Value, body: &str) -> String {
     }
     if let Some(completed_at) = data["completed_at"].as_str() {
         lines.push(format!("completed_at: {}", completed_at));
+    }
+    // Emit subtasks list if present.
+    if let Some(arr) = data["subtasks"].as_array() {
+        let names: Vec<&str> = arr.iter().filter_map(|v| v.as_str()).collect();
+        if !names.is_empty() {
+            lines.push("subtasks:".to_string());
+            for name in names {
+                lines.push(format!("  - {}", name));
+            }
+        }
     }
     lines.push("---".to_string());
 
@@ -1084,18 +1587,29 @@ pub fn read_object_file(
 
 /// Create a task from TASK.md content. The full markdown is stored in the
 /// object branch alongside the generated object.json. Returns `(uuid, commit)`.
+///
+/// The TASK.md must provide a `name` either via the caller (`name_override`)
+/// or in the frontmatter (as `name:` for backward compat). `title:` is stored
+/// in object.json but is NOT the task's lookup name.
+///
+/// If TASK.md contains `subtasks:` as a list of names, they are validated
+/// against the parent's `namespaces.subtasks`. If given as a dict `{name: uuid}`,
+/// it is converted to a list and `namespaces.subtasks` is updated.
 pub fn add_task_from_md(
     backend: &dyn Backend,
     scope: &TaskScope,
     md_content: &str,
     source: Option<(&str, &str, &str)>,
+    name_override: Option<&str>,
+    parent_task_uuid: Option<&str>,
 ) -> Result<(String, String)> {
     let (pairs, body) = parse_frontmatter(md_content);
     let fm = FrontmatterMap(&pairs);
 
-    let name = fm
-        .get("name")
-        .ok_or_else(|| anyhow::anyhow!("TASK.md frontmatter must contain 'name'"))?;
+    let name = name_override
+        .map(|s| s.to_string())
+        .ok_or_else(|| anyhow::anyhow!("task name is required as a positional argument"))?;
+    let title = fm.get("title");
     let kind = fm.get("kind");
     let status = fm.get("status");
     let description = fm.get("description");
@@ -1111,6 +1625,28 @@ pub fn add_task_from_md(
         }
     }
 
+    // Parse subtasks from TASK.md content.
+    let parsed_subtasks = parse_subtasks_from_content(md_content);
+    let mut subtask_names: Vec<String> = vec![];
+    let mut subtask_ns: serde_json::Map<String, serde_json::Value> = serde_json::Map::new();
+
+    match parsed_subtasks {
+        Some(SubtasksParsed::List(names)) => {
+            // Validate all names exist in the parent's namespace (if parent exists).
+            // For a newly created task, these would be subtasks to be added later;
+            // we store them in the task's own namespace.
+            subtask_names = names;
+        }
+        Some(SubtasksParsed::Dict(entries)) => {
+            // Convert dict to list + update namespace.
+            for (n, u) in &entries {
+                subtask_names.push(n.clone());
+                subtask_ns.insert(n.clone(), serde_json::Value::String(u.clone()));
+            }
+        }
+        None => {}
+    }
+
     let branch: String = match source {
         Some((ctx, _, _)) => ctx.to_string(),
         None => scope.host_branch.clone(),
@@ -1118,6 +1654,21 @@ pub fn add_task_from_md(
     let task_uuid = Uuid::new_v4().to_string();
     let kind_str = kind.as_deref().unwrap_or(DEFAULT_KIND);
     let status_str = status.as_deref().unwrap_or(DEFAULT_STATUS);
+
+    // Validate parent.
+    if let Some(parent) = parent_task_uuid {
+        let conn = open_db(scope)?;
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM tasks WHERE task_uuid = ?1",
+                params![parent],
+                |_| Ok(true),
+            )
+            .unwrap_or(false);
+        if !exists {
+            bail!("parent task '{parent}' not found");
+        }
+    }
 
     let conn = open_db(scope)?;
     let existing: Vec<String> = {
@@ -1137,10 +1688,14 @@ pub fn add_task_from_md(
             existing.join(", ")
         );
     }
+
+    // Store subtasks namespace as JSON in DB.
+    let subs_json = serde_json::to_string(&serde_json::Value::Object(subtask_ns.clone()))?;
+
     conn.execute(
-        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![task_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance],
+        "INSERT INTO tasks (task_uuid, task_name, task_status, task_kind, task_description, project_uuid, task_deadline, task_importance, parent_task_uuid, subtasks) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+        params![task_uuid, name, status_str, kind_str, description, scope.project_uuid, deadline, importance, parent_task_uuid, subs_json],
     )?;
     conn.execute(
         "INSERT INTO task_names (branch_name, task_name, task_uuid) VALUES (?1, ?2, ?3)",
@@ -1156,7 +1711,7 @@ pub fn add_task_from_md(
     commit_state_in(backend, &scope.state_dir, &commit_msg)?;
 
     let task_data = TaskData {
-        name: name.to_string(),
+        title,
         uuid: task_uuid.clone(),
         status: status_str.to_string(),
         kind: kind_str.to_string(),
@@ -1165,14 +1720,23 @@ pub fn add_task_from_md(
         description: description.map(|s| s.to_string()),
         deadline: deadline.map(|s| s.to_string()),
         importance,
+        parent_task_uuid: parent_task_uuid.map(|s| s.to_string()),
+        subtasks: subtask_names,
+        subtasks_ns: subtask_ns,
     };
     let object_json = build_task_object_json(&task_data, source);
-    // Store the original TASK.md as-is; regenerate with the UUID embedded in frontmatter.
+    // Regenerate TASK.md with uuid embedded and subtasks as list.
     let task_md = {
         let mut regenerated_lines = vec!["---".to_string()];
         regenerated_lines.push(format!("uuid: {}", task_uuid));
         for (k, v) in &pairs {
             regenerated_lines.push(format!("{}: {}", k, v));
+        }
+        if !task_data.subtasks.is_empty() {
+            regenerated_lines.push("subtasks:".to_string());
+            for n in &task_data.subtasks {
+                regenerated_lines.push(format!("  - {}", n));
+            }
         }
         regenerated_lines.push("---".to_string());
         let mut out = regenerated_lines.join("\n");
@@ -1200,6 +1764,11 @@ pub fn add_task_from_md(
         &scope.state_dir,
         &format!("object add: {task_uuid}"),
     )?;
+
+    // If this task has a parent, register in parent's namespace.
+    if let Some(parent) = parent_task_uuid {
+        update_parent_subtasks(backend, scope, parent, &name, &task_uuid)?;
+    }
 
     if source.is_some() {
         eprintln!("[subcontext] Added shadow task '{name}' ({task_uuid})");
@@ -1257,8 +1826,8 @@ pub fn update_task(
         let (pairs, _body) = parse_frontmatter(md);
         let fm = FrontmatterMap(&pairs);
 
-        if let Some(n) = fm.get("name") {
-            val["data"]["name"] = serde_json::Value::String(n);
+        if let Some(t) = fm.get("title") {
+            val["data"]["title"] = serde_json::Value::String(t);
         }
         if let Some(k) = fm.get("kind") {
             val["data"]["kind"] = serde_json::Value::String(k);
@@ -1282,9 +1851,9 @@ pub fn update_task(
         // Store TASK.md as-is.
         new_md = md.to_string();
     } else {
-        // Update from individual fields.
+        // Update from individual fields. `name` here is actually `title`.
         if let Some(n) = name {
-            val["data"]["name"] = serde_json::Value::String(n.to_string());
+            val["data"]["title"] = serde_json::Value::String(n.to_string());
         }
         if let Some(k) = kind {
             val["data"]["kind"] = serde_json::Value::String(k.to_string());
@@ -1312,8 +1881,8 @@ pub fn update_task(
 
     let updated_json = serde_json::to_string_pretty(&val)? + "\n";
 
-    // Update DB.
-    let task_name = val["data"]["name"].as_str().unwrap_or("").to_string();
+    // Update DB. task_name in DB is the lookup name (not in object.json).
+    // Only update status/kind/desc/deadline/importance from object.json.
     let task_status = val["data"]["status"]
         .as_str()
         .unwrap_or("created")
@@ -1328,11 +1897,10 @@ pub fn update_task(
 
     let conn = open_db(scope)?;
     conn.execute(
-        "UPDATE tasks SET task_name=?1, task_status=?2, task_kind=?3, \
-         task_description=?4, task_deadline=?5, task_importance=?6 \
-         WHERE task_uuid=?7",
+        "UPDATE tasks SET task_status=?1, task_kind=?2, \
+         task_description=?3, task_deadline=?4, task_importance=?5 \
+         WHERE task_uuid=?6",
         params![
-            task_name,
             task_status,
             task_kind,
             task_desc,
@@ -1340,11 +1908,6 @@ pub fn update_task(
             task_imp,
             uuid
         ],
-    )?;
-    // Update task_names entry.
-    conn.execute(
-        "UPDATE task_names SET task_name=?1 WHERE task_uuid=?2",
-        params![task_name, uuid],
     )?;
     drop(conn);
     commit_state_in(backend, &scope.state_dir, &format!("task update: {uuid}"))?;
@@ -1364,7 +1927,7 @@ pub fn update_task(
     drop(conn);
     commit_state_in(backend, &scope.state_dir, &format!("object update: {uuid}"))?;
 
-    eprintln!("[subcontext] Updated task '{task_name}' ({uuid})");
+    eprintln!("[subcontext] Updated task ({uuid})");
     Ok(new_commit)
 }
 
@@ -1545,13 +2108,12 @@ pub fn object_commit(
             // Generate object.json from TASK.md.
             let (pairs, _body) = parse_frontmatter(&md_str);
             let fm = FrontmatterMap(&pairs);
-            let name = fm.get("name").unwrap_or_else(|| "unnamed".to_string());
             let kind = fm.get("kind").unwrap_or_else(|| DEFAULT_KIND.to_string());
             let status = fm
                 .get("status")
                 .unwrap_or_else(|| DEFAULT_STATUS.to_string());
             let task_data = TaskData {
-                name,
+                title: fm.get("title"),
                 uuid: uuid.to_string(),
                 status,
                 kind,
@@ -1563,6 +2125,9 @@ pub fn object_commit(
                     .get("importance")
                     .and_then(|s| s.parse().ok())
                     .unwrap_or(0.0),
+                parent_task_uuid: None,
+                subtasks: vec![],
+                subtasks_ns: serde_json::Map::new(),
             };
             let json = build_task_object_json(&task_data, None);
             let commit = update_object_branch(
@@ -1583,7 +2148,6 @@ pub fn object_commit(
             let fm = FrontmatterMap(&pairs);
 
             let mut mismatches = Vec::new();
-            check_field(&val, &fm, "name", &mut mismatches);
             check_field(&val, &fm, "kind", &mut mismatches);
             check_field(&val, &fm, "status", &mut mismatches);
 
@@ -1774,7 +2338,7 @@ mod tests {
     #[test]
     fn generate_task_md_roundtrip() {
         let data = TaskData {
-            name: "my-task".to_string(),
+            title: Some("My Task".to_string()),
             uuid: "abc-123".to_string(),
             status: "created".to_string(),
             kind: "todo".to_string(),
@@ -1783,11 +2347,14 @@ mod tests {
             description: Some("A test task".to_string()),
             deadline: Some("2026-04-10T00:00:00Z".to_string()),
             importance: 1.5,
+            parent_task_uuid: None,
+            subtasks: vec!["sub1".to_string()],
+            subtasks_ns: serde_json::Map::new(),
         };
         let md = generate_task_md(&data, "# Body\nContent here\n");
         let (pairs, body) = parse_frontmatter(&md);
         let fm = FrontmatterMap(&pairs);
-        assert_eq!(fm.get("name").unwrap(), "my-task");
+        assert_eq!(fm.get("title").unwrap(), "My Task");
         assert_eq!(fm.get("kind").unwrap(), "todo");
         assert_eq!(fm.get("status").unwrap(), "created");
         assert_eq!(fm.get("description").unwrap(), "A test task");
@@ -1795,5 +2362,8 @@ mod tests {
         assert_eq!(fm.get("importance").unwrap(), "1.5");
         assert!(body.contains("# Body"));
         assert!(body.contains("Content here"));
+        // Subtasks should be in the raw content but excluded from pairs.
+        assert!(md.contains("subtasks:"));
+        assert!(md.contains("  - sub1"));
     }
 }

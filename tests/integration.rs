@@ -1700,10 +1700,6 @@ fn task_add_creates_task_branch_and_updates_db() {
     let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
     assert!(obj_json.contains("\"type\": \"task\""), "obj: {obj_json}");
     assert!(
-        obj_json.contains("\"name\": \"write-docs\""),
-        "obj: {obj_json}"
-    );
-    assert!(
         obj_json.contains(&format!("\"uuid\": \"{uuid}\"")),
         "obj: {obj_json}"
     );
@@ -1716,6 +1712,11 @@ fn task_add_creates_task_branch_and_updates_db() {
     assert!(
         obj_json.contains("\"description\": null"),
         "obj: {obj_json}"
+    );
+    // name is stored in parent, not in object.json
+    assert!(
+        !obj_json.contains("\"name\":"),
+        "name should not be in object.json: {obj_json}"
     );
 
     // State branch has a commit for the task add
@@ -2375,16 +2376,12 @@ fn task_add_creates_task_md_on_object_branch() {
 
     // TASK.md should exist on the object branch.
     let task_md = git_in_repo(&root, &["show", &format!("object/{uuid}:TASK.md")]);
-    assert!(task_md.contains("name: write-docs"), "TASK.md: {task_md}");
     assert!(task_md.contains("kind: todo"), "TASK.md: {task_md}");
     assert!(task_md.contains("status: created"), "TASK.md: {task_md}");
 
     // object.json should also exist.
     let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid}:object.json")]);
-    assert!(
-        obj_json.contains("\"name\": \"write-docs\""),
-        "obj: {obj_json}"
-    );
+    assert!(obj_json.contains("\"kind\": \"todo\""), "obj: {obj_json}");
 
     cleanup(&root);
 }
@@ -2395,10 +2392,10 @@ fn task_add_from_file() {
     subcontext_ok(&root, &["install"]);
 
     // Write a TASK.md file.
-    let task_md = "---\nname: file-task\nkind: goal\nstatus: active\ndescription: From a file\ndeadline: 2026-12-31T00:00:00Z\nimportance: 2.0\n---\n# File Task\n\nDetailed description here.\n";
+    let task_md = "---\nkind: goal\nstatus: active\ndescription: From a file\ndeadline: 2026-12-31T00:00:00Z\nimportance: 2.0\n---\n# File Task\n\nDetailed description here.\n";
     fs::write(root.join("TASK.md"), task_md).unwrap();
 
-    let out = subcontext(&root, &["task", "add", "--file", "TASK.md"]);
+    let out = subcontext(&root, &["task", "add", "file-task", "--file", "TASK.md"]);
     assert!(
         out.status.success(),
         "task add --file failed: {}",
@@ -2423,17 +2420,10 @@ fn task_add_from_file() {
         stored_md.contains("Detailed description here"),
         "stored TASK.md: {stored_md}"
     );
-    assert!(
-        stored_md.contains("name: file-task"),
-        "stored TASK.md: {stored_md}"
-    );
+    // name: is stripped from stored TASK.md (names live in parent namespace)
 
     // object.json should have the parsed fields.
     let obj_json = git_in_repo(&root, &["show", &format!("object/{uuid_line}:object.json")]);
-    assert!(
-        obj_json.contains("\"name\": \"file-task\""),
-        "obj: {obj_json}"
-    );
     assert!(obj_json.contains("\"kind\": \"goal\""), "obj: {obj_json}");
     assert!(
         obj_json.contains("\"status\": \"active\""),
@@ -2452,13 +2442,13 @@ fn task_show_prints_task_md() {
     let root = make_test_repo();
     subcontext_ok(&root, &["install"]);
 
-    let task_md = "---\nname: show-me\nkind: task\n---\n# Show Me\n\nBody content.\n";
+    let task_md = "---\nkind: task\n---\n# Show Me\n\nBody content.\n";
     fs::write(root.join("TASK.md"), task_md).unwrap();
-    subcontext_ok(&root, &["task", "add", "--file", "TASK.md"]);
+    subcontext_ok(&root, &["task", "add", "show-me", "--file", "TASK.md"]);
 
     let stdout = subcontext_ok(&root, &["task", "show", "show-me"]);
     assert!(
-        stdout.contains("name: show-me"),
+        stdout.contains("kind: task"),
         "show should print TASK.md frontmatter: {stdout}"
     );
     assert!(
