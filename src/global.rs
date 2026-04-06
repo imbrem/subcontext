@@ -2,7 +2,7 @@
 //!
 //! A global subcontext is installed outside any particular Git project. It
 //! lives at `$GIT_SUBCONTEXT_PATH` (or `~/.subcontext` by default) and holds
-//! a self-contained bare repo + worktrees with `kind: user` rather than
+//! a self-contained bare repo + worktrees with `kind: system` rather than
 //! `kind: project`.
 //!
 //! The layout mirrors `.git/.subcontext/` but is nested under a `global/`
@@ -18,12 +18,15 @@
 //!     └── state/
 //! ```
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
+use std::fmt::Write as FmtWrite;
 use std::path::{Path, PathBuf};
 
 use crate::backend::{Backend, GitInvocation};
 use crate::git::run_git_in_bare;
-use crate::project::{USER_KIND, ensure_config_in};
+use crate::project::{
+    SYSTEM_KIND, USER_KIND, ensure_config_in, read_kind_at, read_project_uuid_at,
+};
 use crate::task::{TaskScope, init_state_branch_in};
 
 pub const GLOBAL_ENV: &str = "GIT_SUBCONTEXT_PATH";
@@ -120,14 +123,14 @@ pub fn install(backend: &dyn Backend) -> Result<()> {
     // 3. Add config worktree.
     backend.worktree_add(&repo, &cfg, "config")?;
 
-    // 4. Write the user subcontext.yaml (kind: user).
-    ensure_config_in(backend, &cfg, USER_KIND)?;
+    // 4. Write the system subcontext.yaml (kind: system).
+    ensure_config_in(backend, &cfg, SYSTEM_KIND)?;
 
     // 5. Commit the config tree.
     backend.add_all(&cfg)?;
     let status = backend.status_porcelain(&cfg)?;
     if !status.is_empty() {
-        backend.commit(&cfg, "subcontext: init user config")?;
+        backend.commit(&cfg, "subcontext: init system config")?;
     }
 
     // 6. Create the default overlay branch and its worktree.
@@ -401,4 +404,498 @@ pub fn record_child_checkout_path(
     )?;
     run_git_in_bare(backend, &["update-ref", &ref_name, &commit], &repo, &repo)?;
     Ok(Some(commit))
+}
+
+// ─── User subcontexts ───────────────────────────────────────────────
+
+/// Install a user subcontext as a managed child of the global (system)
+/// subcontext. Returns the user UUID.
+pub fn install_user(backend: &dyn Backend) -> Result<String> {
+    if !global_exists(backend)? {
+        bail!("no global (system) subcontext installed — run `subcontext install --global` first");
+    }
+
+    let root = global_root()?;
+    let user_dir = root.join("user");
+    let repo = user_dir.join("repo");
+    let cfg = user_dir.join("config");
+    let work = user_dir.join("work");
+    let state = user_dir.join("state");
+
+    if backend.exists(&repo) {
+        let uuid = read_project_uuid_at(backend, &cfg)?;
+        eprintln!("[subcontext] User subcontext already installed (UUID: {uuid}).");
+        return Ok(uuid);
+    }
+
+    eprintln!(
+        "[subcontext] Initializing user subcontext at {}...",
+        user_dir.display()
+    );
+    backend.create_dir_all(&user_dir)?;
+
+    // 1. Init bare repo.
+    backend.init_bare(&user_dir, &repo)?;
+
+    // 2. Create config branch via plumbing.
+    let empty_tree = run_git_in_bare(
+        backend,
+        &["hash-object", "-t", "tree", "/dev/null"],
+        &repo,
+        &repo,
+    )?;
+    let config_commit = run_git_in_bare(
+        backend,
+        &["commit-tree", &empty_tree, "-m", "init config branch"],
+        &repo,
+        &repo,
+    )?;
+    run_git_in_bare(
+        backend,
+        &["update-ref", "refs/heads/config", &config_commit],
+        &repo,
+        &repo,
+    )?;
+
+    // 3. Add config worktree.
+    backend.worktree_add(&repo, &cfg, "config")?;
+
+    // 4. Write the user subcontext.yaml (kind: user).
+    let user_uuid = ensure_config_in(backend, &cfg, USER_KIND)?;
+
+    // 5. Commit the config tree.
+    backend.add_all(&cfg)?;
+    let status = backend.status_porcelain(&cfg)?;
+    if !status.is_empty() {
+        backend.commit(&cfg, "subcontext: init user config")?;
+    }
+
+    // 6. Create the default overlay branch and its worktree.
+    let overlay_commit = run_git_in_bare(
+        backend,
+        &[
+            "commit-tree",
+            &empty_tree,
+            "-m",
+            &format!("init {DEFAULT_OVERLAY_BRANCH}"),
+        ],
+        &repo,
+        &repo,
+    )?;
+    run_git_in_bare(
+        backend,
+        &[
+            "update-ref",
+            &format!("refs/heads/{DEFAULT_OVERLAY_BRANCH}"),
+            &overlay_commit,
+        ],
+        &repo,
+        &repo,
+    )?;
+    backend.worktree_add(&repo, &work, DEFAULT_OVERLAY_BRANCH)?;
+
+    // 7. Initialize state branch + tasks.db.
+    init_state_branch_in(backend, &repo, &state)?;
+
+    // 8. Register as managed child of the system subcontext.
+    if let Some(commit) = register_child(backend, &user_uuid, USER_KIND)? {
+        let global_scope = global_task_scope(backend)?;
+        let conn = crate::task::open_db(&global_scope)?;
+        crate::task::insert_object(&conn, &user_uuid, "managed", &commit, None)?;
+        drop(conn);
+        crate::task::commit_state_in(
+            backend,
+            &global_scope.state_dir,
+            &format!("object add: {user_uuid}"),
+        )?;
+    }
+
+    // 9. Set as current user if none exists.
+    let global_scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&global_scope)?;
+    ensure_global_extra_schema(&conn)?;
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'current_user'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    if existing.is_none() {
+        conn.execute(
+            "INSERT OR REPLACE INTO config (key, value) VALUES ('current_user', ?1)",
+            rusqlite::params![user_uuid],
+        )?;
+        drop(conn);
+        crate::task::commit_state_in(
+            backend,
+            &global_scope.state_dir,
+            &format!("set current user: {user_uuid}"),
+        )?;
+        eprintln!("[subcontext] Set current user to {user_uuid}.");
+    } else {
+        drop(conn);
+    }
+
+    eprintln!("[subcontext] User subcontext installed (UUID: {user_uuid}).");
+    Ok(user_uuid)
+}
+
+/// Build a TaskScope targeting the user subcontext.
+pub fn user_task_scope(backend: &dyn Backend) -> Result<TaskScope> {
+    let root = global_root()?;
+    let user_dir = root.join("user");
+    let repo = user_dir.join("repo");
+    let state = user_dir.join("state");
+    let cfg = user_dir.join("config");
+    if !backend.exists(&repo) {
+        bail!("no user subcontext installed — run `subcontext install --user` first");
+    }
+    let project_uuid = read_project_uuid_at(backend, &cfg)?;
+    Ok(TaskScope {
+        repo_dir: repo,
+        state_dir: state,
+        scratch_base: user_dir,
+        host_branch: GLOBAL_HOST_BRANCH.to_string(),
+        project_uuid,
+    })
+}
+
+/// Ensure extra schema tables exist in the global DB (config table, parents
+/// table). Called lazily — safe to call multiple times.
+pub fn ensure_global_extra_schema(conn: &rusqlite::Connection) -> Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS config (
+             key   TEXT PRIMARY KEY,
+             value TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS parents (
+             child_uuid  TEXT PRIMARY KEY,
+             parent_uuid TEXT NOT NULL
+         );",
+    )?;
+    Ok(())
+}
+
+// ─── Current user ───────────────────────────────────────────────────
+
+/// Get the current user UUID from the system subcontext config.
+pub fn get_current_user(backend: &dyn Backend) -> Result<Option<String>> {
+    if !global_exists(backend)? {
+        return Ok(None);
+    }
+    let scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+    let val: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = 'current_user'",
+            [],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(val)
+}
+
+/// Set the current user UUID. Validates that the UUID refers to a user-kind
+/// managed subcontext.
+pub fn set_current_user(backend: &dyn Backend, uuid: &str) -> Result<()> {
+    if !global_exists(backend)? {
+        bail!("no global (system) subcontext installed");
+    }
+    let scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+
+    // Verify it's a managed user subcontext by checking the object branch.
+    let repo = global_repo_dir()?;
+    let ref_name = format!("refs/heads/object/{uuid}");
+    if run_git_in_bare(
+        backend,
+        &["show-ref", "--verify", "--quiet", &ref_name],
+        &repo,
+        &repo,
+    )
+    .is_err()
+    {
+        bail!("UUID {uuid} is not registered in the system subcontext");
+    }
+
+    let json_str = run_git_in_bare(
+        backend,
+        &["show", &format!("object/{uuid}:object.json")],
+        &repo,
+        &repo,
+    )?;
+    let val: serde_json::Value = serde_json::from_str(&json_str)?;
+    let kind = val
+        .pointer("/data/kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if kind != USER_KIND {
+        bail!("UUID {uuid} has kind '{kind}', not 'user'");
+    }
+
+    conn.execute(
+        "INSERT OR REPLACE INTO config (key, value) VALUES ('current_user', ?1)",
+        rusqlite::params![uuid],
+    )?;
+    drop(conn);
+    crate::task::commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("set current user: {uuid}"),
+    )?;
+    eprintln!("[subcontext] Current user set to {uuid}.");
+    Ok(())
+}
+
+// ─── Parent-child relationships ─────────────────────────────────────
+
+/// Record that `child_uuid` has `parent_uuid` as its parent in the system DB.
+/// A child can only have one parent; re-setting is an error unless the same.
+pub fn set_parent(backend: &dyn Backend, child_uuid: &str, parent_uuid: &str) -> Result<()> {
+    let scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+
+    let existing: Option<String> = conn
+        .query_row(
+            "SELECT parent_uuid FROM parents WHERE child_uuid = ?1",
+            rusqlite::params![child_uuid],
+            |r| r.get(0),
+        )
+        .ok();
+
+    match existing {
+        Some(ref p) if p == parent_uuid => return Ok(()),
+        Some(p) => bail!("child {child_uuid} already has parent {p}, cannot set to {parent_uuid}"),
+        None => {}
+    }
+
+    conn.execute(
+        "INSERT INTO parents (child_uuid, parent_uuid) VALUES (?1, ?2)",
+        rusqlite::params![child_uuid, parent_uuid],
+    )?;
+    drop(conn);
+    crate::task::commit_state_in(
+        backend,
+        &scope.state_dir,
+        &format!("set parent of {child_uuid} to {parent_uuid}"),
+    )?;
+    Ok(())
+}
+
+/// Get the parent UUID of a child from the system DB.
+pub fn get_parent(backend: &dyn Backend, child_uuid: &str) -> Result<Option<String>> {
+    if !global_exists(backend)? {
+        return Ok(None);
+    }
+    let scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+    let val: Option<String> = conn
+        .query_row(
+            "SELECT parent_uuid FROM parents WHERE child_uuid = ?1",
+            rusqlite::params![child_uuid],
+            |r| r.get(0),
+        )
+        .ok();
+    Ok(val)
+}
+
+/// Get all children of a parent from the system DB.
+pub fn get_children(backend: &dyn Backend, parent_uuid: &str) -> Result<Vec<String>> {
+    if !global_exists(backend)? {
+        return Ok(vec![]);
+    }
+    let scope = global_task_scope(backend)?;
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+    let mut stmt = conn.prepare("SELECT child_uuid FROM parents WHERE parent_uuid = ?1")?;
+    let rows = stmt.query_map(rusqlite::params![parent_uuid], |r| r.get(0))?;
+    let mut children = vec![];
+    for row in rows {
+        children.push(row?);
+    }
+    Ok(children)
+}
+
+// ─── Tree / info helpers ────────────────────────────────────────────
+
+/// Get kind of a managed subcontext from its object branch.
+pub fn get_managed_kind(backend: &dyn Backend, uuid: &str) -> Result<String> {
+    let repo = global_repo_dir()?;
+    let json_str = run_git_in_bare(
+        backend,
+        &["show", &format!("object/{uuid}:object.json")],
+        &repo,
+        &repo,
+    )?;
+    let val: serde_json::Value = serde_json::from_str(&json_str)?;
+    Ok(val
+        .pointer("/data/kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string())
+}
+
+/// Build a tree string showing all managed subcontexts under the system subcontext.
+pub fn tree_text(backend: &dyn Backend) -> Result<String> {
+    if !global_exists(backend)? {
+        bail!("no global (system) subcontext installed");
+    }
+    let scope = global_task_scope(backend)?;
+    let system_uuid = scope.project_uuid.clone();
+
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+
+    // Collect all managed objects.
+    let mut stmt = conn.prepare("SELECT uuid, type FROM objects WHERE type = 'managed'")?;
+    let managed: Vec<(String, String)> = stmt
+        .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+        .filter_map(|r| r.ok())
+        .collect();
+    drop(stmt);
+
+    // Build parent→children map from the parents table.
+    let mut parent_children: std::collections::HashMap<String, Vec<String>> =
+        std::collections::HashMap::new();
+    let mut child_parent: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    {
+        let mut stmt = conn.prepare("SELECT child_uuid, parent_uuid FROM parents")?;
+        let rows: Vec<(String, String)> = stmt
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))?
+            .filter_map(|r| r.ok())
+            .collect();
+        for (child, parent) in rows {
+            parent_children
+                .entry(parent.clone())
+                .or_default()
+                .push(child.clone());
+            child_parent.insert(child, parent);
+        }
+    }
+    drop(conn);
+
+    let mut out = String::new();
+    let system_kind = "system";
+    writeln!(out, "{system_uuid} ({system_kind})")?;
+
+    // Find top-level managed (those whose parent is NOT in managed set, or have no parent).
+    let managed_uuids: std::collections::HashSet<String> =
+        managed.iter().map(|(u, _)| u.clone()).collect();
+
+    fn print_subtree(
+        backend: &dyn Backend,
+        out: &mut String,
+        uuid: &str,
+        parent_children: &std::collections::HashMap<String, Vec<String>>,
+        managed_uuids: &std::collections::HashSet<String>,
+        prefix: &str,
+        is_last: bool,
+    ) -> Result<()> {
+        let kind = get_managed_kind(backend, uuid).unwrap_or_else(|_| "unknown".to_string());
+        let connector = if is_last { "└── " } else { "├── " };
+        writeln!(out, "{prefix}{connector}{uuid} ({kind})")?;
+        let child_prefix = if is_last {
+            format!("{prefix}    ")
+        } else {
+            format!("{prefix}│   ")
+        };
+        if let Some(children) = parent_children.get(uuid) {
+            let relevant: Vec<&String> = children
+                .iter()
+                .filter(|c| managed_uuids.contains(c.as_str()))
+                .collect();
+            for (i, child) in relevant.iter().enumerate() {
+                let last = i == relevant.len() - 1;
+                print_subtree(
+                    backend,
+                    out,
+                    child,
+                    parent_children,
+                    managed_uuids,
+                    &child_prefix,
+                    last,
+                )?;
+            }
+        }
+        Ok(())
+    }
+
+    // Top-level = managed whose parent is the system UUID or who have no parent.
+    let mut top_level: Vec<&String> = managed_uuids
+        .iter()
+        .filter(|u| match child_parent.get(u.as_str()) {
+            None => true,
+            Some(p) => p == &system_uuid,
+        })
+        .collect();
+    top_level.sort();
+
+    for (i, uuid) in top_level.iter().enumerate() {
+        let last = i == top_level.len() - 1;
+        print_subtree(
+            backend,
+            &mut out,
+            uuid,
+            &parent_children,
+            &managed_uuids,
+            "",
+            last,
+        )?;
+    }
+
+    Ok(out)
+}
+
+/// Build the ancestry chain for a given UUID (walking up parents).
+/// Returns vec of (uuid, kind) from the given UUID up to the root.
+/// Does NOT include the system subcontext itself.
+pub fn ancestry_chain(backend: &dyn Backend, uuid: &str) -> Result<Vec<(String, String)>> {
+    if !global_exists(backend)? {
+        return Ok(vec![]);
+    }
+    let scope = global_task_scope(backend)?;
+    let system_uuid = scope.project_uuid.clone();
+    let conn = crate::task::open_db(&scope)?;
+    ensure_global_extra_schema(&conn)?;
+
+    let mut chain = vec![];
+    let mut current = uuid.to_string();
+
+    // Walk up parents, stop if we hit the system UUID or run out.
+    loop {
+        let parent: Option<String> = conn
+            .query_row(
+                "SELECT parent_uuid FROM parents WHERE child_uuid = ?1",
+                rusqlite::params![current],
+                |r| r.get(0),
+            )
+            .ok();
+        match parent {
+            Some(p) if p != system_uuid => {
+                let kind = get_managed_kind(backend, &p).unwrap_or_else(|_| "unknown".to_string());
+                chain.push((p.clone(), kind));
+                current = p;
+            }
+            _ => break,
+        }
+    }
+    Ok(chain)
+}
+
+/// Get the system subcontext's UUID.
+pub fn system_uuid(backend: &dyn Backend) -> Result<String> {
+    let cfg = global_config_dir()?;
+    read_project_uuid_at(backend, &cfg)
+}
+
+/// Get the system subcontext's kind.
+pub fn system_kind(backend: &dyn Backend) -> Result<String> {
+    let cfg = global_config_dir()?;
+    read_kind_at(backend, &cfg)
 }

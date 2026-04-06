@@ -754,9 +754,9 @@ fn install_global_creates_subcontext_directory_with_user_kind() {
     assert!(global_path.join("global/work").is_dir());
     assert!(global_path.join("global/state").is_dir());
 
-    // subcontext.yaml has kind: user
+    // subcontext.yaml has kind: system
     let yaml = fs::read_to_string(global_path.join("global/config/subcontext.yaml")).unwrap();
-    assert!(yaml.contains("kind: user"), "yaml: {yaml}");
+    assert!(yaml.contains("kind: system"), "yaml: {yaml}");
     assert!(yaml.contains("project_uuid:"));
 
     // state/tasks.db exists
@@ -2056,5 +2056,282 @@ fn uninstall_removes_state_worktree() {
 
     assert!(!root.join(".git/.subcontext").exists());
 
+    cleanup(&root);
+}
+
+fn subcontext_with_global_ok(cwd: &Path, global_path: &Path, args: &[&str]) -> String {
+    let out = subcontext_with_global(cwd, global_path, args);
+    assert!(
+        out.status.success(),
+        "subcontext {} failed (exit {}):\nstdout: {}\nstderr: {}",
+        args.join(" "),
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+fn read_uuid(root: &Path) -> String {
+    let yaml = fs::read_to_string(root.join(".git/.subcontext/config/subcontext.yaml")).unwrap();
+    yaml.lines()
+        .find_map(|l| {
+            l.strip_prefix("project_uuid:")
+                .map(|s| s.trim().to_string())
+        })
+        .expect("project_uuid missing")
+}
+
+#[test]
+fn install_user_creates_user_subcontext() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    // Install system (global) first.
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+
+    // Install user subcontext.
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    // Verify user dir exists with kind: user.
+    let user_yaml = fs::read_to_string(global_path.join("user/config/subcontext.yaml")).unwrap();
+    assert!(user_yaml.contains("kind: user"), "yaml: {user_yaml}");
+
+    // Current user should be set automatically.
+    let stdout = subcontext_with_global_ok(&fake_home, &global_path, &["current-user"]);
+    let user_uuid = stdout.trim();
+    assert!(
+        !user_uuid.is_empty(),
+        "current user UUID should not be empty"
+    );
+
+    // The user UUID should appear in the yaml.
+    assert!(
+        user_yaml.contains(user_uuid),
+        "user yaml should contain the UUID"
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+}
+
+#[test]
+fn task_propagates_to_user_context_not_global() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    // Set up system -> user -> project hierarchy.
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    // Add a task in the project.
+    subcontext_with_global_ok(&root, &global_path, &["task", "add", "my-task"]);
+
+    // The shadow should appear in the user subcontext's tasks.db.
+    let user_db = global_path.join("user/state/tasks.db");
+    let conn = rusqlite::Connection::open(&user_db).unwrap();
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_name = 'my-task'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(count > 0, "task should be propagated to user context");
+    drop(conn);
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn task_propagation_is_recursive() {
+    // Tests that a task created in a project propagates all the way up:
+    // project -> user -> system (global).
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    // 1. Install system subcontext.
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+
+    // 2. Install user subcontext.
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    // 3. Install project subcontext.
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    // 4. Add a task in the project (without --local).
+    subcontext_with_global_ok(&root, &global_path, &["task", "add", "recursive-task"]);
+
+    // 5. Verify the task exists in the project's local DB.
+    let local_db = root.join(".git/.subcontext/state/tasks.db");
+    let conn = rusqlite::Connection::open(&local_db).unwrap();
+    let local_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(local_count, 1, "task should exist locally");
+    drop(conn);
+
+    // 6. Verify the task propagated to the user context.
+    let user_db = global_path.join("user/state/tasks.db");
+    let conn = rusqlite::Connection::open(&user_db).unwrap();
+    let user_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        user_count > 0,
+        "task should propagate to user context (got {user_count})"
+    );
+    drop(conn);
+
+    // 7. Verify the task propagated to the system (global) context.
+    let global_db = global_path.join("global/state/tasks.db");
+    let conn = rusqlite::Connection::open(&global_db).unwrap();
+    let global_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM tasks WHERE task_name = 'recursive-task'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert!(
+        global_count > 0,
+        "task should propagate recursively to global/system context (got {global_count})"
+    );
+    drop(conn);
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn tree_shows_managed_hierarchy() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    let stdout = subcontext_with_global_ok(&fake_home, &global_path, &["tree"]);
+    assert!(stdout.contains("(system)"), "tree should show system root");
+    assert!(stdout.contains("(user)"), "tree should show user node");
+    assert!(
+        stdout.contains("(project)"),
+        "tree should show project node: {stdout}"
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn parent_and_children_commands() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    // Project's parent should be the user UUID.
+    let parent_out = subcontext_with_global_ok(&root, &global_path, &["parent"]);
+    assert!(
+        parent_out.contains("(user)"),
+        "parent should be user: {parent_out}"
+    );
+
+    // Project should have no children.
+    let out = subcontext_with_global(&root, &global_path, &["children"]);
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("No children"),
+        "project should have no children: stdout={}, stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        stderr
+    );
+
+    // UUID command should print the project's UUID.
+    let uuid_out = subcontext_with_global_ok(&root, &global_path, &["uuid"]);
+    let project_uuid = read_uuid(&root);
+    assert_eq!(uuid_out.trim(), project_uuid);
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn status_shows_global_and_ancestry() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    let stdout = subcontext_with_global_ok(&root, &global_path, &["status"]);
+    assert!(
+        stdout.contains("Global:") && stdout.contains("(system)"),
+        "status should show global system: {stdout}"
+    );
+    assert!(
+        stdout.contains("Ancestry:") && stdout.contains("(user)"),
+        "status should show user in ancestry: {stdout}"
+    );
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
     cleanup(&root);
 }
