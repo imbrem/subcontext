@@ -387,11 +387,50 @@ pub struct DeadlineEntry {
 /// - `horizon_secs`: if `Some(n)`, only return tasks whose deadline is at most
 ///   `n` seconds in the future from now. If `n == 0`, only past deadlines.
 ///   If `None`, return all matching tasks regardless of deadline time.
+/// Parse a human-readable duration string into seconds.
+///
+/// Supported suffixes: `s` (seconds), `m` (minutes), `h` (hours),
+/// `d` (days), `w` (weeks), `mo` (months, 30 days), `y` (years, 365 days).
+/// A bare number without a suffix is treated as seconds.
+pub fn parse_duration(s: &str) -> Result<f64> {
+    let s = s.trim();
+    if s.is_empty() {
+        bail!("empty duration string");
+    }
+    // Try suffixes longest-first to match "mo" before "m".
+    let (num, multiplier) = if let Some(n) = s.strip_suffix("mo") {
+        (n, 30.0 * 86400.0)
+    } else if let Some(n) = s.strip_suffix('y') {
+        (n, 365.0 * 86400.0)
+    } else if let Some(n) = s.strip_suffix('w') {
+        (n, 7.0 * 86400.0)
+    } else if let Some(n) = s.strip_suffix('d') {
+        (n, 86400.0)
+    } else if let Some(n) = s.strip_suffix('h') {
+        (n, 3600.0)
+    } else if let Some(n) = s.strip_suffix('m') {
+        (n, 60.0)
+    } else if let Some(n) = s.strip_suffix('s') {
+        (n, 1.0)
+    } else {
+        (s, 1.0)
+    };
+    let value: f64 = num
+        .trim()
+        .parse()
+        .with_context(|| format!("invalid duration: {s}"))?;
+    Ok(value * multiplier)
+}
+
 pub fn list_deadlines(
     scope: &TaskScope,
     important_only: bool,
-    horizon_secs: Option<f64>,
+    horizon: Option<&str>,
 ) -> Result<Vec<DeadlineEntry>> {
+    let horizon_secs: Option<f64> = match horizon {
+        Some(h) => Some(parse_duration(h)?),
+        None => None,
+    };
     let conn = open_db(scope)?;
 
     let mut sql = String::from(
@@ -860,6 +899,29 @@ mod tests {
     fn parse_iso8601_rejects_bad_input() {
         assert_eq!(parse_iso8601_to_unix("not a date"), None);
         assert_eq!(parse_iso8601_to_unix("2026-04-12T12:34:56"), None); // no Z
+    }
+
+    #[test]
+    fn parse_duration_units() {
+        assert_eq!(parse_duration("0").unwrap(), 0.0);
+        assert_eq!(parse_duration("30s").unwrap(), 30.0);
+        assert_eq!(parse_duration("5m").unwrap(), 300.0);
+        assert_eq!(parse_duration("2h").unwrap(), 7200.0);
+        assert_eq!(parse_duration("1d").unwrap(), 86400.0);
+        assert_eq!(parse_duration("1w").unwrap(), 7.0 * 86400.0);
+        assert_eq!(parse_duration("1mo").unwrap(), 30.0 * 86400.0);
+        assert_eq!(parse_duration("1y").unwrap(), 365.0 * 86400.0);
+    }
+
+    #[test]
+    fn parse_duration_fractional() {
+        assert_eq!(parse_duration("0.5d").unwrap(), 43200.0);
+    }
+
+    #[test]
+    fn parse_duration_rejects_empty() {
+        assert!(parse_duration("").is_err());
+        assert!(parse_duration("abc").is_err());
     }
 
     #[test]

@@ -188,10 +188,10 @@ enum TaskCommand {
         /// Only show important tasks (importance > 0)
         #[arg(long)]
         important: bool,
-        /// Only show deadlines within this many seconds from now.
-        /// 0 = only overdue deadlines.
+        /// Only show deadlines within this duration from now (e.g. 1d, 2w, 3mo, 1y).
+        /// Suffixes: s, m (minutes), h, d, w, mo (months), y. 0 = only overdue.
         #[arg(long)]
-        horizon: Option<f64>,
+        horizon: Option<String>,
     },
 }
 
@@ -346,7 +346,7 @@ fn main() -> Result<()> {
                         task::fail_task(backend, &scope, &name, time.as_deref())?;
                     }
                     TaskCommand::Deadlines { important, horizon } => {
-                        let entries = task::list_deadlines(&scope, important, horizon)?;
+                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
                         print!("{}", task::format_deadlines(&entries));
                     }
                 }
@@ -415,7 +415,7 @@ fn main() -> Result<()> {
                         task::fail_task(backend, &scope, &name, time.as_deref())?;
                     }
                     TaskCommand::Deadlines { important, horizon } => {
-                        let entries = task::list_deadlines(&scope, important, horizon)?;
+                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
                         print!("{}", task::format_deadlines(&entries));
                     }
                 }

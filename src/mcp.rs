@@ -95,9 +95,9 @@ fn handle_method(
                             "description": "If true, only show tasks with importance > 0. Default: false.",
                             "default": false
                         },
-                        "horizon_seconds": {
-                            "type": "number",
-                            "description": "How far into the future (in seconds) to look for deadlines. If 0, only shows overdue deadlines. If omitted, shows all deadlines regardless of time."
+                        "horizon": {
+                            "type": "string",
+                            "description": "How far into the future to look for deadlines, as a human-readable duration (e.g. '1d', '2w', '3mo', '1y'). Suffixes: s, m (minutes), h, d, w, mo (months), y. Use '0' for only overdue deadlines. If omitted, shows all deadlines."
                         }
                     },
                     "additionalProperties": false
@@ -127,15 +127,17 @@ fn handle_method(
                         .and_then(|p| p.get("important_only"))
                         .and_then(|v| v.as_bool())
                         .unwrap_or(false);
-                    let horizon_secs: Option<f64> = params
-                        .and_then(|p| p.get("horizon_seconds"))
-                        .and_then(|v| v.as_f64());
+                    let horizon: Option<String> = params
+                        .and_then(|p| p.get("horizon"))
+                        .and_then(|v| v.as_str())
+                        .map(|s| s.to_string());
 
                     let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
-                    let text = match deadlines_text(backend, &cwd, important_only, horizon_secs) {
-                        Ok(s) => s,
-                        Err(e) => format!("Error: {e:#}"),
-                    };
+                    let text =
+                        match deadlines_text(backend, &cwd, important_only, horizon.as_deref()) {
+                            Ok(s) => s,
+                            Err(e) => format!("Error: {e:#}"),
+                        };
                     Ok(Some(json!({
                         "content": [{"type": "text", "text": text}],
                         "isError": false
@@ -155,10 +157,10 @@ fn deadlines_text(
     backend: &dyn Backend,
     cwd: &std::path::Path,
     important_only: bool,
-    horizon_secs: Option<f64>,
+    horizon: Option<&str>,
 ) -> anyhow::Result<String> {
     let root = git::find_main_git_root(backend, cwd)?;
     let scope = task::TaskScope::for_local(backend, &root)?;
-    let entries = task::list_deadlines(&scope, important_only, horizon_secs)?;
+    let entries = task::list_deadlines(&scope, important_only, horizon)?;
     Ok(task::format_deadlines(&entries))
 }
