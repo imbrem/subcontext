@@ -80,15 +80,6 @@ pub fn config_dir(root: &Path) -> PathBuf {
     subcontext_dir(root).join("config")
 }
 
-/// Derive the config dir from a repo dir (sibling directory).
-/// repo_dir is `.../repo`, config_dir is `.../config`.
-pub fn config_dir_from_repo(repo_dir: &Path) -> PathBuf {
-    repo_dir
-        .parent()
-        .map(|p| p.join("config"))
-        .unwrap_or_else(|| repo_dir.join("../config"))
-}
-
 /// .git/.subcontext/repo
 pub fn repo_dir(root: &Path) -> PathBuf {
     subcontext_dir(root).join("repo")
@@ -97,6 +88,11 @@ pub fn repo_dir(root: &Path) -> PathBuf {
 /// .git/.subcontext/state
 pub fn state_dir(root: &Path) -> PathBuf {
     subcontext_dir(root).join("state")
+}
+
+/// .git/.subcontext/pool (default pool worktree)
+pub fn pool_dir(root: &Path) -> PathBuf {
+    subcontext_dir(root).join("pool")
 }
 
 // ─── Checkout context ────────────────────────────────────────────────

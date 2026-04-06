@@ -39,6 +39,7 @@ pub fn uninstall(backend: &dyn Backend, root: &Path) -> Result<()> {
     let work = sc_dir.join("work");
     let config = sc_dir.join("config");
     let state = sc_dir.join("state");
+    let pool = sc_dir.join("pool");
     if backend.exists(&work) {
         backend.remove_dir_all(&work).ok();
     }
@@ -47,6 +48,9 @@ pub fn uninstall(backend: &dyn Backend, root: &Path) -> Result<()> {
     }
     if backend.exists(&state) {
         backend.remove_dir_all(&state).ok();
+    }
+    if backend.exists(&pool) {
+        backend.remove_dir_all(&pool).ok();
     }
     backend.remove_dir_all(&sc_dir).ok();
 

@@ -86,7 +86,7 @@ fn handle_method(
                 }
             }, {
                 "name": "subcontext_deadlines",
-                "description": "List deadlines for tasks not marked done or failed. Returns task names, statuses, deadlines, and importance values sorted by deadline.",
+                "description": "List deadlines for active pool tasks. Returns task IDs, titles, deadlines, and importance sorted by deadline.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -161,6 +161,6 @@ fn deadlines_text(
 ) -> anyhow::Result<String> {
     let root = git::find_main_git_root(backend, cwd)?;
     let scope = task::TaskScope::for_local(backend, &root)?;
-    let entries = task::list_deadlines(&scope, important_only, horizon, None)?;
+    let entries = task::pool_list_deadlines(&scope, important_only, horizon)?;
     Ok(task::format_deadlines(&entries))
 }

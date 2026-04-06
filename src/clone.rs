@@ -66,6 +66,36 @@ pub fn clone(backend: &dyn Backend, root: &Path, url: &str) -> Result<()> {
         crate::task::init_state_branch(backend, root)?;
     }
 
+    // Set up pool worktree if the remote has a pool object, or create one locally
+    {
+        // Check if there's a pool UUID in state.db
+        let state = state_dir(root);
+        if backend.exists(&state.join(crate::task::DB_NAME)) {
+            let conn = crate::task::open_state_db(&state)?;
+            let pool_uuid: Option<String> = conn
+                .query_row("SELECT uuid FROM pools LIMIT 1", [], |r| r.get(0))
+                .ok();
+            drop(conn);
+            if let Some(uuid) = pool_uuid {
+                let pool_branch = format!("object/{uuid}");
+                if crate::overlay::overlay_branch_exists(backend, root, &pool_branch)? {
+                    let pool = crate::git::pool_dir(root);
+                    run_subcontext_git(
+                        backend,
+                        &["worktree", "add", &pool.to_string_lossy(), &pool_branch],
+                        root,
+                    )?;
+                } else {
+                    crate::task::init_pool_local(backend, root)?;
+                }
+            } else {
+                crate::task::init_pool_local(backend, root)?;
+            }
+        } else {
+            crate::task::init_pool_local(backend, root)?;
+        }
+    }
+
     // Apply overlay
     let ctx = CheckoutContext::main_only(root);
     overlay::apply_overlay(backend, &ctx)?;

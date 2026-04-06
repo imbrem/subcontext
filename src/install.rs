@@ -73,11 +73,11 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
     // If a global subcontext exists on this machine, register this project
     // as a child of it (creates an object/<uuid> branch in the global bare
     // repo with object.json containing child data).
-    if let Some(commit) = global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)? {
-        // Record the managed child in the global objects table.
+    if let Some(_commit) = global::register_child(backend, &project_uuid, SUBCONTEXT_KIND)? {
+        // Record the managed child in the global state.db objects table.
         if let Ok(global_scope) = global::global_task_scope(backend) {
-            let conn = task::open_db(&global_scope)?;
-            task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
+            let conn = task::open_state_db(&global_scope.state_dir)?;
+            task::insert_object(&conn, &project_uuid, &global_scope.project_uuid, "child")?;
             drop(conn);
             task::commit_state_in(
                 backend,
@@ -112,14 +112,14 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
                     "kind": SUBCONTEXT_KIND,
                 });
                 let object_json = task::build_child_object_json(&child_data);
-                let commit = task::create_object_branch(
+                let _commit = task::create_object_branch(
                     backend,
                     &user_scope,
                     &project_uuid,
                     &[("object.json", &object_json)],
                 )?;
-                let conn = task::open_db(&user_scope)?;
-                task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
+                let conn = task::open_state_db(&user_scope.state_dir)?;
+                task::insert_object(&conn, &project_uuid, &user_scope.project_uuid, "child")?;
                 drop(conn);
                 task::commit_state_in(
                     backend,
@@ -194,6 +194,9 @@ fn init_context_repo(backend: &dyn Backend, root: &Path, host_branch: &str) -> R
 
     // 6. Initialize state branch (tasks.db)
     task::init_state_branch(backend, root)?;
+
+    // 7. Initialize default pool
+    task::init_pool_local(backend, root)?;
 
     Ok(())
 }
