@@ -2736,3 +2736,167 @@ fn install_skills_skips_existing() {
 
     let _ = fs::remove_dir_all(&fake_home);
 }
+
+// ─── Namespace ──────────────────────────────────────────────────────
+
+#[test]
+fn namespace_set_get_list_remove() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let uuid1 = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+    let uuid2 = "11111111-2222-3333-4444-555555555555";
+
+    // Set a flat entry.
+    subcontext_ok(&root, &["namespace", "set", "myproject", uuid1]);
+
+    // Get it back.
+    let out = subcontext_ok(&root, &["namespace", "get", "myproject"]);
+    assert_eq!(out.trim(), uuid1);
+
+    // Set a nested entry.
+    subcontext_ok(&root, &["namespace", "set", "tools/editor", uuid2]);
+
+    // Get the nested entry.
+    let out = subcontext_ok(&root, &["namespace", "get", "tools/editor"]);
+    assert_eq!(out.trim(), uuid2);
+
+    // List all.
+    let out = subcontext_ok(&root, &["namespace", "list"]);
+    assert!(out.contains("myproject"));
+    assert!(out.contains(uuid1));
+    assert!(out.contains("tools/editor"));
+    assert!(out.contains(uuid2));
+
+    // Remove flat entry.
+    subcontext_ok(&root, &["namespace", "remove", "myproject"]);
+    let out = subcontext(&root, &["namespace", "get", "myproject"]);
+    assert!(!out.status.success());
+
+    // Remove nested entry (should clean up empty parent).
+    subcontext_ok(&root, &["namespace", "remove", "tools/editor"]);
+    let out = subcontext_ok(&root, &["namespace", "list"]);
+    assert!(!out.contains("tools"));
+
+    cleanup(&root);
+}
+
+#[test]
+fn namespace_rejects_dot_prefix() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    let out = subcontext(
+        &root,
+        &[
+            "namespace",
+            "set",
+            ".bad",
+            "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee",
+        ],
+    );
+    assert!(
+        !out.status.success(),
+        "names starting with '.' should be rejected"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn namespace_user_flag_uses_user_config() {
+    let fake_home = std::env::temp_dir().join(format!(
+        "subcontext-home-{}-{}",
+        std::process::id(),
+        COUNTER.fetch_add(1, Ordering::SeqCst)
+    ));
+    fs::create_dir_all(&fake_home).unwrap();
+    let global_path = make_global_dir();
+
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--global"]);
+    subcontext_with_global_ok(&fake_home, &global_path, &["install", "--user"]);
+
+    let root = make_test_repo();
+    subcontext_with_global_ok(&root, &global_path, &["install"]);
+
+    let uuid = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+
+    // Set in user namespace.
+    subcontext_with_global_ok(
+        &root,
+        &global_path,
+        &["namespace", "--user", "set", "foo", uuid],
+    );
+
+    // Get from user namespace.
+    let out =
+        subcontext_with_global_ok(&root, &global_path, &["namespace", "--user", "get", "foo"]);
+    assert_eq!(out.trim(), uuid);
+
+    // Should NOT be visible in the project namespace.
+    let out = subcontext_with_global(&root, &global_path, &["namespace", "get", "foo"]);
+    assert!(!out.status.success());
+
+    cleanup(&fake_home);
+    cleanup(&global_path);
+    cleanup(&root);
+}
+
+#[test]
+fn task_path_dotdot_walks_to_parent() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Create parent and child tasks.
+    subcontext_ok(&root, &["task", "add", "parent-task"]);
+    subcontext_ok(
+        &root,
+        &["task", "add", "child-task", "--parent", "parent-task"],
+    );
+
+    // Set current task to child.
+    subcontext_ok(&root, &["task", "set", "parent-task/child-task"]);
+
+    // Use .. to reference the parent — stderr should show the parent's UUID.
+    let show_out = subcontext(&root, &["task", "show", ".."]);
+    assert!(show_out.status.success(), "task show .. should succeed");
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    // The TASK.md for a parent with subtasks should contain "child-task" in subtasks.
+    assert!(
+        show_stdout.contains("child-task"),
+        ".. should resolve to parent task (whose subtasks include child-task), got: {show_stdout}"
+    );
+
+    cleanup(&root);
+}
+
+#[test]
+fn task_path_dot_uuid_resolves_directly() {
+    let root = make_test_repo();
+    subcontext_ok(&root, &["install"]);
+
+    // Create a task and capture its UUID.
+    let add_out = subcontext(&root, &["task", "add", "uuid-task"]);
+    let stderr = String::from_utf8_lossy(&add_out.stderr);
+    // Extract UUID from "[subcontext] Added task 'uuid-task' (UUID)"
+    let uuid = stderr
+        .split('(')
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .unwrap()
+        .trim();
+
+    // Resolve via /.uuid/<uuid>. The stderr should print the Task UUID.
+    let show_out = subcontext(&root, &["task", "show", &format!("/.uuid/{uuid}")]);
+    assert!(
+        show_out.status.success(),
+        "task show /.uuid/<uuid> should succeed"
+    );
+    let show_stderr = String::from_utf8_lossy(&show_out.stderr);
+    assert!(
+        show_stderr.contains(uuid),
+        "/.uuid/<uuid> should resolve to the task with UUID {uuid}, stderr: {show_stderr}"
+    );
+
+    cleanup(&root);
+}

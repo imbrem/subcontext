@@ -7,6 +7,7 @@ mod hook;
 mod install;
 mod mcp;
 mod mcp_config;
+mod namespace;
 mod overlay;
 mod project;
 mod settings;
@@ -150,6 +151,18 @@ enum Commands {
     /// View the current subcontext's children
     Children,
 
+    /// Manage the namespace dictionary
+    Namespace {
+        /// Operate on the global (system-level) subcontext.
+        #[arg(long)]
+        global: bool,
+        /// Operate on the user subcontext.
+        #[arg(long, conflicts_with = "global")]
+        user: bool,
+        #[command(subcommand)]
+        command: NamespaceCommand,
+    },
+
     /// Internal hook dispatcher (not for direct use)
     #[command(name = "_hook", hide = true)]
     Hook {
@@ -258,6 +271,29 @@ enum TaskCommand {
 }
 
 #[derive(Subcommand)]
+enum NamespaceCommand {
+    /// Set a namespace entry: name=uuid (use / for nesting, e.g. tools/editor=uuid)
+    Set {
+        /// Key path (e.g. "myproject" or "tools/editor")
+        key: String,
+        /// UUID to map the name to
+        uuid: String,
+    },
+    /// Get a namespace entry by key path
+    Get {
+        /// Key path (e.g. "myproject" or "tools/editor")
+        key: String,
+    },
+    /// Remove a namespace entry
+    Remove {
+        /// Key path (e.g. "myproject" or "tools/editor")
+        key: String,
+    },
+    /// List all namespace entries
+    List,
+}
+
+#[derive(Subcommand)]
 enum HookCommand {
     /// Handle post-checkout events
     PostCheckout {
@@ -293,7 +329,20 @@ fn handle_task_show(
     name_or_uuid: &str,
 ) -> Result<()> {
     use task::ShowTaskResult;
-    match task::show_task(backend, scope, name_or_uuid)? {
+    // If the input looks like a path (contains /, starts with ., etc.),
+    // try resolving it as a task path first.
+    let resolved = if name_or_uuid.contains('/')
+        || name_or_uuid == "."
+        || name_or_uuid == ".."
+        || name_or_uuid.starts_with('/')
+    {
+        let conn = task::open_db(scope)?;
+        task::resolve_task_path(&conn, scope, name_or_uuid, Some(backend)).ok()
+    } else {
+        None
+    };
+    let lookup = resolved.as_deref().unwrap_or(name_or_uuid);
+    match task::show_task(backend, scope, lookup)? {
         ShowTaskResult::Single(uuid, content) => {
             eprintln!("[subcontext] Task UUID: {uuid}");
             print!("{content}");
@@ -421,7 +470,12 @@ fn main() -> Result<()> {
                 match parent {
                     Some(p) => {
                         let conn = task::open_db(&scope)?;
-                        Ok(Some(task::resolve_task_path(&conn, &scope, p)?))
+                        Ok(Some(task::resolve_task_path(
+                            &conn,
+                            &scope,
+                            p,
+                            Some(backend),
+                        )?))
                     }
                     None => Ok(None),
                 }
@@ -555,7 +609,7 @@ fn main() -> Result<()> {
                 TaskCommand::Set { name } => match name {
                     Some(ref n) => {
                         let conn = task::open_db(&scope)?;
-                        let uuid = task::resolve_task_path(&conn, &scope, n)?;
+                        let uuid = task::resolve_task_path(&conn, &scope, n, Some(backend))?;
                         drop(conn);
                         task::set_branch_task(backend, &scope, &uuid)?;
                         eprintln!(
@@ -575,7 +629,7 @@ fn main() -> Result<()> {
                     let parent_uuid = match name {
                         Some(ref n) => {
                             let conn = task::open_db(&scope)?;
-                            Some(task::resolve_task_path(&conn, &scope, n)?)
+                            Some(task::resolve_task_path(&conn, &scope, n, Some(backend))?)
                         }
                         None => {
                             let conn = task::open_db(&scope)?;
@@ -658,6 +712,93 @@ fn main() -> Result<()> {
                     let kind = global::get_managed_kind(backend, &child)
                         .unwrap_or_else(|_| "unknown".to_string());
                     println!("{child} ({kind})");
+                }
+            }
+        }
+        Commands::Namespace {
+            global: global_flag,
+            user: user_flag,
+            command,
+        } => {
+            let config_dir = if global_flag {
+                global::global_config_dir()?
+            } else if user_flag {
+                global::user_config_dir()?
+            } else {
+                let root = git::find_main_git_root(backend, &cwd)?;
+                git::config_dir(&root)
+            };
+
+            match command {
+                NamespaceCommand::Set { key, uuid } => {
+                    let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+                    let mut ns = namespace::read_namespaces(backend, &config_dir)?;
+                    namespace::set_namespace(&mut ns, &segments, &uuid)?;
+                    namespace::write_namespaces(backend, &config_dir, &ns)?;
+                    // Commit the config worktree.
+                    crate::git::run_work_git(backend, &["add", "-A"], &config_dir)?;
+                    let status =
+                        crate::git::run_work_git(backend, &["status", "--porcelain"], &config_dir)?;
+                    if !status.is_empty() {
+                        crate::git::run_work_git(
+                            backend,
+                            &["commit", "-m", &format!("namespace set: {key}")],
+                            &config_dir,
+                        )?;
+                    }
+                    eprintln!("[subcontext] Set namespace '{key}' = {uuid}");
+                }
+                NamespaceCommand::Get { key } => {
+                    let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+                    let ns = namespace::read_namespaces(backend, &config_dir)?;
+                    match namespace::resolve_namespace(&ns, &segments) {
+                        Ok((uuid, remaining)) => {
+                            if remaining.is_empty() {
+                                println!("{uuid}");
+                            } else {
+                                bail!(
+                                    "path resolved to UUID '{uuid}' with remaining segments: {}",
+                                    remaining.join("/")
+                                );
+                            }
+                        }
+                        Err(e) => bail!("{e}"),
+                    }
+                }
+                NamespaceCommand::Remove { key } => {
+                    let segments: Vec<&str> = key.split('/').filter(|s| !s.is_empty()).collect();
+                    let mut ns = namespace::read_namespaces(backend, &config_dir)?;
+                    let removed = namespace::remove_namespace(&mut ns, &segments)?;
+                    if removed.is_some() {
+                        namespace::write_namespaces(backend, &config_dir, &ns)?;
+                        crate::git::run_work_git(backend, &["add", "-A"], &config_dir)?;
+                        let status = crate::git::run_work_git(
+                            backend,
+                            &["status", "--porcelain"],
+                            &config_dir,
+                        )?;
+                        if !status.is_empty() {
+                            crate::git::run_work_git(
+                                backend,
+                                &["commit", "-m", &format!("namespace remove: {key}")],
+                                &config_dir,
+                            )?;
+                        }
+                        eprintln!("[subcontext] Removed namespace '{key}'");
+                    } else {
+                        eprintln!("[subcontext] Namespace '{key}' not found.");
+                    }
+                }
+                NamespaceCommand::List => {
+                    let ns = namespace::read_namespaces(backend, &config_dir)?;
+                    let entries = namespace::flatten_namespaces(&ns, "");
+                    if entries.is_empty() {
+                        eprintln!("[subcontext] No namespace entries.");
+                    } else {
+                        for (key, uuid) in &entries {
+                            println!("{key} = {uuid}");
+                        }
+                    }
                 }
             }
         }
