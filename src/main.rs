@@ -1,17 +1,16 @@
 pub use subcontext::backend;
 
 mod clone;
+mod docs;
 mod git;
 mod global;
 mod hook;
 mod install;
 mod mcp;
-mod mcp_config;
 mod namespace;
 mod overlay;
 mod project;
 mod settings;
-mod skills;
 mod startup;
 mod status;
 mod submodule;
@@ -44,25 +43,25 @@ enum Commands {
         #[arg(long)]
         repair: bool,
 
-        /// Install the global (system) subcontext and MCP server into the
-        /// user's Claude Code config (`~/.claude.json`).
-        #[arg(long, conflicts_with_all = ["repair", "user", "skills"])]
+        /// Install the global (system) subcontext.
+        #[arg(long, conflicts_with_all = ["repair", "user"])]
         global: bool,
 
         /// Install a user subcontext under the global (system) subcontext.
-        #[arg(long, conflicts_with_all = ["repair", "global", "skills"])]
+        #[arg(long, conflicts_with_all = ["repair", "global"])]
         user: bool,
-
-        /// Install bundled Claude Code skills globally (~/.claude/skills/).
-        /// Skips skills that already exist.
-        #[arg(long, conflicts_with_all = ["repair", "global", "user"])]
-        skills: bool,
     },
 
     /// Clone an existing subcontext repo and attach it to this project
     Clone {
         /// URL of the context repo to clone
         url: String,
+    },
+
+    /// Dump bundled documentation, sample skills, and setup guides to a directory
+    Docs {
+        /// Destination directory (created if it doesn't exist)
+        path: String,
     },
 
     /// Add files to the overlay
@@ -487,13 +486,9 @@ fn main() -> Result<()> {
             repair,
             global,
             user,
-            skills,
         } => {
-            if skills {
-                skills::install_skills(backend)?;
-            } else if global {
+            if global {
                 global::install(backend)?;
-                mcp_config::install_global(backend)?;
             } else if user {
                 global::install_user(backend)?;
             } else {
@@ -504,6 +499,14 @@ fn main() -> Result<()> {
         Commands::Clone { url } => {
             let root = git::find_main_git_root(backend, &cwd)?;
             clone::clone(backend, &root, &url)?;
+        }
+        Commands::Docs { path } => {
+            let dest = if Path::new(&path).is_absolute() {
+                Path::new(&path).to_path_buf()
+            } else {
+                cwd.join(&path)
+            };
+            docs::dump_docs(backend, &dest)?;
         }
         Commands::Add { files } => {
             let root = git::find_main_git_root(backend, &cwd)?;

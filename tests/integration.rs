@@ -592,8 +592,8 @@ fn mcp_status_tool_returns_text() {
 }
 
 #[test]
-fn install_global_writes_disabled_mcp_server() {
-    // Use an isolated HOME so we don't touch the real ~/.claude.json.
+fn install_global_no_longer_writes_mcp_config() {
+    // install --global should NOT touch ~/.claude.json (MCP installer removed).
     let fake_home = std::env::temp_dir().join(format!(
         "subcontext-home-{}-{}",
         std::process::id(),
@@ -616,90 +616,10 @@ fn install_global_writes_disabled_mcp_server() {
     );
 
     let config_path = fake_home.join(".claude.json");
-    assert!(config_path.exists(), "~/.claude.json should be created");
-
-    let content = fs::read_to_string(&config_path).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-
-    // Should be under _disabled_mcpServers, NOT mcpServers (inactive by default).
-    let disabled = value
-        .get("_disabled_mcpServers")
-        .and_then(|v| v.as_object())
-        .expect("_disabled_mcpServers should exist");
-    assert!(disabled.contains_key("subcontext"));
     assert!(
-        value
-            .get("mcpServers")
-            .and_then(|v| v.as_object())
-            .is_none_or(|s| !s.contains_key("subcontext")),
-        "subcontext should NOT be in active mcpServers"
+        !config_path.exists(),
+        "~/.claude.json should NOT be created by install --global"
     );
-
-    let entry = &disabled["subcontext"];
-    assert_eq!(entry["type"], "stdio");
-    assert_eq!(entry["args"], serde_json::json!(["mcp"]));
-    // command should be an absolute path to a binary (not the `git` alias),
-    // so the server works from any directory.
-    let command = entry["command"].as_str().unwrap();
-    assert!(
-        Path::new(command).is_absolute(),
-        "command should be absolute path, got: {command}"
-    );
-    assert!(
-        command.ends_with("subcontext"),
-        "command should point at the subcontext binary, got: {command}"
-    );
-
-    // Second invocation is idempotent.
-    let out2 = Command::new(&bin)
-        .args(["install", "--global"])
-        .envs(test_env())
-        .env("HOME", &fake_home)
-        .current_dir(&fake_home)
-        .output()
-        .unwrap();
-    assert!(out2.status.success());
-
-    let content2 = fs::read_to_string(&config_path).unwrap();
-    let value2: serde_json::Value = serde_json::from_str(&content2).unwrap();
-    assert_eq!(
-        value2["_disabled_mcpServers"]["subcontext"], *entry,
-        "second run should leave entry untouched"
-    );
-
-    cleanup(&fake_home);
-}
-
-#[test]
-fn install_global_preserves_existing_config() {
-    let fake_home = std::env::temp_dir().join(format!(
-        "subcontext-home-{}-{}",
-        std::process::id(),
-        COUNTER.fetch_add(1, Ordering::SeqCst)
-    ));
-    fs::create_dir_all(&fake_home).unwrap();
-    let config_path = fake_home.join(".claude.json");
-    fs::write(
-        &config_path,
-        r#"{"mcpServers":{"other":{"command":"echo","args":["hi"]}},"keepMe":true}"#,
-    )
-    .unwrap();
-
-    let bin = test_bin_dir().join("subcontext");
-    let out = Command::new(&bin)
-        .args(["install", "--global"])
-        .envs(test_env())
-        .env("HOME", &fake_home)
-        .current_dir(&fake_home)
-        .output()
-        .unwrap();
-    assert!(out.status.success());
-
-    let content = fs::read_to_string(&config_path).unwrap();
-    let value: serde_json::Value = serde_json::from_str(&content).unwrap();
-    assert_eq!(value["keepMe"], true);
-    assert_eq!(value["mcpServers"]["other"]["command"], "echo");
-    assert!(value["_disabled_mcpServers"]["subcontext"].is_object());
 
     cleanup(&fake_home);
 }
@@ -2657,84 +2577,93 @@ fn task_add_no_name_no_file_fails() {
     cleanup(&root);
 }
 
-// ─── Skill installation tests ───────────────────────────────────────
+// ─── Docs dump tests ────────────────────────────────────────────────
 
 #[test]
-fn install_skills_creates_skill_directory() {
-    let fake_home = std::env::temp_dir().join(format!(
-        "subcontext-skills-home-{}-{}",
+fn docs_dumps_files_to_directory() {
+    let dest = std::env::temp_dir().join(format!(
+        "subcontext-docs-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
-    fs::create_dir_all(&fake_home).unwrap();
 
     let bin = test_bin_dir().join("subcontext");
-    let out = Command::new(bin)
-        .args(["install", "--skills"])
+    let out = Command::new(&bin)
+        .args(["docs", dest.to_str().unwrap()])
         .envs(test_env())
-        .env("HOME", &fake_home)
-        .current_dir(&fake_home)
         .output()
         .unwrap();
     assert!(
         out.status.success(),
-        "install --skills failed: {}",
+        "docs failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
 
-    // Skill should be installed.
-    let skill_path = fake_home.join(".claude/skills/add-task/SKILL.md");
-    assert!(skill_path.exists(), "skill SKILL.md should exist");
-    let content = fs::read_to_string(&skill_path).unwrap();
-    assert!(content.contains("name: add-task"), "content: {content}");
+    // Root docs should exist.
+    assert!(dest.join("README.md").exists(), "README.md should exist");
+    assert!(dest.join("setup.md").exists(), "setup.md should exist");
+    assert!(dest.join("usage.md").exists(), "usage.md should exist");
 
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Sample skills should exist.
     assert!(
-        stderr.contains("Installed skill 'add-task'"),
-        "stderr: {stderr}"
+        dest.join("skills/README.md").exists(),
+        "skills/README.md should exist"
+    );
+    assert!(
+        dest.join("skills/add-task/SKILL.md").exists(),
+        "skills/add-task/SKILL.md should exist"
+    );
+    assert!(
+        dest.join("skills/task-schema/SKILL.md").exists(),
+        "skills/task-schema/SKILL.md should exist"
     );
 
-    let _ = fs::remove_dir_all(&fake_home);
+    // Content should be non-empty and contain expected strings.
+    let setup = fs::read_to_string(dest.join("setup.md")).unwrap();
+    assert!(
+        setup.contains("subcontext install"),
+        "setup.md should contain install instructions"
+    );
+
+    let skill = fs::read_to_string(dest.join("skills/add-task/SKILL.md")).unwrap();
+    assert!(
+        skill.contains("name: add-task"),
+        "sample skill should have frontmatter"
+    );
+
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Dumped"), "should print summary: {stderr}");
+
+    let _ = fs::remove_dir_all(&dest);
 }
 
 #[test]
-fn install_skills_skips_existing() {
-    let fake_home = std::env::temp_dir().join(format!(
-        "subcontext-skills-skip-{}-{}",
+fn docs_overwrites_existing_files() {
+    let dest = std::env::temp_dir().join(format!(
+        "subcontext-docs-overwrite-{}-{}",
         std::process::id(),
         COUNTER.fetch_add(1, Ordering::SeqCst)
     ));
-    fs::create_dir_all(&fake_home).unwrap();
-
-    // Pre-create the skill directory with different content.
-    let skill_dir = fake_home.join(".claude/skills/add-task");
-    fs::create_dir_all(&skill_dir).unwrap();
-    fs::write(skill_dir.join("SKILL.md"), "custom content").unwrap();
+    fs::create_dir_all(&dest).unwrap();
+    fs::write(dest.join("README.md"), "old content").unwrap();
 
     let bin = test_bin_dir().join("subcontext");
-    let out = Command::new(bin)
-        .args(["install", "--skills"])
+    let out = Command::new(&bin)
+        .args(["docs", dest.to_str().unwrap()])
         .envs(test_env())
-        .env("HOME", &fake_home)
-        .current_dir(&fake_home)
         .output()
         .unwrap();
     assert!(out.status.success());
 
-    // Original content should be preserved (not overwritten).
-    let content = fs::read_to_string(skill_dir.join("SKILL.md")).unwrap();
-    assert_eq!(
-        content, "custom content",
-        "existing skill should not be overwritten"
-    );
-
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    // Should be overwritten with bundled content.
+    let content = fs::read_to_string(dest.join("README.md")).unwrap();
+    assert_ne!(content, "old content", "should overwrite existing files");
     assert!(
-        stderr.contains("already exists") && stderr.contains("skipping"),
-        "expected skip warning: {stderr}"
+        content.contains("Subcontext"),
+        "should contain bundled content"
     );
 
-    let _ = fs::remove_dir_all(&fake_home);
+    let _ = fs::remove_dir_all(&dest);
 }
 
 // ─── Namespace ──────────────────────────────────────────────────────
