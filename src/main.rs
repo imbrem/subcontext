@@ -106,14 +106,15 @@ enum Commands {
 
     /// Manage tasks
     Task {
-        /// Operate on the global (user-level) subcontext instead of the
-        /// current repo's subcontext. Implied when run outside a git repo.
+        /// Operate on the global (system-level) subcontext.
         #[arg(long, global = true)]
         global: bool,
-        /// Only act on the local (per-repo) subcontext — skip creating a
-        /// shadow task in the global subcontext. No effect outside a git
-        /// repo or when `--global` is passed.
+        /// Operate on the user subcontext.
         #[arg(long, global = true, conflicts_with = "global")]
+        user: bool,
+        /// Only act on the local (per-repo) subcontext — skip creating a
+        /// shadow task in the global subcontext.
+        #[arg(long, global = true, conflicts_with_all = ["global", "user"])]
         local: bool,
         #[command(subcommand)]
         command: TaskCommand,
@@ -181,15 +182,18 @@ enum TaskCommand {
         /// Mark as important. Without a value sets importance to 1.0.
         #[arg(long, num_args = 0..=1, default_missing_value = "1.0")]
         important: Option<f64>,
+        /// Parent task (name/path or UUID). Makes this a subtask.
+        #[arg(long)]
+        parent: Option<String>,
     },
-    /// Update an existing task (by UUID or name)
+    /// Update an existing task (by UUID or name/path)
     Update {
-        /// Task name or UUID to update
+        /// Task name, path, or UUID to update
         name_or_uuid: String,
         /// Path to an updated TASK.md file
         #[arg(long)]
         file: Option<String>,
-        /// Updated task name
+        /// Updated task title
         #[arg(long)]
         name: Option<String>,
         /// Updated task kind
@@ -208,22 +212,22 @@ enum TaskCommand {
         #[arg(long)]
         important: Option<f64>,
     },
-    /// Show a task's TASK.md (by name or UUID)
+    /// Show a task's TASK.md (by name/path or UUID)
     Show {
-        /// Task name or UUID
+        /// Task name, path, or UUID
         name_or_uuid: String,
     },
-    /// Mark a task as done
+    /// Mark a task as done (supports hierarchical paths like parent/child)
     Done {
-        /// Task name
+        /// Task name or path (e.g. "mytask", "parent/child", "/root-task", ".")
         name: String,
         /// Completion timestamp (ISO8601). Defaults to now.
         #[arg(long)]
         time: Option<String>,
     },
-    /// Mark a task as failed
+    /// Mark a task as failed (supports hierarchical paths like parent/child)
     Fail {
-        /// Task name
+        /// Task name or path (e.g. "mytask", "parent/child", "/root-task", ".")
         name: String,
         /// Failure timestamp (ISO8601). Defaults to now.
         #[arg(long)]
@@ -239,6 +243,18 @@ enum TaskCommand {
         #[arg(long)]
         horizon: Option<String>,
     },
+    /// Set (or unset) the current task for this branch
+    Set {
+        /// Task name/path to set as current. Omit to unset.
+        name: Option<String>,
+    },
+    /// List subtasks of the current task (or root tasks)
+    List {
+        /// Task name/path whose subtasks to list. Omit for current task's children.
+        name: Option<String>,
+    },
+    /// List root task UUIDs (tasks with no parent)
+    Roots,
 }
 
 #[derive(Subcommand)]
@@ -382,216 +398,201 @@ fn main() -> Result<()> {
         }
         Commands::Task {
             global: global_flag,
+            user: user_flag,
             local: local_flag,
             command,
         } => {
-            // Use the global scope when --global is passed OR when we're
-            // outside a git repo. Otherwise fall back to the local scope.
             let local_root = git::find_main_git_root(backend, &cwd).ok();
-            let use_global = global_flag || local_root.is_none();
+            let scope = if global_flag {
+                global::global_task_scope(backend)?
+            } else if user_flag {
+                global::user_task_scope(backend)?
+            } else if let Some(ref root) = local_root {
+                task::TaskScope::for_local(backend, root)?
+            } else if global::global_exists(backend)? {
+                global::user_task_scope(backend).unwrap_or(global::global_task_scope(backend)?)
+            } else {
+                bail!("not inside a git repo and no global subcontext installed");
+            };
+            let is_local_scope = !global_flag && !user_flag && local_root.is_some();
 
-            // Helper: run the task add logic for a given scope, handling
-            // both --file and positional-name modes.
-            let handle_task_add = |backend: &dyn Backend,
-                                   scope: &task::TaskScope,
-                                   name: Option<String>,
-                                   file: Option<String>,
-                                   kind: Option<String>,
-                                   status: Option<String>,
-                                   description: Option<String>,
-                                   deadline: Option<String>,
-                                   important: Option<f64>|
-             -> Result<(String, String, String)> {
-                let importance = important.unwrap_or(0.0);
-                if let Some(file_path) = file {
-                    let md = std::fs::read_to_string(&file_path)
-                        .with_context(|| format!("cannot read {file_path}"))?;
-                    let (uuid, commit) = task::add_task_from_md(backend, scope, &md, None)?;
-                    // Extract name from frontmatter for propagation.
-                    let (pairs, _) = task::parse_frontmatter(&md);
-                    let task_name = pairs
-                        .iter()
-                        .find(|(k, _)| k == "name")
-                        .map(|(_, v)| v.clone())
-                        .unwrap_or_default();
-                    Ok((uuid, commit, task_name))
-                } else {
-                    let name = name
-                        .ok_or_else(|| anyhow::anyhow!("task name is required (or use --file)"))?;
-                    let (uuid, commit) = task::add_task(
+            // Helper: resolve --parent to a UUID via path resolution.
+            let resolve_parent = |parent: &Option<String>| -> Result<Option<String>> {
+                match parent {
+                    Some(p) => {
+                        let conn = task::open_db(&scope)?;
+                        Ok(Some(task::resolve_task_path(&conn, &scope, p)?))
+                    }
+                    None => Ok(None),
+                }
+            };
+
+            match command {
+                TaskCommand::Add {
+                    name,
+                    file,
+                    kind,
+                    status,
+                    description,
+                    deadline,
+                    important,
+                    parent,
+                } => {
+                    let importance = important.unwrap_or(0.0);
+                    let parent_uuid = resolve_parent(&parent)?;
+                    let (local_uuid, local_commit, task_name) = if let Some(file_path) = file {
+                        let md = std::fs::read_to_string(&file_path)
+                            .with_context(|| format!("cannot read {file_path}"))?;
+                        let (uuid, commit) = task::add_task_from_md(
+                            backend,
+                            &scope,
+                            &md,
+                            None,
+                            name.as_deref(),
+                            parent_uuid.as_deref(),
+                        )?;
+                        let (pairs, _) = task::parse_frontmatter(&md);
+                        let task_name = name.unwrap_or_else(|| {
+                            pairs
+                                .iter()
+                                .find(|(k, _)| k == "name")
+                                .map(|(_, v)| v.clone())
+                                .unwrap_or_default()
+                        });
+                        (uuid, commit, task_name)
+                    } else {
+                        let name = name.ok_or_else(|| {
+                            anyhow::anyhow!("task name is required (or use --file)")
+                        })?;
+                        let (uuid, commit) = task::add_task(
+                            backend,
+                            &scope,
+                            &name,
+                            kind.as_deref(),
+                            status.as_deref(),
+                            description.as_deref(),
+                            deadline.as_deref(),
+                            importance,
+                            None,
+                            parent_uuid.as_deref(),
+                        )?;
+                        (uuid, commit, name)
+                    };
+                    // Propagate up unless --local or non-local scope.
+                    if is_local_scope && !local_flag && global::global_exists(backend)? {
+                        let importance = important.unwrap_or(0.0);
+                        let root = local_root.as_ref().unwrap();
+                        propagate_task_up(
+                            backend,
+                            &scope.project_uuid,
+                            &local_uuid,
+                            &local_commit,
+                            &task_name,
+                            kind.as_deref(),
+                            status.as_deref(),
+                            description.as_deref(),
+                            deadline.as_deref(),
+                            importance,
+                        )?;
+                        if let Some(commit) = global::record_child_checkout_path(
+                            backend,
+                            &scope.project_uuid,
+                            &root.join(".git"),
+                        )? {
+                            let global_scope = global::global_task_scope(backend)?;
+                            let conn = task::open_db(&global_scope)?;
+                            conn.execute(
+                                "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
+                                rusqlite::params![commit, scope.project_uuid],
+                            )?;
+                            drop(conn);
+                            task::commit_state_in(
+                                backend,
+                                &global_scope.state_dir,
+                                &format!("object update: {}", scope.project_uuid),
+                            )?;
+                        }
+                    }
+                }
+                TaskCommand::Update {
+                    name_or_uuid,
+                    file,
+                    name,
+                    kind,
+                    status,
+                    description,
+                    deadline,
+                    important,
+                } => {
+                    let uuid = task::resolve_task_uuid(backend, &scope, &name_or_uuid)?;
+                    let md = file.map(|p| std::fs::read_to_string(&p)).transpose()?;
+                    task::update_task(
                         backend,
-                        scope,
-                        &name,
+                        &scope,
+                        &uuid,
+                        md.as_deref(),
+                        name.as_deref(),
                         kind.as_deref(),
                         status.as_deref(),
                         description.as_deref(),
                         deadline.as_deref(),
-                        importance,
-                        None,
+                        important,
                     )?;
-                    Ok((uuid, commit, name))
                 }
-            };
-
-            if use_global {
-                let scope = global::global_task_scope(backend)?;
-                match command {
-                    TaskCommand::Add {
-                        name,
-                        file,
-                        kind,
-                        status,
-                        description,
-                        deadline,
-                        important,
-                    } => {
-                        handle_task_add(
-                            backend,
-                            &scope,
-                            name,
-                            file,
-                            kind,
-                            status,
-                            description,
-                            deadline,
-                            important,
-                        )?;
-                    }
-                    TaskCommand::Update {
-                        name_or_uuid,
-                        file,
-                        name,
-                        kind,
-                        status,
-                        description,
-                        deadline,
-                        important,
-                    } => {
-                        let uuid = task::resolve_task_uuid(backend, &scope, &name_or_uuid)?;
-                        let md = file.map(|p| std::fs::read_to_string(&p)).transpose()?;
-                        task::update_task(
-                            backend,
-                            &scope,
-                            &uuid,
-                            md.as_deref(),
-                            name.as_deref(),
-                            kind.as_deref(),
-                            status.as_deref(),
-                            description.as_deref(),
-                            deadline.as_deref(),
-                            important,
-                        )?;
-                    }
-                    TaskCommand::Show { name_or_uuid } => {
-                        handle_task_show(backend, &scope, &name_or_uuid)?;
-                    }
-                    TaskCommand::Done { name, time } => {
-                        task::done_task(backend, &scope, &name, time.as_deref())?;
-                    }
-                    TaskCommand::Fail { name, time } => {
-                        task::fail_task(backend, &scope, &name, time.as_deref())?;
-                    }
-                    TaskCommand::Deadlines { important, horizon } => {
-                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
-                        print!("{}", task::format_deadlines(&entries));
-                    }
+                TaskCommand::Show { name_or_uuid } => {
+                    handle_task_show(backend, &scope, &name_or_uuid)?;
                 }
-            } else {
-                let root = local_root.unwrap();
-                let scope = task::TaskScope::for_local(backend, &root)?;
-                match command {
-                    TaskCommand::Add {
-                        name,
-                        file,
-                        kind,
-                        status,
-                        description,
-                        deadline,
-                        important,
-                    } => {
-                        let (local_uuid, local_commit, task_name) = handle_task_add(
-                            backend,
-                            &scope,
-                            name,
-                            file.clone(),
-                            kind.clone(),
-                            status.clone(),
-                            description.clone(),
-                            deadline.clone(),
-                            important,
-                        )?;
-                        // Propagate task up the parent chain unless --local.
-                        if !local_flag && global::global_exists(backend)? {
-                            let importance = important.unwrap_or(0.0);
-                            propagate_task_up(
-                                backend,
-                                &scope.project_uuid,
-                                &local_uuid,
-                                &local_commit,
-                                &task_name,
-                                kind.as_deref(),
-                                status.as_deref(),
-                                description.as_deref(),
-                                deadline.as_deref(),
-                                importance,
-                            )?;
-                            if let Some(commit) = global::record_child_checkout_path(
-                                backend,
-                                &scope.project_uuid,
-                                &root.join(".git"),
-                            )? {
-                                let global_scope = global::global_task_scope(backend)?;
-                                let conn = task::open_db(&global_scope)?;
-                                conn.execute(
-                                    "UPDATE objects SET current_commit = ?1 WHERE uuid = ?2",
-                                    rusqlite::params![commit, scope.project_uuid],
-                                )?;
-                                drop(conn);
-                                task::commit_state_in(
-                                    backend,
-                                    &global_scope.state_dir,
-                                    &format!("object update: {}", scope.project_uuid),
-                                )?;
-                            }
+                TaskCommand::Done { name, time } => {
+                    task::done_task(backend, &scope, &name, time.as_deref())?;
+                }
+                TaskCommand::Fail { name, time } => {
+                    task::fail_task(backend, &scope, &name, time.as_deref())?;
+                }
+                TaskCommand::Deadlines { important, horizon } => {
+                    let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
+                    print!("{}", task::format_deadlines(&entries));
+                }
+                TaskCommand::Set { name } => match name {
+                    Some(ref n) => {
+                        let conn = task::open_db(&scope)?;
+                        let uuid = task::resolve_task_path(&conn, &scope, n)?;
+                        drop(conn);
+                        task::set_branch_task(backend, &scope, &uuid)?;
+                        eprintln!(
+                            "[subcontext] Current task for branch '{}' set to '{n}' ({uuid})",
+                            scope.host_branch
+                        );
+                    }
+                    None => {
+                        task::unset_branch_task(backend, &scope)?;
+                        eprintln!(
+                            "[subcontext] Unset current task for branch '{}'",
+                            scope.host_branch
+                        );
+                    }
+                },
+                TaskCommand::List { name } => {
+                    let parent_uuid = match name {
+                        Some(ref n) => {
+                            let conn = task::open_db(&scope)?;
+                            Some(task::resolve_task_path(&conn, &scope, n)?)
                         }
-                    }
-                    TaskCommand::Update {
-                        name_or_uuid,
-                        file,
-                        name,
-                        kind,
-                        status,
-                        description,
-                        deadline,
-                        important,
-                    } => {
-                        let uuid = task::resolve_task_uuid(backend, &scope, &name_or_uuid)?;
-                        let md = file.map(|p| std::fs::read_to_string(&p)).transpose()?;
-                        task::update_task(
-                            backend,
-                            &scope,
-                            &uuid,
-                            md.as_deref(),
-                            name.as_deref(),
-                            kind.as_deref(),
-                            status.as_deref(),
-                            description.as_deref(),
-                            deadline.as_deref(),
-                            important,
-                        )?;
-                    }
-                    TaskCommand::Show { name_or_uuid } => {
-                        handle_task_show(backend, &scope, &name_or_uuid)?;
-                    }
-                    TaskCommand::Done { name, time } => {
-                        task::done_task(backend, &scope, &name, time.as_deref())?;
-                    }
-                    TaskCommand::Fail { name, time } => {
-                        task::fail_task(backend, &scope, &name, time.as_deref())?;
-                    }
-                    TaskCommand::Deadlines { important, horizon } => {
-                        let entries = task::list_deadlines(&scope, important, horizon.as_deref())?;
-                        print!("{}", task::format_deadlines(&entries));
+                        None => {
+                            let conn = task::open_db(&scope)?;
+                            task::get_branch_task(&conn, &scope.host_branch)?
+                        }
+                    };
+                    let tasks = task::list_subtasks(&scope, parent_uuid.as_deref())?;
+                    print!("{}", task::format_subtasks(&tasks, name.as_deref()));
+                }
+                TaskCommand::Roots => {
+                    let uuids = task::list_root_uuids(&scope)?;
+                    if uuids.is_empty() {
+                        eprintln!("[subcontext] No root tasks.");
+                    } else {
+                        for uuid in &uuids {
+                            println!("{uuid}");
+                        }
                     }
                 }
             }
@@ -700,6 +701,7 @@ fn main() -> Result<()> {
 /// Recursively propagate a task from a child context up through its parent
 /// chain. Each parent gets a shadow task whose source points to the original
 /// child task.
+#[allow(clippy::too_many_arguments)]
 fn propagate_task_up(
     backend: &dyn Backend,
     child_uuid: &str,
@@ -729,13 +731,12 @@ fn propagate_task_up(
                 deadline,
                 importance,
                 Some((child_uuid, task_uuid, task_commit)),
+                None,
             )?;
             return Ok(());
         }
     };
 
-    // Find the TaskScope for the parent. The parent may be the user
-    // subcontext or another project — we need to resolve its scope.
     let parent_scope = resolve_scope_for_uuid(backend, &parent_uuid)?;
     let (shadow_uuid, shadow_commit) = task::add_task(
         backend,
@@ -747,6 +748,7 @@ fn propagate_task_up(
         deadline,
         importance,
         Some((child_uuid, task_uuid, task_commit)),
+        None,
     )?;
 
     // Recurse: propagate from parent to grandparent.
@@ -767,17 +769,15 @@ fn propagate_task_up(
 /// Resolve a TaskScope for a given UUID. Checks if it's the user subcontext
 /// or the system subcontext.
 fn resolve_scope_for_uuid(backend: &dyn Backend, uuid: &str) -> Result<task::TaskScope> {
-    // Check if it's the system (global) subcontext.
-    if let Ok(scope) = global::global_task_scope(backend) {
-        if scope.project_uuid == uuid {
-            return Ok(scope);
-        }
+    if let Ok(scope) = global::global_task_scope(backend)
+        && scope.project_uuid == uuid
+    {
+        return Ok(scope);
     }
-    // Check if it's the user subcontext.
-    if let Ok(scope) = global::user_task_scope(backend) {
-        if scope.project_uuid == uuid {
-            return Ok(scope);
-        }
+    if let Ok(scope) = global::user_task_scope(backend)
+        && scope.project_uuid == uuid
+    {
+        return Ok(scope);
     }
     bail!(
         "cannot resolve TaskScope for UUID {uuid} — only system and user subcontexts support receiving propagated tasks"

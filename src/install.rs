@@ -89,47 +89,47 @@ pub fn install_from_hooks(backend: &dyn Backend, root: &Path, repair: bool) -> R
 
     // If there's a current user context, register the project as a child of
     // the user and record the parent relationship in the system DB.
-    if global::global_exists(backend)? {
-        if let Ok(Some(user_uuid)) = global::get_current_user(backend) {
-            // Register as child of the user context.
-            let user_scope = global::user_task_scope(backend);
-            if let Ok(user_scope) = user_scope {
-                // Register child in user context's bare repo.
-                let user_repo = user_scope.repo_dir.clone();
-                let ref_name = format!("refs/heads/object/{project_uuid}");
-                if run_git_in_bare(
+    if global::global_exists(backend)?
+        && let Ok(Some(user_uuid)) = global::get_current_user(backend)
+    {
+        // Register as child of the user context.
+        let user_scope = global::user_task_scope(backend);
+        if let Ok(user_scope) = user_scope {
+            // Register child in user context's bare repo.
+            let user_repo = user_scope.repo_dir.clone();
+            let ref_name = format!("refs/heads/object/{project_uuid}");
+            if run_git_in_bare(
+                backend,
+                &["show-ref", "--verify", "--quiet", &ref_name],
+                &user_repo,
+                &user_repo,
+            )
+            .is_err()
+            {
+                // Create child object branch in user's repo.
+                let child_data = serde_json::json!({
+                    "uuid": project_uuid,
+                    "kind": SUBCONTEXT_KIND,
+                });
+                let object_json = task::build_child_object_json(&child_data);
+                let commit = task::create_object_branch(
                     backend,
-                    &["show-ref", "--verify", "--quiet", &ref_name],
-                    &user_repo,
-                    &user_repo,
-                )
-                .is_err()
-                {
-                    // Create child object branch in user's repo.
-                    let child_data = serde_json::json!({
-                        "uuid": project_uuid,
-                        "kind": SUBCONTEXT_KIND,
-                    });
-                    let object_json = task::build_child_object_json(&child_data);
-                    let commit = task::create_object_branch(
-                        backend,
-                        &user_scope,
-                        &project_uuid,
-                        &[("object.json", &object_json)],
-                    )?;
-                    let conn = task::open_db(&user_scope)?;
-                    task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
-                    drop(conn);
-                    task::commit_state_in(
-                        backend,
-                        &user_scope.state_dir,
-                        &format!("object add: {project_uuid}"),
-                    )?;
-                }
+                    &user_scope,
+                    &project_uuid,
+                    &[("object.json", &object_json)],
+                )?;
+                let conn = task::open_db(&user_scope)?;
+                task::insert_object(&conn, &project_uuid, "managed", &commit, None)?;
+                drop(conn);
+                task::commit_state_in(
+                    backend,
+                    &user_scope.state_dir,
+                    &format!("object add: {project_uuid}"),
+                )?;
             }
-            // Record parent relationship in system DB.
-            global::set_parent(backend, &project_uuid, &user_uuid).ok();
         }
+        // Record parent relationship in system DB.
+        global::set_parent(backend, &project_uuid, &user_uuid).ok();
     }
 
     Ok(())
